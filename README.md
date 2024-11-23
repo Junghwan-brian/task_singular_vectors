@@ -1,6 +1,6 @@
 # Task Singular Vectors: Reducing Task Interference in Model Merging
 
-This is the source code to reproduce the experiments for "Task Singular Vectors: Reducing Task Interference in Model Merging" by (anonymized).
+This is the source code to reproduce the experiments for "Task Singular Vectors: Reducing Task Interference in Model Merging" by Antonio Andrea Gargiulo, Donato Crisostomi, Maria Sofia Bucarelli, Simone Scardapane, Fabrizio Silvestri, and Emanuele Rodolà.
 
 Our paper, study task vectors at the layer level, focusing on task layer matrices and their singular value decomposition. We refer to these produced singular vectors as **Task Singular Vectors** (**TSV**). Recognizing that layer task matrices are often low-rank, we propose:
 1) **TSV-Compress** (**TSV-C**), a compression scheme reducing TV to 10\% of their original size while retaining 99\% of accuracy. 
@@ -17,7 +17,7 @@ conda activate tsv
 ```
 
 ## Checkpoints
-We provide the checkpoints, in [this link](removed for anonymization).
+We provide the checkpoints, in [this link](https://drive.google.com/drive/folders/1UEM1Thcz1c7dc1nji1i5uTN53Kf6G3-e?usp=sharing). The checkpoints and masks are the previous versions of the ones in [this repository](https://github.com/nik-dim/tall_masks), downloaded from there at the beginning of our research. 
 
 ## Datasets
 Most datasets being used should be downloaded automatically with torchvision or huggingface. For the datasets requiring manual preparation (like Cars, DTD, EuroSAT, SUN397), please follow the instructions in [this issue](https://github.com/mlfoundations/task_vectors/issues/1). Depending on the torchvision version, some issues might arise when downloading specific datasets like [here](https://github.com/basveeling/pcam/issues/4) or [here](https://github.com/pytorch/vision/issues/5662). In this case, using a different torchvision version might solve the issue. 
