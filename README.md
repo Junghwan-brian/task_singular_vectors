@@ -1,6 +1,6 @@
 # Task Singular Vectors: Reducing Task Interference in Model Merging
 
-This is the source code to reproduce the experiments for "Task Singular Vectors: Reducing Task Interference in Model Merging" by Antonio Andrea Gargiulo, Donato Crisostomi, Maria Sofia Bucarelli, Simone Scardapane, Fabrizio Silvestri, and Emanuele Rodolà.
+This is the source code to reproduce the experiments for ["Task Singular Vectors: Reducing Task Interference in Model Merging"](https://arxiv.org/abs/2412.00081) by Antonio Andrea Gargiulo, Donato Crisostomi, Maria Sofia Bucarelli, Simone Scardapane, Fabrizio Silvestri, and Emanuele Rodolà.
 
 Our paper, study task vectors at the layer level, focusing on task layer matrices and their singular value decomposition. We refer to these produced singular vectors as **Task Singular Vectors** (**TSV**). Recognizing that layer task matrices are often low-rank, we propose:
 1) **TSV-Compress** (**TSV-C**), a compression scheme reducing TV to 10\% of their original size while retaining 99\% of accuracy. 
@@ -83,27 +83,19 @@ python eval_single_task.py --model=ViT-B-32 --finetuning-mode=standard
 The results are saved in the `results/` folder. 
 
 ## Reference
-Code adapted from the following papers:
+If you find this code useful, please cite the following paper:
 ```bibtex
-@inproceedings{wang2024localizing,
-  title={Localizing Task Information for Improved Model Merging and Compression},
-  author={Wang, Ke and
-    Dimitriadis, Nikolaos and
-    Ortiz{-}Jim{\'{e}}nez, Guillermo and
-    Fleuret, Fran\c{c}ois and
-    Frossard, Pascal},
-  booktitle={International Conference on Machine Learning},
-  year={2024}
-}
-
-@misc{ilharco2023editingmodelstaskarithmetic,
-      title={Editing Models with Task Arithmetic}, 
-      author={Gabriel Ilharco and Marco Tulio Ribeiro and Mitchell Wortsman and Suchin Gururangan and Ludwig Schmidt and Hannaneh Hajishirzi and Ali Farhadi},
-      year={2023},
-      eprint={2212.04089},
+@misc{gargiulo2024tasksingularvectorsreducing,
+      title={Task Singular Vectors: Reducing Task Interference in Model Merging}, 
+      author={Antonio Andrea Gargiulo and Donato Crisostomi and Maria Sofia Bucarelli and Simone Scardapane and Fabrizio Silvestri and Emanuele Rodolà},
+      year={2024},
+      eprint={2412.00081},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2212.04089}, 
+      url={https://arxiv.org/abs/2412.00081}, 
 }
 ```
+Code adapted from:
+- [Task Arithmetic](https://github.com/mlfoundations/task_vectors)
+- [Consensus Merging](https://github.com/nik-dim/tall_masks)
 
