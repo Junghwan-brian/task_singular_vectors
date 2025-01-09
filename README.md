@@ -6,7 +6,10 @@ Our paper, study task vectors at the layer level, focusing on task layer matrice
 1) **TSV-Compress** (**TSV-C**), a compression scheme reducing TV to 10\% of their original size while retaining 99\% of accuracy. 
 2) **TSV-Merge** (**TSV-M**), a novel approach that combines compression with interference reduction to improve model merging performance.
 
-https://github.com/AntoAndGar/task_singular_vectors/tree/main/notebooks/1080p60/Method.mp4
+<video width="720" controls>
+  <source src="https://github.com/AntoAndGar/task_singular_vectors/raw/main/notebooks/media/videos/notebooks/1080p60/Method.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
 
 ## Dependencies
 
