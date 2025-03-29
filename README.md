@@ -2,7 +2,7 @@
 
 This is the source code to reproduce the experiments for ["Task Singular Vectors: Reducing Task Interference in Model Merging"](https://arxiv.org/abs/2412.00081) by Antonio Andrea Gargiulo, Donato Crisostomi, Maria Sofia Bucarelli, Simone Scardapane, Fabrizio Silvestri, and Emanuele Rodolà.
 
-Our paper, study task vectors at the layer level, focusing on task layer matrices and their singular value decomposition. We refer to these produced singular vectors as **Task Singular Vectors** (**TSV**). Recognizing that layer task matrices are often low-rank, we propose:
+Our paper studies task vectors at the layer level, focusing on task layer matrices and their singular value decomposition. We refer to the resulting singular vectors as **Task Singular Vectors** (**TSV**). Recognizing that layer task matrices are often low-rank, we propose:
 1) **TSV-Compress** (**TSV-C**), a compression scheme reducing TV to 10\% of their original size while retaining 99\% of accuracy. 
 2) **TSV-Merge** (**TSV-M**), a novel approach that combines compression with interference reduction to improve model merging performance.
 
