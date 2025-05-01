@@ -9,7 +9,7 @@ cars_template = [
     lambda c: f"a photo of my old {c}.",
 ]
 
-cifar10_template = [
+cifar10_stl10_template = [
     lambda c: f"a photo of a {c}.",
     lambda c: f"a blurry photo of a {c}.",
     lambda c: f"a black and white photo of a {c}.",
@@ -186,10 +186,10 @@ resisc45_template = [
     lambda c: f"aerial view of the {c}.",
 ]
 
-stl10_template = [
-    lambda c: f"a photo of a {c}.",
-    lambda c: f"a photo of the {c}.",
-]
+# cifar10_stl10_template = [
+#     lambda c: f"a photo of a {c}.",
+#     lambda c: f"a photo of the {c}.",
+# ]
 
 sun397_template = [
     lambda c: f"a photo of a {c}.",
@@ -226,7 +226,7 @@ sst2_template = [
 ]
 
 emnist_template = [
-    lambda c: f'a photo of the digit character: "{c}".',
+    lambda c: f'a photo of the number: "{c}".',
 ]
 
 fashionmnist_template = [
@@ -240,7 +240,7 @@ kmnist_template = [
 
 dataset_to_template = {
     "Cars": cars_template,
-    "CIFAR10": cifar10_template,
+    "CIFAR10": cifar10_stl10_template,
     "CIFAR100": cifar100_template,
     "DTD": dtd_template,
     "EuroSAT": eurosat_template,
@@ -249,7 +249,7 @@ dataset_to_template = {
     "MNIST": mnist_template,
     "ImageNet": imagenet_template,
     "RESISC45": resisc45_template,
-    "STL10": stl10_template,
+    "STL10": cifar10_stl10_template,
     "SUN397": sun397_template,
     "SVHN": svhn_template,
     "Flowers102": flowers102_template,

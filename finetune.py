@@ -167,7 +167,7 @@ if __name__ == "__main__":
     train_datasets = [
         # "MNIST",
         # "Cars",
-        "DTD",
+        # "DTD",
         # "EuroSAT",
         # "GTSRB",
         # "RESISC45",
@@ -184,7 +184,7 @@ if __name__ == "__main__":
         # "Food101",
         # "RenderedSST2",
         # "KMNIST",
-        # "EMNIST",
+        "EMNIST",
     ]
     epochs = {
         "Cars": 35,
@@ -217,8 +217,10 @@ if __name__ == "__main__":
         args.save_dir = os.path.join(args.model_location, args.model)
 
         # We use gradient accumulation to simulate larger batch sizes if the model does not fit in memory.
-        args.batch_size = 64 if args.model == "ViT-L-14" else 128
+        # args.batch_size = 64 if args.model == "ViT-L-14" else 128
         args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
+
+        args.batch_size = 8
 
         print("=" * 100)
         print(f"Finetuning {args.model} on {dataset}")
