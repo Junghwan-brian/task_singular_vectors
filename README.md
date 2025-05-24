@@ -1,7 +1,10 @@
 # Task Singular Vectors: Reducing Task Interference in Model Merging
 
-https://img.shields.io/badge/CVPR%20-%202025?style=flat&labelColor=grey&color=blue&link=https%3A%2F%2Farxiv.org%2Fabs%2F2412.00081
-
+<p align="center">
+  <a href="https://arxiv.org/pdf/2505.11427">
+    <img src="https://img.shields.io/badge/ACL%20Demo-2025-B31B1B.svg" alt="ACL Demo 2025"/>
+  </a>
+</p>
 
 This is the source code to reproduce the experiments for ["Task Singular Vectors: Reducing Task Interference in Model Merging"](https://arxiv.org/abs/2412.00081) by Antonio Andrea Gargiulo, Donato Crisostomi, Maria Sofia Bucarelli, Simone Scardapane, Fabrizio Silvestri, and Emanuele Rodolà.
 
