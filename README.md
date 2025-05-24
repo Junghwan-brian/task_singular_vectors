@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://arxiv.org/pdf/2505.11427">
-    <img src="https://img.shields.io/badge/CVPR%20-%202025?style=flat&labelColor=grey&color=blue&link=https%3A%2F%2Farxiv.org%2Fabs%2F2412.00081" alt="ACL Demo 2025"/>
+    <img src="https://img.shields.io/badge/2025-2025?style=flat&label=CVPR&labelColor=blue&color=grey&link=https%3A%2F%2Farxiv.org%2Fabs%2F2412.00081" alt="CVPR 2025"/>
   </a>
 </p>
 
