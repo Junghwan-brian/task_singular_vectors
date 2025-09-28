@@ -2,7 +2,6 @@ import json
 import os
 
 import torch
-import wandb
 from omegaconf import open_dict
 
 from src.eval.eval import evaluate_task_vector, evaluate_task_vector_at_coef
@@ -26,7 +25,8 @@ def perform_eval_with_merged_vector(args, task_vector, eval_masks=None, svd_dict
         args.save_dir = os.path.join(args.model_location, args.model)
 
     ft_accuracies_path = get_single_task_accuracies_path(args.model)
-    pretrained_checkpoint = get_zeroshot_path(args.model_location, "MNIST", args.model)
+    pretrained_checkpoint = get_zeroshot_path(
+        args.model_location, "MNIST", args.model)
 
     with open_dict(args):
         with open(ft_accuracies_path) as f:

@@ -4,24 +4,25 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-import wandb
+import logging
 
 from .utils import state_dict_to_vector, vector_to_state_dict
 from .variables_and_paths import ALL_DATASETS
 
 
-def log_wandb_mask_sparsity(final_mask: torch.Tensor):
+def log_mask_sparsity(final_mask: torch.Tensor):
     """
-    Logs the mask sparsity for each dataset to Weights & Biases (wandb).
+    각 데이터셋별 마스크 희소도를 표준 로거에 기록합니다.
 
     Args:
-        final_mask (torch.Tensor): The final mask tensor.
+        final_mask (torch.Tensor): 최종 마스크 텐서.
     """
     dataset_sparsities = final_mask.float().mean(1)
 
+    logger = logging.getLogger("task_singular_vectors")
     for i in range(len(final_mask)):
         dataset = ALL_DATASETS[i]
-        wandb.log({f"mask_sparsity_{dataset}": dataset_sparsities[i]})
+        logger.info({f"mask_sparsity_{dataset}": float(dataset_sparsities[i])})
 
 
 def generate_task_masks(
@@ -65,7 +66,7 @@ def generate_task_masks(
     print(
         f"Average sparsity for the mask with tall_mask_lambda of {tall_mask_lambda}: {final_mask.float().mean():.4f}"
     )
-    log_wandb_mask_sparsity(final_mask)
+    log_mask_sparsity(final_mask)
 
     return final_mask
 
@@ -99,9 +100,11 @@ def construct_tall_mask(
             tv_flat_checks, flat_ft, flat_ptm, tall_mask_lambda=tall_mask_lambda, tv=merged_tv
         )
         # convert vectors to dictionary
-        masks_at_scale = [vector_to_state_dict(mask, ptm_check, remove_keys=remove_keys) for mask in masks_at_scale]
+        masks_at_scale = [vector_to_state_dict(
+            mask, ptm_check, remove_keys=remove_keys) for mask in masks_at_scale]
         # store the masks with {dataset: mask}
-        tall_masks[tall_mask_lambda] = {key: value for key, value in zip(config.DATASETS, masks_at_scale)}
+        tall_masks[tall_mask_lambda] = {
+            key: value for key, value in zip(config.DATASETS, masks_at_scale)}
     return tall_masks
 
 
@@ -126,7 +129,8 @@ def find_optimal_mask(val_metrics, eval_masks, args, save_masks=True):
             transposed_dict[inner_key][key] = value
 
     # for each task, find the best lambda
-    max_subkeys = {key: max(inner_dict, key=inner_dict.get) for key, inner_dict in transposed_dict.items()}
+    max_subkeys = {key: max(inner_dict, key=inner_dict.get)
+                   for key, inner_dict in transposed_dict.items()}
 
     # select the best mask for each task, which will be used for testing later
     best_masks_for_test = {}
@@ -139,22 +143,27 @@ def find_optimal_mask(val_metrics, eval_masks, args, save_masks=True):
         # select the mask based on the selected lambda, save as dictionaries
         best_masks_for_test[ds] = eval_masks[best_lambda][ds]
         # select the mask based on the selected lambda, save as vectors
-        best_masks_for_test_vector[ds] = state_dict_to_vector(eval_masks[best_lambda][ds], remove_keys=[])
+        best_masks_for_test_vector[ds] = state_dict_to_vector(
+            eval_masks[best_lambda][ds], remove_keys=[])
         print(f"Best lambda for {ds} is {best_lambda}")
         # save the best validation metric based on the selected lambda
-        best_val_metrics[ds + "Val:top1"] = val_metrics[best_lambda][ds + "Val:top1"]
+        best_val_metrics[ds +
+                         "Val:top1"] = val_metrics[best_lambda][ds + "Val:top1"]
 
     # save the best masks in disk
     if save_masks and not args.method.load_mask:
         # convert to numpy to save with np.packbits for saving storage
-        best_masks_for_test_vector = {k: np.packbits(v) for k, v in best_masks_for_test_vector.items()}
-        mask_save_dir = args.model_location.replace("checkpoints", "tall_masks")
+        best_masks_for_test_vector = {k: np.packbits(
+            v) for k, v in best_masks_for_test_vector.items()}
+        mask_save_dir = args.model_location.replace(
+            "checkpoints", "tall_masks")
         mask_name = (
             f"TALL_mask_{args.num_tasks}task.npy"
             if not args.method.use_ties
             else f"TALL_mask_{args.num_tasks}task_use_ties_{args.method.ties_agg}.npy"
         )
-        np.save(os.path.join(mask_save_dir, args.model, mask_name), best_masks_for_test_vector)
+        np.save(os.path.join(mask_save_dir, args.model,
+                mask_name), best_masks_for_test_vector)
         del best_masks_for_test_vector
 
     return best_masks_for_test, best_val_metrics
@@ -175,12 +184,14 @@ def load_tall_mask(remove_keys, ptm_check, config):
             )
         else:
             print("==== Loading TALL Masks built with Task Arithmetic ====")
-            tall_masks = torch.load(os.path.join(mask_location, config.model, f"TALL_mask_{config.num_tasks}task.npy"))
+            tall_masks = torch.load(os.path.join(
+                mask_location, config.model, f"TALL_mask_{config.num_tasks}task.npy"))
     except:
         raise Exception("TALL Masks are not constructed yet.")
 
     # unpack masks and convert back to torch tensors
-    tall_masks = {k: torch.from_numpy(np.unpackbits(v)) for k, v in tall_masks.items()}
+    tall_masks = {k: torch.from_numpy(np.unpackbits(v))
+                  for k, v in tall_masks.items()}
 
     # convert vectors to dictionaries
     tall_masks = {
@@ -219,6 +230,7 @@ def construct_consensus_mask(ptm_check, prun_thre_k, config, remove_keys=[]):
             consensus_mask[key] = consensus_mask[key] + mask[key].float()
         # filter out the least-activated parameters based on given threshold
         consensus_mask[key] = consensus_mask[key].float() >= prun_thre_k
-    consensus_mask_vector = state_dict_to_vector(consensus_mask, remove_keys=remove_keys)
+    consensus_mask_vector = state_dict_to_vector(
+        consensus_mask, remove_keys=remove_keys)
 
     return consensus_mask_vector

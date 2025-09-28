@@ -3,12 +3,12 @@ import time
 from omegaconf import open_dict
 
 import torch
-import wandb
+import logging
 
 from src.datasets import get_dataloader, get_dataset, maybe_dictionarize
 from src.eval.eval import eval_single_dataset
 from src.models import ImageClassifier, ImageEncoder, get_classification_head
-from src.utils import initialize_wandb, parse_arguments
+from src.utils import parse_arguments, setup_logging
 from src.utils.distributed import (
     cleanup_ddp,
     distribute_loader,
@@ -23,11 +23,12 @@ def finetune(rank, args):
     setup_ddp(rank, args.world_size, port=args.port)
 
     if is_main_process():
-        initialize_wandb(args)
+        setup_logging(filename="finetune.log")
 
     train_dataset = args.train_dataset
 
-    ft_path = get_finetuned_path(args.model_location, train_dataset, args.model)
+    ft_path = get_finetuned_path(
+        args.model_location, train_dataset, args.model)
     zs_path = get_zeroshot_path(args.model_location, train_dataset, args.model)
 
     if os.path.exists(zs_path) and os.path.exists(ft_path):
@@ -55,7 +56,8 @@ def finetune(rank, args):
         location=args.data_location,
         batch_size=args.batch_size,
     )
-    data_loader = get_dataloader(dataset, is_train=True, args=args, image_encoder=None)
+    data_loader = get_dataloader(
+        dataset, is_train=True, args=args, image_encoder=None)
     num_batches = len(dataset.train_loader)
 
     # Distribute the data and model across the GPUs.
@@ -84,7 +86,8 @@ def finetune(rank, args):
     if is_main_process():
         ckpdir = os.path.join(args.save_dir, train_dataset)
         os.makedirs(ckpdir, exist_ok=True)
-        model_path = get_zeroshot_path(args.model_location, train_dataset, args.model)
+        model_path = get_zeroshot_path(
+            args.model_location, train_dataset, args.model)
         ddp_model.module.image_encoder.save(model_path)
 
     for epoch in range(args.epochs):
@@ -138,9 +141,10 @@ def finetune(rank, args):
                     f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}\t",  # noqa: E501
                     flush=True,
                 )
-                wandb.log(
+                logging.getLogger("task_singular_vectors").info(
                     {
-                        f"{train_dataset}/train/loss": loss.item(),
+                        "dataset": train_dataset,
+                        "train/loss": loss.item(),
                         "train/data_time": data_time,
                         "train/batch_time": batch_time,
                     }
@@ -152,8 +156,10 @@ def finetune(rank, args):
         test_accuracy = eval_single_dataset(image_encoder, train_dataset, args)
 
     if is_main_process():
-        ft_path = get_finetuned_path(args.model_location, train_dataset, args.model)
-        zs_path = get_zeroshot_path(args.model_location, train_dataset, args.model)
+        ft_path = get_finetuned_path(
+            args.model_location, train_dataset, args.model)
+        zs_path = get_zeroshot_path(
+            args.model_location, train_dataset, args.model)
 
         image_encoder.save(ft_path)
         return zs_path, ft_path
@@ -223,5 +229,6 @@ if __name__ == "__main__":
         print("=" * 100)
         print(f"Finetuning {args.model} on {dataset}")
         print("=" * 100)
-        torch.multiprocessing.spawn(finetune, args=(args,), nprocs=args.world_size)
+        torch.multiprocessing.spawn(
+            finetune, args=(args,), nprocs=args.world_size)
         # finetune(0, args)

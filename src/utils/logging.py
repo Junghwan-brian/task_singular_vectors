@@ -1,44 +1,46 @@
 import os
 import json
+import logging
 import hydra
 from argparse import Namespace
 from pprint import pprint
 
-import wandb
-
 from src.utils.distributed import is_main_process
 
 
-def initialize_wandb(args, disabled=True):
-    if disabled:
-        # for debugging
-        wandb.init(config=args, mode="disabled")
-    else:
-        wandb.init(config=args)
+def setup_logging(filename: str = "main.log", level: int = logging.INFO) -> logging.Logger:
+    """Initialize and return a module-level logger.
 
-    if wandb.run is not None:
-        INVALID_PATHS = [
-            "__old__",
-            "checkpoints",
-            "logs",
-            "outputs",
-            "results",
-            "wandb",
-        ]
-        wandb.run.log_code(
-            exclude_fn=lambda path: any(
-                [
-                    path.startswith(os.path.expanduser(os.getcwd() + "/" + i))
-                    for i in INVALID_PATHS
-                ]
-            )
-        )
-    return wandb
+    Creates a rotating file logger and a console logger if not already present.
+    """
+    logger = logging.getLogger("task_singular_vectors")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(level)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    )
+
+    try:
+        file_handler = logging.FileHandler(filename)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception:
+        # If file handler fails (e.g., no permission), continue with console only
+        pass
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 
-def wandb_log(dictionary: dict):
+def log_dict(dictionary: dict):
     if is_main_process():
-        wandb.log(dictionary)
+        logger = logging.getLogger("task_singular_vectors")
+        logger.info(json.dumps(dictionary))
 
 
 def log_results(final_results, args):
@@ -80,6 +82,5 @@ def log_results(final_results, args):
 
     print("saved results to: ", save_file)
     print("saved results to: ", hydra_save_file)
-    artifact = wandb.Artifact(name="final_results", type="results")
-    artifact.add_file(save_file)
-    wandb.log_artifact(artifact)
+    logger = logging.getLogger("task_singular_vectors")
+    logger.info(f"Results saved to {save_file} and {hydra_save_file}")

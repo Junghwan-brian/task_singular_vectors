@@ -2,8 +2,7 @@ import os
 from pprint import pprint
 
 import hydra
-
-import wandb
+import logging
 from omegaconf import DictConfig, OmegaConf
 
 from src.eval.aggregation import create_task_vector
@@ -22,19 +21,22 @@ def my_app(cfg: DictConfig) -> None:
     cfg.data_location = os.path.expanduser(cfg.data_location)
     OmegaConf.set_struct(cfg, True)
 
-    # set up experiment for WandB
-    print(cfg.method.full_name)
-    print()
-    wandb.init(
-        config=OmegaConf.to_container(cfg),
-        mode=cfg.wandb.mode,
-        project=cfg.wandb.project,
-        group=cfg.wandb.group,
-        dir="logs/",
-    )
-    wandb.config.update({"method.full_name1": cfg.method.full_name})
-    wandb.config.update({"method.keep": cfg.method.k})
-    print(OmegaConf.to_yaml(cfg))
+    # set up experiment logging
+    logger = logging.getLogger("task_singular_vectors")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+        )
+        file_handler = logging.FileHandler("main.log")
+        file_handler.setFormatter(formatter)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+
+    logger.info(cfg.method.full_name)
+    logger.info("\n" + OmegaConf.to_yaml(cfg))
     OmegaConf.set_struct(cfg, True)
 
     # create final task vector
@@ -52,8 +54,7 @@ def my_app(cfg: DictConfig) -> None:
         cfg, task_vector_dict, eval_masks, svd_dict
     )
     pprint(additive_accuracies, width=1)
-    wandb.log(additive_accuracies)
-    wandb.finish(quiet=True)
+    logger.info(f"additive_accuracies: {additive_accuracies}")
 
 
 if __name__ == "__main__":

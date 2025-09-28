@@ -11,11 +11,11 @@ from src.models.heads import get_classification_head
 from src.models.modeling import ImageClassifier
 from src.models.task_vectors import _Checkpoint, _TaskVector
 from src.utils import utils
-from torcheval.metrics.functional import (
-    multiclass_accuracy,
-    multiclass_f1_score,
-    multiclass_confusion_matrix,
-)
+# from torcheval.metrics.functional import (
+#     multiclass_accuracy,
+#     multiclass_f1_score,
+#     multiclass_confusion_matrix,
+# )
 
 
 def eval_single_dataset(image_encoder, dataset_name, args):
@@ -31,7 +31,8 @@ def eval_single_dataset(image_encoder, dataset_name, args):
         location=args.data_location,
         batch_size=args.batch_size,
     )
-    dataloader = get_dataloader(dataset, is_train=False, args=args, image_encoder=None)
+    dataloader = get_dataloader(
+        dataset, is_train=False, args=args, image_encoder=None)
     device = args.device
 
     with torch.no_grad():
@@ -174,7 +175,8 @@ def evaluate_task_vector_at_coef(
 
     coef_info = add_normalized_accuracy(coef_info, args)
     coef_info["avg_normalized_top1"] = np.mean(
-        [coef_info[dataset + ":normalized_top1"] for dataset in args.eval_datasets]
+        [coef_info[dataset + ":normalized_top1"]
+            for dataset in args.eval_datasets]
     )
     coef_info["avg_top1"] = np.mean(
         [coef_info[dataset + ":top1"] for dataset in args.eval_datasets]
@@ -225,7 +227,8 @@ def evaluate_task_vector(
         else:
             for tall_mask_lambda in [0.2, 0.3, 0.4, 0.5, 0.6]:
                 print("\n" * 2)
-                print("=" * 43, f"tall_mask_lambda = {tall_mask_lambda:.2f}", "=" * 43)
+                print(
+                    "=" * 43, f"tall_mask_lambda = {tall_mask_lambda:.2f}", "=" * 43)
                 info[tall_mask_lambda] = evaluate_task_vector_at_coef(
                     task_vector,
                     pretrained_checkpoint,
@@ -236,7 +239,8 @@ def evaluate_task_vector(
                 )
                 print(
                     "\t avg_normalized_top1: {}%\t avg_top1: {}%".format(
-                        round(info[tall_mask_lambda]["avg_normalized_top1"] * 100, 2),
+                        round(info[tall_mask_lambda]
+                              ["avg_normalized_top1"] * 100, 2),
                         round(info[tall_mask_lambda]["avg_top1"] * 100, 2),
                     )
                 )
@@ -265,7 +269,8 @@ def evaluate_task_vector(
 def add_normalized_accuracy(results, args):
     for dataset_name in args.eval_datasets:
         results[dataset_name + ":normalized_top1"] = (
-            results[dataset_name + ":top1"] / args.finetuning_accuracies[dataset_name]
+            results[dataset_name + ":top1"] /
+            args.finetuning_accuracies[dataset_name]
         )
 
     return results
