@@ -193,13 +193,13 @@ if __name__ == "__main__":
         "EMNIST",
     ]
     epochs = {
-        "Cars": 35,
-        "DTD": 76,
-        "EuroSAT": 12,
+        # "Cars": 35,
+        # "DTD": 76,
+        # "EuroSAT": 12,
         "GTSRB": 11,
         "MNIST": 5,
         "RESISC45": 15,
-        "SUN397": 14,
+        # "SUN397": 14,
         "SVHN": 4,
         "CIFAR10": 6,
         "CIFAR100": 6,

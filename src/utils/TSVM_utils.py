@@ -33,13 +33,13 @@ def compute_svd_dict(task_vectors, config):
 
                     temp_u = torch.zeros_like(u)
                     # select only the first reduced_index_s columns of u and place them
-                    temp_u[:, i * reduced_index_s : (i + 1) * reduced_index_s] = u[
+                    temp_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
                         :, :reduced_index_s
                     ]
                     svd_dict[dataset][key]["u"] = temp_u
 
                     temp_s = torch.zeros_like(s)
-                    temp_s[i * reduced_index_s : (i + 1) * reduced_index_s] = s[
+                    temp_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
                         :reduced_index_s
                     ]
 
@@ -47,7 +47,7 @@ def compute_svd_dict(task_vectors, config):
 
                     # select only the first reduced_index_s rows of v and place them
                     temp_v = torch.zeros_like(v)
-                    temp_v[i * reduced_index_s : (i + 1) * reduced_index_s, :] = v[
+                    temp_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
                         :reduced_index_s, :
                     ]
 
@@ -84,9 +84,12 @@ def sum_svd_dict(svd_dict, config):
     new_vector = {}
     for key in svd_dict[config.DATASETS[0]]:
         if "u" in svd_dict[config.DATASETS[0]][key].keys():
-            sum_u = sum([svd_dict[dataset][key]["u"] for dataset in config.DATASETS])
-            sum_s = sum([svd_dict[dataset][key]["s"] for dataset in config.DATASETS])
-            sum_v = sum([svd_dict[dataset][key]["v"] for dataset in config.DATASETS])
+            sum_u = sum([svd_dict[dataset][key]["u"]
+                        for dataset in config.DATASETS])
+            sum_s = sum([svd_dict[dataset][key]["s"]
+                        for dataset in config.DATASETS])
+            sum_v = sum([svd_dict[dataset][key]["v"]
+                        for dataset in config.DATASETS])
 
             u_u, s_u, v_u = torch.linalg.svd(sum_u, full_matrices=False)
             u_v, s_v, v_v = torch.linalg.svd(sum_v, full_matrices=False)
@@ -111,7 +114,7 @@ def sum_svd_dict(svd_dict, config):
 
 
 ###############
-##### LOSSLESS Orthogonalization
+# LOSSLESS Orthogonalization
 def compute_and_sum_svd_mem_reduction_lossless(task_vectors, config):
     """
     Computes the Singular Value Decomposition (SVD) for each task vector and merge the results.
@@ -163,14 +166,14 @@ def compute_and_sum_svd_mem_reduction_lossless(task_vectors, config):
                     reduced_index_s = s.shape[0]
 
                     # select only the first reduced_index_s columns of u and place them
-                    sum_u[:, i * reduced_index_s : (i + 1) * reduced_index_s] = u[
+                    sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
                         :, :reduced_index_s
                     ]
-                    sum_s[i * reduced_index_s : (i + 1) * reduced_index_s] = s[
+                    sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
                         :reduced_index_s
                     ]
                     # select only the first reduced_index_s rows of v and place them
-                    sum_v[i * reduced_index_s : (i + 1) * reduced_index_s, :] = v[
+                    sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
                         :reduced_index_s, :
                     ]
 
@@ -198,7 +201,7 @@ def compute_and_sum_svd_mem_reduction_lossless(task_vectors, config):
 
 
 ###############
-##### LOSSLESS EIGENDECOMP
+# LOSSLESS EIGENDECOMP
 def compute_and_sum_svd_mem_reduction_lossless_eigen(task_vectors, config):
     """
     Computes the Singular Value Decomposition (SVD) for each task vector and merge the results.
@@ -250,14 +253,14 @@ def compute_and_sum_svd_mem_reduction_lossless_eigen(task_vectors, config):
                     reduced_index_s = s.shape[0]
 
                     # select only the first reduced_index_s columns of u and place them
-                    sum_u[:, i * reduced_index_s : (i + 1) * reduced_index_s] = u[
+                    sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
                         :, :reduced_index_s
                     ]
-                    sum_s[i * reduced_index_s : (i + 1) * reduced_index_s] = s[
+                    sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
                         :reduced_index_s
                     ]
                     # select only the first reduced_index_s rows of v and place them
-                    sum_v[i * reduced_index_s : (i + 1) * reduced_index_s, :] = v[
+                    sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
                         :reduced_index_s, :
                     ]
 
@@ -299,7 +302,7 @@ def compute_and_sum_svd_mem_reduction_lossless_eigen(task_vectors, config):
 
 
 ###############
-#### TSV Merge Orthogonalization
+# TSV Merge Orthogonalization
 def compute_and_sum_svd_mem_reduction(task_vectors, config):
     """
     Computes the Singular Value Decomposition (SVD) for each vector in the task_vectors,
@@ -319,6 +322,7 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
     """
     sv_reduction = 1 / len(config.DATASETS)
     device = config.device
+    print(f"DATSETS: {config.DATASETS}")
     print("Computing SVD...")
     with torch.no_grad():
         new_vector = {}
@@ -343,14 +347,14 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
                     reduced_index_s = int(s.shape[0] * sv_reduction)
 
                     # select only the first reduced_index_s columns of u and place them
-                    sum_u[:, i * reduced_index_s : (i + 1) * reduced_index_s] = u[
+                    sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
                         :, :reduced_index_s
                     ]
-                    sum_s[i * reduced_index_s : (i + 1) * reduced_index_s] = s[
+                    sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
                         :reduced_index_s
                     ]
                     # select only the first reduced_index_s rows of v and place them
-                    sum_v[i * reduced_index_s : (i + 1) * reduced_index_s, :] = v[
+                    sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
                         :reduced_index_s, :
                     ]
 
@@ -363,22 +367,20 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
             if len(task_vector.vector[key].shape) == 2 and "text_projection" not in key:
                 u_u, s_u, v_u = torch.linalg.svd(sum_u, full_matrices=False)
                 u_v, s_v, v_v = torch.linalg.svd(sum_v, full_matrices=False)
-
-                new_vector[key] = torch.linalg.multi_dot(
-                    (
-                        u_u,
-                        v_u,
-                        torch.diag(sum_s),
-                        u_v,
-                        v_v,
-                    )
-                )
+                # u_u @ v_u 로 sum_u에 대한 orthogonal matrix 생성
+                u_orth = u_u @ v_u
+                v_orth = u_v @ v_v
+                new_vector[key] = [
+                    u_orth,
+                    torch.diag(sum_s),
+                    v_orth
+                ]
 
     return new_vector
 
 
 ###############
-#### TSV Merge Eigendecomp
+# TSV Merge Eigendecomp
 def compute_and_sum_svd_mem_reduction_2(task_vectors, config):
     """
     Computes the Singular Value Decomposition (SVD) for each vector in the task_vectors,
@@ -422,14 +424,14 @@ def compute_and_sum_svd_mem_reduction_2(task_vectors, config):
                     reduced_index_s = int(s.shape[0] * sv_reduction)
 
                     # select only the first reduced_index_s columns of u and place them
-                    sum_u[:, i * reduced_index_s : (i + 1) * reduced_index_s] = u[
+                    sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
                         :, :reduced_index_s
                     ]
-                    sum_s[i * reduced_index_s : (i + 1) * reduced_index_s] = s[
+                    sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
                         :reduced_index_s
                     ]
                     # select only the first reduced_index_s rows of v and place them
-                    sum_v[i * reduced_index_s : (i + 1) * reduced_index_s, :] = v[
+                    sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
                         :reduced_index_s, :
                     ]
 
@@ -473,7 +475,7 @@ def compute_and_sum_svd_mem_reduction_2(task_vectors, config):
 
 
 ###############
-#### Rank Reduction TV
+# Rank Reduction TV
 def compute_and_sum_svd_mem_reduction_rank_reduction(task_vectors, config):
     """
     Compute and sum the Singular Value Decomposition (SVD) of task vectors with rank reduction.
@@ -517,14 +519,14 @@ def compute_and_sum_svd_mem_reduction_rank_reduction(task_vectors, config):
                     reduced_index_s = int(s.shape[0] * sv_reduction)
 
                     # select only the first reduced_index_s columns of u and place them
-                    sum_u[:, i * reduced_index_s : (i + 1) * reduced_index_s] = u[
+                    sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
                         :, :reduced_index_s
                     ]
-                    sum_s[i * reduced_index_s : (i + 1) * reduced_index_s] = s[
+                    sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
                         :reduced_index_s
                     ]
                     # select only the first reduced_index_s rows of v and place them
-                    sum_v[i * reduced_index_s : (i + 1) * reduced_index_s, :] = v[
+                    sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
                         :reduced_index_s, :
                     ]
 
@@ -570,14 +572,14 @@ def compute_and_sum_svd_mem_reduction_dummy(task_vectors, config):
                         sum_v = torch.zeros_like(v)
 
                         # select only the first reduced_index_s columns of u and place them
-                        sum_u[:, i * reduced_index_s : (i + 1) * reduced_index_s] = u[
+                        sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
                             :, :reduced_index_s
                         ]
-                        sum_s[i * reduced_index_s : (i + 1) * reduced_index_s] = s[
+                        sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
                             :reduced_index_s
                         ]
                         # select only the first reduced_index_s rows of v and place them
-                        sum_v[i * reduced_index_s : (i + 1) * reduced_index_s, :] = v[
+                        sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
                             :reduced_index_s, :
                         ]
                     else:
@@ -592,14 +594,14 @@ def compute_and_sum_svd_mem_reduction_dummy(task_vectors, config):
                         )
 
                         # select only the first reduced_index_s columns of u and place them
-                        sum_u[:, i * reduced_index_s : (i + 1) * reduced_index_s] = u[
+                        sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
                             :, :reduced_index_s
                         ]
-                        sum_s[i * reduced_index_s : (i + 1) * reduced_index_s] = s[
+                        sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
                             :reduced_index_s
                         ]
                         # select only the first reduced_index_s rows of v and place them
-                        sum_v[i * reduced_index_s : (i + 1) * reduced_index_s, :] = v[
+                        sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
                             :reduced_index_s, :
                         ]
 

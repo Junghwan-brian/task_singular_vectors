@@ -74,7 +74,8 @@ def get_all_checkpoints(
     except:
         ptm_check = ImageEncoder(config.model).state_dict()
         torch.save(
-            ptm_check, get_zeroshot_path(model_dir, "MNISTVal", model=config.model)
+            ptm_check, get_zeroshot_path(
+                model_dir, "MNISTVal", model=config.model)
         )
 
     return params, ptm_check
@@ -124,7 +125,8 @@ def get_all_checkpoints_TSVC(
     except:
         ptm_check = ImageEncoder(config.model).state_dict()
         torch.save(
-            ptm_check, get_zeroshot_path(model_dir, "MNISTVal", model=config.model)
+            ptm_check, get_zeroshot_path(
+                model_dir, "MNISTVal", model=config.model)
         )
 
     return params, ptm_check
@@ -144,12 +146,8 @@ def create_task_vector(
             (if applicable).
     """
 
-    if config.method.name == "TSVC":
-        ft_checks, ptm_check = get_all_checkpoints_TSVC(config)
-        check_parameterNamesMatch(list(ft_checks.values()) + [ptm_check])
-    else:
-        ft_checks, ptm_check = get_all_checkpoints(config)
-        check_parameterNamesMatch(ft_checks + [ptm_check])
+    ft_checks, ptm_check = get_all_checkpoints(config)
+    check_parameterNamesMatch(ft_checks + [ptm_check])
 
     remove_keys = []
 
@@ -285,7 +283,8 @@ def create_task_vector(
             vector_to_state_dict(mask, ptm_check, remove_keys=remove_keys)
             for mask in eval_masks
         ]
-        eval_masks = {key: value for key, value in zip(config.DATASETS, eval_masks)}
+        eval_masks = {key: value for key,
+                      value in zip(config.DATASETS, eval_masks)}
 
     elif config.method.name == "TSVM":
         print(f"=== Using SVD ===")
@@ -295,12 +294,14 @@ def create_task_vector(
     elif config.method.name == "TSVM_2":
         print(f"=== Using Eigendecomp ===")
 
-        new_merged_tv = compute_and_sum_svd_mem_reduction_2(task_vectors, config)
+        new_merged_tv = compute_and_sum_svd_mem_reduction_2(
+            task_vectors, config)
     elif config.method.name == "dummy":
         # SVD baseline
         print(f"=== Using Dummy ===")
 
-        new_merged_tv = compute_and_sum_svd_mem_reduction_dummy(task_vectors, config)
+        new_merged_tv = compute_and_sum_svd_mem_reduction_dummy(
+            task_vectors, config)
     elif config.method.name == "TSVC":
         tv_flat_checks, _ = topk_values_mask(
             tv_flat_checks, K=config.method.k, return_mask=False
@@ -311,7 +312,8 @@ def create_task_vector(
         raise ValueError(f"Method {config.method.name} not defined.")
 
     if config.method.name in ["TSVM", "TSVM_2", "dummy"]:
-        task_vector = NonLinearTaskVector(model_name=config.model, vector=new_merged_tv)
+        task_vector = NonLinearTaskVector(
+            model_name=config.model, vector=new_merged_tv)
     else:
         merged_tv_state_dict = vector_to_state_dict(
             merged_tv, ptm_check, remove_keys=remove_keys

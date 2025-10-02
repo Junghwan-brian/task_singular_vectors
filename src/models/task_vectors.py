@@ -70,7 +70,8 @@ class _TaskVector(abc.ABC):
         elif isinstance(checkpoint, torch.nn.Module):
             return checkpoint.state_dict()
         else:
-            raise ValueError(f"Invalid type for checkpoint: {type(checkpoint)}")
+            raise ValueError(
+                f"Invalid type for checkpoint: {type(checkpoint)}")
 
     @abc.abstractmethod
     def _load_checkpoint(self, checkpoint) -> torch.nn.Module:
@@ -83,7 +84,8 @@ class _TaskVector(abc.ABC):
             new_vector = {}
             for key in self.vector:
                 if key not in other.vector:
-                    print(f"Warning, key {key} is not present in both task vectors.")
+                    print(
+                        f"Warning, key {key} is not present in both task vectors.")
                     continue
                 new_vector[key] = self.vector[key] + other.vector[key]
         return self.__class__(vector=new_vector)
@@ -127,7 +129,8 @@ class _TaskVector(abc.ABC):
             dot_product = 0.0
             for key in self.vector:
                 if key not in other.vector:
-                    print(f"Warning, key {key} is not present in both task vectors.")
+                    print(
+                        f"Warning, key {key} is not present in both task vectors.")
                     continue
                 dot_product += torch.sum(self.vector[key] * other.vector[key])
         return dot_product
@@ -149,9 +152,10 @@ class _TaskVector(abc.ABC):
                         f"Warning: key {key} is present in the pretrained state dict but not in the task vector"  # noqa: E501
                     )
                     continue
-                new_state_dict[key] = (
-                    pretrained_state_dict[key] + scaling_coef * self.vector[key]
-                )
+                vector_tensor = self.vector[key].to(
+                    pretrained_state_dict[key].device)
+                new_state_dict[key] = pretrained_state_dict[key] + \
+                    scaling_coef * vector_tensor
         pretrained_model.load_state_dict(new_state_dict)
         return pretrained_model
 

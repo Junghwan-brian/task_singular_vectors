@@ -64,7 +64,8 @@ def accuracy(output: torch.Tensor, target: torch.Tensor, topk: List[int] = (1,))
     pred = output.topk(max(topk), 1, True, True)[1].t()
     correct = pred.eq(target.view(1, -1).expand_as(pred))
     return [
-        float(correct[:k].reshape(-1).float().sum(0, keepdim=True).cpu().numpy())
+        float(correct[:k].reshape(-1).float().sum(0,
+              keepdim=True).cpu().numpy())
         for k in topk
     ]
 
@@ -87,8 +88,13 @@ def torch_save(model, save_path, save_state_dict=True):
 
 
 def torch_load(save_path, device=None):
-    model = torch.load(save_path, map_location="cpu")
-    if device is not None:
+    # PyTorch 2.6+: default weights_only=True can break pickled module loads
+    try:
+        model = torch.load(save_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Older PyTorch without weights_only argument
+        model = torch.load(save_path, map_location="cpu")
+    if device is not None and hasattr(model, "to"):
         model = model.to(device)
     return model
 
@@ -162,7 +168,8 @@ def find_optimal_coef(
     for scaling_coef in results.keys():
         if control_metric is not None:
             if results[scaling_coef][control_metric] < control_metric_threshold:
-                print(f"Control metric fell below {control_metric_threshold} threshold")
+                print(
+                    f"Control metric fell below {control_metric_threshold} threshold")
                 continue
         if minimize:
             if results[scaling_coef][metric] < best_metric:
@@ -308,6 +315,7 @@ def get_ptm_linear(state_dict: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str
         for k, v in state_dict.items()
         if "params0." in k
     }
-    state_dict_remaining = {k: v for k, v in state_dict.items() if "params." not in k}
+    state_dict_remaining = {k: v for k,
+                            v in state_dict.items() if "params." not in k}
 
     return state_dict_new, state_dict_remaining

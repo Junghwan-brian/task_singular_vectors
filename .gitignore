@@ -7,3 +7,8 @@ media/*
 *.pyc
 *.yaml
 logs/*
+*.png
+*.jpg
+*.zip
+datasets/*
+*.json

@@ -19,17 +19,18 @@ pprint(args.__dict__, width=1)
 accuracies = {}
 
 # load pretrained checkpoint
-pretrained_checkpoint = get_zeroshot_path(args.model_location, "MNIST", args.model)
+pretrained_checkpoint = get_zeroshot_path(
+    args.model_location, "MNIST", args.model)
 
 # evaluate each task sequentially
 for dataset in [
     "MNIST",
-    "Cars",
-    "DTD",
-    "EuroSAT",
+    # "Cars",
+    # "DTD",
+    # "EuroSAT",
     "GTSRB",
     "RESISC45",
-    "SUN397",
+    # "SUN397",
     "SVHN",
     "PCAM",
     "CIFAR100",
@@ -50,7 +51,8 @@ for dataset in [
     print(f"Evaluating on {dataset}")
 
     # load finetuned checkpoint
-    finetuned_checkpoint = get_finetuned_path(args.model_location, dataset, args.model)
+    finetuned_checkpoint = get_finetuned_path(
+        args.model_location, dataset, args.model)
     task_vector = NonLinearTaskVector(
         args.model, pretrained_checkpoint, finetuned_checkpoint
     )

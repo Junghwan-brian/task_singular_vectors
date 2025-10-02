@@ -39,12 +39,12 @@ PERCENTAGES = [
 
 DATASETS = [
     "MNIST",
-    "Cars",
-    "DTD",
-    "EuroSAT",
+    # "Cars",
+    # "DTD",
+    # "EuroSAT",
     "GTSRB",
     "RESISC45",
-    "SUN397",
+    # "SUN397",
     "SVHN",
     "PCAM",
     "CIFAR100",
@@ -61,7 +61,8 @@ DATASETS = [
 ]
 
 # load pretrained checkpoint
-pretrained_checkpoint = get_zeroshot_path(args.model_location, "MNIST", args.model)
+pretrained_checkpoint = get_zeroshot_path(
+    args.model_location, "MNIST", args.model)
 
 # evaluate each task sequentially
 for dataset in DATASETS:
@@ -71,7 +72,8 @@ for dataset in DATASETS:
     print(f"Evaluating on {dataset}")
 
     # load finetuned checkpoint
-    finetuned_checkpoint = get_finetuned_path(args.model_location, dataset, args.model)
+    finetuned_checkpoint = get_finetuned_path(
+        args.model_location, dataset, args.model)
 
     task_vector = NonLinearTaskVector(
         args.model, pretrained_checkpoint, finetuned_checkpoint
@@ -99,7 +101,8 @@ for dataset in DATASETS:
             new_vector[key] = {}
             # for i, (task_vector, dataset) in enumerate(zip(task_vectors, config.DATASETS)):
             if len(task_vector.vector[key].shape) == 2 and "text_projection" not in key:
-                u, s, v = torch.linalg.svd(task_vector.vector[key], full_matrices=False)
+                u, s, v = torch.linalg.svd(
+                    task_vector.vector[key], full_matrices=False)
 
                 # print(f"Computed SVD for {key}...")
                 sum_u = torch.zeros_like(u)
