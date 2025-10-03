@@ -367,14 +367,16 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
             if len(task_vector.vector[key].shape) == 2 and "text_projection" not in key:
                 u_u, s_u, v_u = torch.linalg.svd(sum_u, full_matrices=False)
                 u_v, s_v, v_v = torch.linalg.svd(sum_v, full_matrices=False)
-                # u_u @ v_u 로 sum_u에 대한 orthogonal matrix 생성
-                u_orth = u_u @ v_u
-                v_orth = u_v @ v_v
-                new_vector[key] = [
-                    u_orth,
-                    torch.diag(sum_s),
-                    v_orth
-                ]
+
+                new_vector[key] = torch.linalg.multi_dot(
+                    (
+                        u_u,
+                        v_u,
+                        torch.diag(sum_s),
+                        u_v,
+                        v_v,
+                    )
+                )
 
     return new_vector
 

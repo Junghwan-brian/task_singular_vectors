@@ -1,10 +1,10 @@
 # @package _global_
 defaults:
 - _self_
-- method: sum
+- method: TSVM
 
 model: ViT-B-32
-num_tasks: 8
+num_tasks: 20
 specify_lambda: None
 
 DATASETS: ''

@@ -12,6 +12,84 @@ from src.models import ImageClassifier, ImageEncoder, get_classification_head
 from src.utils.variables_and_paths import get_finetuned_path
 from src.utils.sigma_param import SigmaParametrization
 import torch
+from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
+from src.eval.aggregation import get_all_checkpoints
+
+
+def compute_and_sum_svd_mem_reduction(task_vectors, config):
+    """
+    Computes the Singular Value Decomposition (SVD) for each vector in the task_vectors,
+    reduces the dimensionality of the vectors based on the sv_reduction factor, and concatenate
+    the low-rank matrices. If the vector is not a 2D tensor or is "text_projection", it computes the mean of the vectors.
+    Computation of the SVD is performed also for the second operation.
+
+    Args:
+        task_vectors (list): A list of task vector objects, where each object contains a
+                             dictionary of vectors.
+        config (object): Configuration object containing the following attributes:
+                         - DATASETS (list): List of datasets.
+                         - device (torch.device): The device to perform computations on.
+
+    Returns:
+        dict: A dictionary containing the new vectors after SVD computation and merging.
+    """
+    sv_reduction = 1 / len(config.DATASETS)
+    device = config.device
+    print(f"DATSETS: {config.DATASETS}")
+    print("Computing SVD...")
+    with torch.no_grad():
+        new_vector = {}
+        for key in task_vectors[0].vector:
+            new_vector[key] = {}
+            for i, (task_vector, dataset) in enumerate(
+                zip(task_vectors, config.DATASETS)
+            ):
+                vec = task_vector.vector[key].to(device)
+
+                if (
+                    len(task_vector.vector[key].shape) == 2
+                    and "text_projection" not in key
+                ):
+                    u, s, v = torch.linalg.svd(vec, full_matrices=False)
+
+                    if i == 0:
+                        print(f"Computed SVD for {key}...")
+                        sum_u = torch.zeros_like(u, device=device)
+                        sum_s = torch.zeros_like(s, device=device)
+                        sum_v = torch.zeros_like(v, device=device)
+                    reduced_index_s = int(s.shape[0] * sv_reduction)
+
+                    # select only the first reduced_index_s columns of u and place them
+                    sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
+                        :, :reduced_index_s
+                    ]
+                    sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
+                        :reduced_index_s
+                    ]
+                    # select only the first reduced_index_s rows of v and place them
+                    sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
+                        :reduced_index_s, :
+                    ]
+
+                else:
+                    if i == 0:
+                        new_vector[key] = vec.clone()
+                    else:
+                        new_vector[key] += (vec - new_vector[key]) / (i + 1)
+
+            if len(task_vector.vector[key].shape) == 2 and "text_projection" not in key:
+                u_u, s_u, v_u = torch.linalg.svd(sum_u, full_matrices=False)
+                u_v, s_v, v_v = torch.linalg.svd(sum_v, full_matrices=False)
+                # u_u @ v_u 로 sum_u에 대한 orthogonal matrix 생성
+                u_orth = u_u @ v_u
+                v_orth = u_v @ v_v
+                new_vector[key] = [
+                    u_orth,
+                    torch.diag(sum_s),
+                    v_orth
+                ]
+
+    return new_vector
 
 
 @hydra.main(config_path="config", config_name="config", version_base="1.3")
@@ -88,13 +166,20 @@ def my_app(cfg: DictConfig) -> None:
     logger.info("\n" + OmegaConf.to_yaml(cfg))
     OmegaConf.set_struct(cfg, True)
 
+    # TSV Merge Orthogonalization
+    ft_checks, ptm_check = get_all_checkpoints(cfg)
+    # Create the task vectors
+    task_vectors = [
+        NonLinearTaskVector(cfg.model, ptm_check, check) for check in ft_checks
+    ]
+
     # create final task vector
-    task_vector_dict, eval_masks, svd_dict = create_task_vector(cfg)
+    svd_dict = compute_and_sum_svd_mem_reduction(task_vectors, cfg)
 
     # Export SVD bases and initial sigma diagonals for sigma-only finetuning
     try:
         basis = {}
-        for key, value in task_vector_dict.vector.items():
+        for key, value in svd_dict.items():
             # Expect list [U_orth, diag(sum_s), V_orth] for 2D weights
             if isinstance(value, list) and len(value) == 3:
                 U_orth, diag_s, V_orth = value
@@ -120,21 +205,40 @@ def my_app(cfg: DictConfig) -> None:
 
         # Build sigma modules from exported basis in-memory
         sigma_modules = torch.nn.ModuleDict()
+        # Map sanitized keys (valid for Module names) back to original state_dict keys
+        sigma_key_map = {}
         for key, fv in basis.items():
             if all(k in fv for k in ("U", "V", "sigma")):
                 U, V, sigma = fv["U"], fv["V"], fv["sigma"]
                 if U.ndim == 2 and V.ndim == 2 and sigma.ndim == 1:
-                    sigma_modules[key] = SigmaParametrization(U, V, sigma)
+                    # ModuleDict keys cannot contain '.', so sanitize
+                    safe_key = key.replace(".", "_")
+                    # Avoid accidental collisions after sanitization
+                    if safe_key in sigma_key_map:
+                        suffix = 1
+                        candidate = f"{safe_key}_{suffix}"
+                        while candidate in sigma_key_map:
+                            suffix += 1
+                            candidate = f"{safe_key}_{suffix}"
+                        safe_key = candidate
+                    sigma_key_map[safe_key] = key
+                    sigma_modules[safe_key] = SigmaParametrization(U, V, sigma)
         sigma_modules = sigma_modules.cuda()
 
-        test_dataset_name = test_ds + "Val"
+        # Use train split for sigma finetuning and Val split for evaluation
+        train_dataset_name = test_ds
+        val_dataset_name = test_ds + "Val"
         image_encoder = ImageEncoder(cfg.model).cuda()
-        classification_head = get_classification_head(cfg, test_dataset_name)
+        # ensure save_dir exists in cfg for classification head management
+        with open_dict(cfg):
+            if "save_dir" not in cfg:
+                cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
+        classification_head = get_classification_head(cfg, train_dataset_name)
         model = ImageClassifier(image_encoder, classification_head).cuda()
         model.freeze_head()
 
         dataset = get_dataset(
-            test_dataset_name,
+            train_dataset_name,
             model.train_preprocess,
             location=cfg.data_location,
             batch_size=cfg.batch_size,
@@ -152,10 +256,12 @@ def my_app(cfg: DictConfig) -> None:
             with torch.no_grad():
                 new_sd = {k: v.clone() for k, v in base_state_dict.items()}
                 for k, m in modules.items():
-                    if k in new_sd and m.sigma.numel() > 0:
-                        delta = m().to(new_sd[k].device)
-                        if new_sd[k].shape == delta.shape:
-                            new_sd[k] = new_sd[k] + delta
+                    # map sanitized module key back to original state_dict key
+                    orig_key = sigma_key_map.get(k, k)
+                    if orig_key in new_sd and m.sigma.numel() > 0:
+                        delta = m().to(new_sd[orig_key].device)
+                        if new_sd[orig_key].shape == delta.shape:
+                            new_sd[orig_key] = new_sd[orig_key] + delta
                 return new_sd
 
         for epoch in range(int(cfg.sigma_epochs)):
@@ -175,29 +281,38 @@ def my_app(cfg: DictConfig) -> None:
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()
 
-                if i % 100 == 0:
-                    logger.info(
-                        f"[sigma] epoch {epoch} iter {i} loss {loss.item():.4f}")
+            logger.info(
+                f"[sigma] epoch {epoch} loss {loss.item():.4f}")
 
         # Finalize weights and save
         final_sd = apply_sigma_deltas(base_sd, sigma_modules)
         model.image_encoder.load_state_dict(final_sd)
         ft_path = get_finetuned_path(
-            cfg.model_location, test_dataset_name, cfg.model)
+            cfg.model_location, train_dataset_name, cfg.model)
         model.image_encoder.save(ft_path)
         logger.info(f"Saved sigma-finetuned encoder to {ft_path}")
 
         # Evaluate on held-out dataset
         metrics = eval_single_dataset(
-            model.image_encoder, test_dataset_name, cfg)
+            model.image_encoder, val_dataset_name, cfg)
         logger.info(
-            f"Test Acc on {test_dataset_name}: {metrics['top1']*100:.2f}%")
+            f"Test Acc on {val_dataset_name}: {metrics['top1']*100:.2f}%")
 
 
 if __name__ == "__main__":
     # Lightweight argparse wrapper; passes values via environment variables to avoid Hydra conflicts
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--test-dataset", type=str, default="")
+    from src.datasets.registry import registry as DATASET_REGISTRY
+    allowed_test_datasets = sorted(
+        [name for name in DATASET_REGISTRY.keys() if not name.endswith("Val")]
+    )
+    parser.add_argument(
+        "--test-dataset",
+        type=str,
+        choices=allowed_test_datasets,
+        default='CIFAR10',
+        help="Held-out dataset to sigma-finetune on; one of %(choices)s",
+    )
     parser.add_argument("--sigma-epochs", type=int, default=None)
     parser.add_argument("--sigma-lr", type=float, default=None)
     parser.add_argument("--sigma-wd", type=float, default=None)

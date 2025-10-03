@@ -5,6 +5,7 @@ Task_Singular_Vectors_SupMat_Final.pdf
 media/*
 *.log
 *.pyc
+*.pth
 *.yaml
 logs/*
 *.png
