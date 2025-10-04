@@ -14,6 +14,7 @@ from src.utils.sigma_param import SigmaParametrization
 import torch
 from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
 from src.eval.aggregation import get_all_checkpoints
+from torch.nn.utils.stateless import functional_call
 
 
 def compute_and_sum_svd_mem_reduction(task_vectors, config):
@@ -77,7 +78,7 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
                     else:
                         new_vector[key] += (vec - new_vector[key]) / (i + 1)
 
-            if len(task_vector.vector[key].shape) == 2 and "text_projection" not in key:
+            if len(task_vector.vector[key].shape) == 2 and "text_projection" not in key and 'positional' not in key and 'token_embedding' not in key:
                 u_u, s_u, v_u = torch.linalg.svd(sum_u, full_matrices=False)
                 u_v, s_v, v_v = torch.linalg.svd(sum_v, full_matrices=False)
                 # u_u @ v_u 로 sum_u에 대한 orthogonal matrix 생성
@@ -100,11 +101,16 @@ def my_app(cfg: DictConfig) -> None:
         if "test_dataset" not in cfg:
             cfg.test_dataset = ""
         if "sigma_epochs" not in cfg:
-            cfg.sigma_epochs = 5
+            cfg.sigma_epochs = 1
         if "sigma_lr" not in cfg:
-            cfg.sigma_lr = 1e-3
+            cfg.sigma_lr = 1e-4
         if "sigma_wd" not in cfg:
             cfg.sigma_wd = 0.0
+        # scheduler defaults
+        if "sigma_lr_step_size" not in cfg:
+            cfg.sigma_lr_step_size = 1
+        if "sigma_lr_gamma" not in cfg:
+            cfg.sigma_lr_gamma = 0.9
         if "batch_size" not in cfg:
             cfg.batch_size = 128
         if "device" not in cfg:
@@ -126,6 +132,17 @@ def my_app(cfg: DictConfig) -> None:
         if os.environ.get("ENERGY_SIGMA_WD", ""):
             try:
                 cfg.sigma_wd = float(os.environ["ENERGY_SIGMA_WD"])
+            except Exception:
+                pass
+        if os.environ.get("ENERGY_SIGMA_LR_STEP_SIZE", ""):
+            try:
+                cfg.sigma_lr_step_size = int(
+                    os.environ["ENERGY_SIGMA_LR_STEP_SIZE"])
+            except Exception:
+                pass
+        if os.environ.get("ENERGY_SIGMA_LR_GAMMA", ""):
+            try:
+                cfg.sigma_lr_gamma = float(os.environ["ENERGY_SIGMA_LR_GAMMA"])
             except Exception:
                 pass
         if os.environ.get("ENERGY_BATCH_SIZE", ""):
@@ -249,20 +266,13 @@ def my_app(cfg: DictConfig) -> None:
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             params, lr=cfg.sigma_lr, weight_decay=cfg.sigma_wd)
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=int(cfg.sigma_lr_step_size), gamma=float(cfg.sigma_lr_gamma)
+        )
 
-        base_sd = model.image_encoder.state_dict()
-
-        def apply_sigma_deltas(base_state_dict, modules: torch.nn.ModuleDict):
-            with torch.no_grad():
-                new_sd = {k: v.clone() for k, v in base_state_dict.items()}
-                for k, m in modules.items():
-                    # map sanitized module key back to original state_dict key
-                    orig_key = sigma_key_map.get(k, k)
-                    if orig_key in new_sd and m.sigma.numel() > 0:
-                        delta = m().to(new_sd[orig_key].device)
-                        if new_sd[orig_key].shape == delta.shape:
-                            new_sd[orig_key] = new_sd[orig_key] + delta
-                return new_sd
+        # capture base parameters and buffers for functional_call
+        base_params = dict(model.image_encoder.named_parameters())
+        base_buffers = dict(model.image_encoder.named_buffers())
 
         for epoch in range(int(cfg.sigma_epochs)):
             model.train()
@@ -271,22 +281,69 @@ def my_app(cfg: DictConfig) -> None:
                 inputs = batch["images"].cuda()
                 labels = batch["labels"].cuda()
 
-                new_sd = apply_sigma_deltas(base_sd, sigma_modules)
-                model.image_encoder.load_state_dict(new_sd)
+                # build delta map with autograd connectivity
+                delta_map = {}
+                for safe_key, module in sigma_modules.items():
+                    orig_key = sigma_key_map.get(safe_key, safe_key)
+                    if orig_key in base_params and module.sigma.numel() > 0:
+                        delta = module()
+                        if delta.shape == base_params[orig_key].shape:
+                            delta_map[orig_key] = delta
 
-                logits = model(inputs)
+                # combine base params with delta so that grads flow into sigma
+                # detach base params to avoid tracking grads into frozen encoder
+                params_map = {}
+                for name, p in base_params.items():
+                    if name in delta_map:
+                        params_map[name] = p.detach() + delta_map[name]
+                    else:
+                        params_map[name] = p.detach()
+
+                # forward using functional_call to preserve graph w.r.t sigma
+                def encoder_forward(mod, x):
+                    merged = {}
+                    merged.update(base_buffers)
+                    merged.update(params_map)
+                    return functional_call(mod, merged, (x,))
+
+                features = encoder_forward(model.image_encoder, inputs)
+                logits = model.classification_head(features)
                 loss = torch.nn.functional.cross_entropy(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()
 
-            logger.info(
-                f"[sigma] epoch {epoch} loss {loss.item():.4f}")
+                if (i + 1) % 100 == 0:
+                    try:
+                        grad_sum = 0.0
+                        for p in params:
+                            if p.grad is not None:
+                                grad_sum += float(p.grad.detach().abs().sum().item())
+                        logger.info(
+                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} grad_sum {grad_sum:.4e} lr {optimizer.param_groups[0]['lr']:.6f}")
+                    except Exception:
+                        logger.info(
+                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
 
-        # Finalize weights and save
-        final_sd = apply_sigma_deltas(base_sd, sigma_modules)
-        model.image_encoder.load_state_dict(final_sd)
+            # step scheduler at end of epoch
+            scheduler.step()
+            logger.info(
+                f"[sigma] epoch {epoch} end lr {optimizer.param_groups[0]['lr']:.6f}")
+
+        # Finalize weights and save: materialize the final deltas onto base params
+        with torch.no_grad():
+            materialized = {}
+            for name, p in base_params.items():
+                materialized[name] = p.clone()
+            for safe_key, module in sigma_modules.items():
+                orig_key = sigma_key_map.get(safe_key, safe_key)
+                if orig_key in materialized and module.sigma.numel() > 0:
+                    delta = module().to(materialized[orig_key].device)
+                    if materialized[orig_key].shape == delta.shape:
+                        materialized[orig_key] = materialized[orig_key] + delta
+            # load back into encoder
+            model.image_encoder.load_state_dict(materialized, strict=False)
         ft_path = get_finetuned_path(
             cfg.model_location, train_dataset_name, cfg.model)
         model.image_encoder.save(ft_path)
@@ -307,16 +364,19 @@ if __name__ == "__main__":
         [name for name in DATASET_REGISTRY.keys() if not name.endswith("Val")]
     )
     parser.add_argument(
-        "--test-dataset",
+        "--test_dataset",
         type=str,
         choices=allowed_test_datasets,
         default='CIFAR10',
         help="Held-out dataset to sigma-finetune on; one of %(choices)s",
     )
-    parser.add_argument("--sigma-epochs", type=int, default=None)
-    parser.add_argument("--sigma-lr", type=float, default=None)
-    parser.add_argument("--sigma-wd", type=float, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--sigma_epochs", type=int, default=None)
+    parser.add_argument("--sigma_lr", type=float, default=None)
+    parser.add_argument("--sigma_wd", type=float, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    # scheduler hyperparams
+    parser.add_argument("--sigma-lr-step-size", type=int, default=None)
+    parser.add_argument("--sigma-lr-gamma", type=float, default=None)
     # parse_known_args: leave Hydra args intact
     args, _ = parser.parse_known_args()
 
@@ -330,5 +390,9 @@ if __name__ == "__main__":
         os.environ["ENERGY_SIGMA_WD"] = str(args.sigma_wd)
     if args.batch_size is not None:
         os.environ["ENERGY_BATCH_SIZE"] = str(args.batch_size)
+    if getattr(args, "sigma_lr_step_size", None) is not None:
+        os.environ["ENERGY_SIGMA_LR_STEP_SIZE"] = str(args.sigma_lr_step_size)
+    if getattr(args, "sigma_lr_gamma", None) is not None:
+        os.environ["ENERGY_SIGMA_LR_GAMMA"] = str(args.sigma_lr_gamma)
 
     my_app()
