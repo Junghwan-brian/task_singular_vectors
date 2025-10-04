@@ -3,6 +3,7 @@ import hydra
 import logging
 from omegaconf import DictConfig, OmegaConf, open_dict
 import argparse
+import sys
 
 from src.eval.aggregation import create_task_vector
 from src.utils.variables_and_paths import ALL_DATASETS
@@ -378,7 +379,11 @@ if __name__ == "__main__":
     parser.add_argument("--sigma-lr-step-size", type=int, default=None)
     parser.add_argument("--sigma-lr-gamma", type=float, default=None)
     # parse_known_args: leave Hydra args intact
-    args, _ = parser.parse_known_args()
+    args, unknown = parser.parse_known_args()
+
+    # Remove recognized app-specific args so Hydra doesn't see them
+    # and complain about unrecognized arguments.
+    sys.argv = [sys.argv[0]] + unknown
 
     if args.test_dataset:
         os.environ["ENERGY_TEST_DATASET"] = args.test_dataset
