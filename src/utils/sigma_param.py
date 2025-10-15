@@ -18,4 +18,6 @@ class SigmaParametrization(torch.nn.Module):
         self.sigma = torch.nn.Parameter(sigma_vec)
 
     def forward(self):
-        return self.U @ torch.diag(self.sigma) @ self.V
+        # Enforce non-negativity on sigma via ReLU
+        sigma_pos = torch.relu(self.sigma)
+        return self.U @ torch.diag(sigma_pos) @ self.V

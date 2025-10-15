@@ -26,7 +26,7 @@ pretrained_checkpoint = get_zeroshot_path(
 for dataset in [
     "MNIST",
     # "Cars",
-    # "DTD",
+    "DTD",
     # "EuroSAT",
     "GTSRB",
     "RESISC45",

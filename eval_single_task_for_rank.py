@@ -40,7 +40,7 @@ PERCENTAGES = [
 DATASETS = [
     "MNIST",
     # "Cars",
-    # "DTD",
+    "DTD",
     # "EuroSAT",
     "GTSRB",
     "RESISC45",

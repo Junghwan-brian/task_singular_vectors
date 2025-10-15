@@ -16,6 +16,7 @@ import torch
 from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
 from src.eval.aggregation import get_all_checkpoints
 from torch.nn.utils.stateless import functional_call
+import numpy as np
 
 
 def compute_and_sum_svd_mem_reduction(task_vectors, config):
@@ -104,7 +105,7 @@ def my_app(cfg: DictConfig) -> None:
         if "sigma_epochs" not in cfg:
             cfg.sigma_epochs = 1
         if "sigma_lr" not in cfg:
-            cfg.sigma_lr = 1e-4
+            cfg.sigma_lr = 1e-5
         if "sigma_wd" not in cfg:
             cfg.sigma_wd = 0.0
         # scheduler defaults
@@ -116,6 +117,9 @@ def my_app(cfg: DictConfig) -> None:
             cfg.batch_size = 128
         if "device" not in cfg:
             cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # number of training samples to use (0 => use all)
+        if "train_k" not in cfg:
+            cfg.train_k = 0
 
         # override from environment variables (set by argparse in __main__)
         if os.environ.get("ENERGY_TEST_DATASET", ""):
@@ -149,6 +153,11 @@ def my_app(cfg: DictConfig) -> None:
         if os.environ.get("ENERGY_BATCH_SIZE", ""):
             try:
                 cfg.batch_size = int(os.environ["ENERGY_BATCH_SIZE"])
+            except Exception:
+                pass
+        if os.environ.get("ENERGY_TRAIN_K", ""):
+            try:
+                cfg.train_k = int(os.environ["ENERGY_TRAIN_K"])
             except Exception:
                 pass
 
@@ -208,7 +217,11 @@ def my_app(cfg: DictConfig) -> None:
                     "sigma": sigma_vec,
                 }
         if len(basis) > 0:
-            basis_path = f"svd_basis{'_' + test_ds if test_ds else ''}.pth"
+            basis_path = f"basis/svd_basis{'_' + test_ds if test_ds else ''}.pth"
+            # ensure basis directory exists
+            basis_dir = os.path.dirname(basis_path)
+            if basis_dir:
+                os.makedirs(basis_dir, exist_ok=True)
             torch.save(basis, basis_path)
             logger.info(
                 f"Saved SVD basis for sigma finetuning with {len(basis)} entries -> {basis_path}")
@@ -264,6 +277,37 @@ def my_app(cfg: DictConfig) -> None:
         train_loader = get_dataloader(
             dataset, is_train=True, args=cfg, image_encoder=None)
 
+        # Optionally restrict to k training samples if cfg.train_k > 0
+        k = int(cfg.train_k)
+        if k is not None and k > 0:
+            base_dataset = getattr(dataset, "train_dataset", None)
+            if base_dataset is None:
+                # fallback to the dataset behind the current loader
+                base_dataset = getattr(train_loader, "dataset", None)
+            if base_dataset is not None:
+                total = len(base_dataset)
+                if total > 0:
+                    k_eff = min(k, total)
+                    # Deterministic first-k subset to avoid extra randomness
+                    indices = list(range(k_eff))
+                    num_workers = getattr(train_loader, "num_workers", 6)
+                    collate_fn = getattr(train_loader, "collate_fn", None)
+                    train_loader = torch.utils.data.DataLoader(
+                        torch.utils.data.Subset(base_dataset, indices),
+                        batch_size=cfg.batch_size,
+                        shuffle=True,
+                        num_workers=num_workers,
+                        collate_fn=collate_fn,
+                    )
+                    logger.info(
+                        f"Using only {k_eff}/{total} training samples (cfg.train_k={k}).")
+                else:
+                    logger.warning(
+                        "train_dataset appears to be empty; falling back to full loader.")
+            else:
+                logger.warning(
+                    "Could not locate base train_dataset for subsetting; using full loader instead.")
+
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             params, lr=cfg.sigma_lr, weight_decay=cfg.sigma_wd)
@@ -274,6 +318,11 @@ def my_app(cfg: DictConfig) -> None:
         # capture base parameters and buffers for functional_call
         base_params = dict(model.image_encoder.named_parameters())
         base_buffers = dict(model.image_encoder.named_buffers())
+
+        # prepare epoch-wise accuracy accumulation and output directory
+        epoch_top1_list = []
+        epoch_acc_dir = os.path.join(os.getcwd(), "epoch_acc")
+        os.makedirs(epoch_acc_dir, exist_ok=True)
 
         for epoch in range(int(cfg.sigma_epochs)):
             model.train()
@@ -332,6 +381,27 @@ def my_app(cfg: DictConfig) -> None:
             logger.info(
                 f"[sigma] epoch {epoch} end lr {optimizer.param_groups[0]['lr']:.6f}")
 
+            # Evaluate on validation split with current sigma after each epoch
+            with torch.no_grad():
+                materialized = {}
+                for name, p in base_params.items():
+                    materialized[name] = p.clone()
+                for safe_key, module in sigma_modules.items():
+                    orig_key = sigma_key_map.get(safe_key, safe_key)
+                    if orig_key in materialized and module.sigma.numel() > 0:
+                        delta = module().to(materialized[orig_key].device)
+                        if materialized[orig_key].shape == delta.shape:
+                            materialized[orig_key] = materialized[orig_key] + delta
+                model.image_encoder.load_state_dict(materialized, strict=False)
+            metrics_epoch = eval_single_dataset(
+                model.image_encoder, val_dataset_name, cfg)
+            logger.info(
+                f"[sigma] epoch {epoch} val top1 {metrics_epoch['top1']*100:.2f}%")
+            try:
+                epoch_top1_list.append(float(metrics_epoch["top1"]))
+            except Exception:
+                pass
+
         # Finalize weights and save: materialize the final deltas onto base params
         with torch.no_grad():
             materialized = {}
@@ -347,6 +417,10 @@ def my_app(cfg: DictConfig) -> None:
             model.image_encoder.load_state_dict(materialized, strict=False)
         ft_path = get_finetuned_path(
             cfg.model_location, train_dataset_name, cfg.model)
+        # ensure directory for finetuned path exists
+        ft_dir = os.path.dirname(ft_path)
+        if ft_dir:
+            os.makedirs(ft_dir, exist_ok=True)
         model.image_encoder.save(ft_path)
         logger.info(f"Saved sigma-finetuned encoder to {ft_path}")
 
@@ -355,6 +429,24 @@ def my_app(cfg: DictConfig) -> None:
             model.image_encoder, val_dataset_name, cfg)
         logger.info(
             f"Test Acc on {val_dataset_name}: {metrics['top1']*100:.2f}%")
+
+        # Save accumulated epoch accuracies to npy using argparse-provided hyperparameters
+        try:
+            fname = (
+                "energy_train"
+                f"acc_{test_ds}_"
+                f"epochs{int(cfg.sigma_epochs)}_"
+                f"lr{cfg.sigma_lr}_"
+                f"wd{cfg.sigma_wd}_"
+                f"bs{cfg.batch_size}_"
+                f"step{cfg.sigma_lr_step_size}_"
+                f"gamma{cfg.sigma_lr_gamma}.npy"
+            )
+            save_path = os.path.join(epoch_acc_dir, fname)
+            np.save(save_path, np.array(epoch_top1_list, dtype=np.float32))
+            logger.info(f"Saved epoch-wise accuracies -> {save_path}")
+        except Exception as e:
+            logger.exception(f"Failed to save epoch-wise accuracies: {e}")
 
 
 if __name__ == "__main__":
@@ -378,6 +470,8 @@ if __name__ == "__main__":
     # scheduler hyperparams
     parser.add_argument("--sigma-lr-step-size", type=int, default=None)
     parser.add_argument("--sigma-lr-gamma", type=float, default=None)
+    # limit number of training samples (0 => use all)
+    parser.add_argument("--k", type=int, default=None)
     # parse_known_args: leave Hydra args intact
     args, unknown = parser.parse_known_args()
 
@@ -399,5 +493,7 @@ if __name__ == "__main__":
         os.environ["ENERGY_SIGMA_LR_STEP_SIZE"] = str(args.sigma_lr_step_size)
     if getattr(args, "sigma_lr_gamma", None) is not None:
         os.environ["ENERGY_SIGMA_LR_GAMMA"] = str(args.sigma_lr_gamma)
+    if getattr(args, "k", None) is not None:
+        os.environ["ENERGY_TRAIN_K"] = str(args.k)
 
     my_app()

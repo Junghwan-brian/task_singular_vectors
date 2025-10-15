@@ -79,12 +79,36 @@ def torch_load_old(save_path: str, device=None):
 
 
 def torch_save(model, save_path, save_state_dict=True):
-    # TODO: hacky way to save state dict
+    # Convert to state_dict if requested
     if save_state_dict and isinstance(model, torch.nn.Module):
         model = model.state_dict()
-    if os.path.dirname(save_path) != "":
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    torch.save(model, save_path)
+
+    # Move tensors to CPU to make serialization more robust
+    if isinstance(model, dict):
+        cpu_state = {}
+        for k, v in model.items():
+            if hasattr(v, "detach"):
+                try:
+                    cpu_state[k] = v.detach().cpu()
+                except Exception:
+                    cpu_state[k] = v
+            else:
+                cpu_state[k] = v
+        model = cpu_state
+
+    # Ensure directory exists
+    dir_name = os.path.dirname(save_path)
+    if dir_name != "":
+        os.makedirs(dir_name, exist_ok=True)
+
+    # Try modern zip serialization first, then legacy as fallback
+    try:
+        torch.save(model, save_path)
+    except Exception:
+        try:
+            torch.save(model, save_path, _use_new_zipfile_serialization=False)
+        except Exception as e:
+            raise e
 
 
 def torch_load(save_path, device=None):

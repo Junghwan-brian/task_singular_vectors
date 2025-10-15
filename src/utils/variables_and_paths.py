@@ -9,7 +9,7 @@ CACHEDIR = None
 
 ALL_DATASETS = [
     # "Cars",
-    # "DTD",
+    "DTD",
     # "EuroSAT",
     "GTSRB",
     "MNIST",

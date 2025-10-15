@@ -173,7 +173,7 @@ if __name__ == "__main__":
     train_datasets = [
         # "MNIST",
         # "Cars",
-        # "DTD",
+        "DTD",
         # "EuroSAT",
         # "GTSRB",
         # "RESISC45",
@@ -194,7 +194,7 @@ if __name__ == "__main__":
     ]
     epochs = {
         # "Cars": 35,
-        # "DTD": 76,
+        "DTD": 76,
         # "EuroSAT": 12,
         "GTSRB": 11,
         "MNIST": 5,
