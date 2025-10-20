@@ -103,23 +103,26 @@ def my_app(cfg: DictConfig) -> None:
         if "test_dataset" not in cfg:
             cfg.test_dataset = ""
         if "sigma_epochs" not in cfg:
-            cfg.sigma_epochs = 1
+            cfg.sigma_epochs = 5
         if "sigma_lr" not in cfg:
-            cfg.sigma_lr = 1e-5
+            cfg.sigma_lr = 1e-4
         if "sigma_wd" not in cfg:
             cfg.sigma_wd = 0.0
         # scheduler defaults
         if "sigma_lr_step_size" not in cfg:
             cfg.sigma_lr_step_size = 1
         if "sigma_lr_gamma" not in cfg:
-            cfg.sigma_lr_gamma = 0.9
+            cfg.sigma_lr_gamma = 0.1
         if "batch_size" not in cfg:
-            cfg.batch_size = 128
+            cfg.batch_size = 256
         if "device" not in cfg:
             cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
         # number of training samples to use (0 => use all)
         if "train_k" not in cfg:
             cfg.train_k = 0
+        # init scale for sigma (scale singular values when initializing)
+        if "sigma_init_scale" not in cfg:
+            cfg.sigma_init_scale = 0.0
 
         # override from environment variables (set by argparse in __main__)
         if os.environ.get("ENERGY_TEST_DATASET", ""):
@@ -160,6 +163,12 @@ def my_app(cfg: DictConfig) -> None:
                 cfg.train_k = int(os.environ["ENERGY_TRAIN_K"])
             except Exception:
                 pass
+        if os.environ.get("ENERGY_SIGMA_INIT_SCALE", ""):
+            try:
+                cfg.sigma_init_scale = float(
+                    os.environ["ENERGY_SIGMA_INIT_SCALE"])
+            except Exception:
+                pass
 
     # exclude held-out test dataset from basis building
     test_ds = cfg.test_dataset
@@ -188,6 +197,8 @@ def my_app(cfg: DictConfig) -> None:
         stream_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         logger.addHandler(stream_handler)
+    # prevent propagation to root logger to avoid duplicate logs on stdout
+    logger.propagate = False
 
     logger.info(cfg.method.full_name)
     logger.info("\n" + OmegaConf.to_yaml(cfg))
@@ -253,7 +264,10 @@ def my_app(cfg: DictConfig) -> None:
                             candidate = f"{safe_key}_{suffix}"
                         safe_key = candidate
                     sigma_key_map[safe_key] = key
-                    sigma_modules[safe_key] = SigmaParametrization(U, V, sigma)
+                    # scale initial sigma to avoid overly large initial deltas
+                    init_sigma = sigma * float(cfg.sigma_init_scale)
+                    sigma_modules[safe_key] = SigmaParametrization(
+                        U, V, init_sigma)
         sigma_modules = sigma_modules.cuda()
 
         # Use train split for sigma finetuning and Val split for evaluation
@@ -277,36 +291,112 @@ def my_app(cfg: DictConfig) -> None:
         train_loader = get_dataloader(
             dataset, is_train=True, args=cfg, image_encoder=None)
 
-        # Optionally restrict to k training samples if cfg.train_k > 0
+        # Optionally restrict to k shots per class if cfg.train_k > 0
         k = int(cfg.train_k)
         if k is not None and k > 0:
             base_dataset = getattr(dataset, "train_dataset", None)
             if base_dataset is None:
                 # fallback to the dataset behind the current loader
                 base_dataset = getattr(train_loader, "dataset", None)
+
+            def _extract_labels(ds):
+                # Handle torch Subset
+                try:
+                    from torch.utils.data import Subset
+                except Exception:
+                    Subset = None
+                if Subset is not None and isinstance(ds, Subset):
+                    underlying = ds.dataset
+                    base_labels = _extract_labels(underlying)
+                    return [base_labels[i] for i in ds.indices]
+                # Common torchvision datasets
+                if hasattr(ds, "targets") and ds.targets is not None:
+                    labels = ds.targets
+                    if hasattr(labels, "tolist"):
+                        labels = labels.tolist()
+                    return list(labels)
+                if hasattr(ds, "labels") and ds.labels is not None:
+                    labels = ds.labels
+                    if hasattr(labels, "tolist"):
+                        labels = labels.tolist()
+                    return list(labels)
+                if hasattr(ds, "samples") and ds.samples is not None:
+                    # ImageFolder-like
+                    try:
+                        return [lbl for _, lbl in ds.samples]
+                    except Exception:
+                        pass
+                # Fallback: iterate once to build labels
+                try:
+                    labels = []
+                    for idx in range(len(ds)):
+                        sample = ds[idx]
+                        if isinstance(sample, dict):
+                            labels.append(int(sample["labels"]))
+                        else:
+                            # (image, label) or (image, label, ...)
+                            labels.append(int(sample[1]))
+                    return labels
+                except Exception:
+                    return None
+
             if base_dataset is not None:
                 total = len(base_dataset)
-                if total > 0:
-                    k_eff = min(k, total)
-                    # Deterministic first-k subset to avoid extra randomness
-                    indices = list(range(k_eff))
-                    num_workers = getattr(train_loader, "num_workers", 6)
-                    collate_fn = getattr(train_loader, "collate_fn", None)
-                    train_loader = torch.utils.data.DataLoader(
-                        torch.utils.data.Subset(base_dataset, indices),
-                        batch_size=cfg.batch_size,
-                        shuffle=True,
-                        num_workers=num_workers,
-                        collate_fn=collate_fn,
-                    )
-                    logger.info(
-                        f"Using only {k_eff}/{total} training samples (cfg.train_k={k}).")
+                labels = _extract_labels(base_dataset)
+                if total > 0 and labels is not None and len(labels) == total:
+                    # Build per-class indices
+                    try:
+                        labels_array = np.array(labels)
+                        num_classes = None
+                        if hasattr(base_dataset, "classes") and base_dataset.classes is not None:
+                            try:
+                                num_classes = len(base_dataset.classes)
+                            except Exception:
+                                num_classes = None
+                        if num_classes is None:
+                            num_classes = int(
+                                labels_array.max()) + 1 if labels_array.size > 0 else 0
+
+                        few_shot_indices = []
+                        rng = np.random.default_rng(0)
+                        for c in range(num_classes):
+                            class_indices = np.where(labels_array == c)[0]
+                            if class_indices.size == 0:
+                                continue
+                            # deterministic shuffle then take first k
+                            rng.shuffle(class_indices)
+                            take = min(k, class_indices.size)
+                            few_shot_indices.extend(
+                                class_indices[:take].tolist())
+
+                        if len(few_shot_indices) == 0:
+                            logger.warning(
+                                "Few-shot selection produced 0 indices; using full loader instead.")
+                        else:
+                            num_workers = getattr(
+                                train_loader, "num_workers", 6)
+                            collate_fn = getattr(
+                                train_loader, "collate_fn", None)
+                            train_loader = torch.utils.data.DataLoader(
+                                torch.utils.data.Subset(
+                                    base_dataset, few_shot_indices),
+                                batch_size=cfg.batch_size,
+                                shuffle=True,
+                                num_workers=num_workers,
+                                collate_fn=collate_fn,
+                            )
+                            # Report per-class target k and actual total selected
+                            logger.info(
+                                f"Using few-shot sampling: k={k} per class -> total {len(few_shot_indices)}/{total}.")
+                    except Exception as e:
+                        logger.exception(
+                            f"Failed to build few-shot subset (k={k}): {e}. Using full loader.")
                 else:
                     logger.warning(
-                        "train_dataset appears to be empty; falling back to full loader.")
+                        "Could not extract labels for few-shot; using full loader instead.")
             else:
                 logger.warning(
-                    "Could not locate base train_dataset for subsetting; using full loader instead.")
+                    "Could not locate base train_dataset for few-shot; using full loader instead.")
 
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
@@ -326,6 +416,17 @@ def my_app(cfg: DictConfig) -> None:
 
         for epoch in range(int(cfg.sigma_epochs)):
             model.train()
+            # keep encoder in eval mode to freeze BN/Dropout statistics
+            try:
+                model.image_encoder.eval()
+            except Exception:
+                pass
+            # log LR at the start of each epoch (before scheduler step)
+            try:
+                logger.info(
+                    f"[sigma] epoch {epoch} start lr {optimizer.param_groups[0]['lr']:.2e}")
+            except Exception:
+                pass
             for i, batch in enumerate(train_loader):
                 batch = maybe_dictionarize(batch)
                 inputs = batch["images"].cuda()
@@ -361,25 +462,30 @@ def my_app(cfg: DictConfig) -> None:
                 loss = torch.nn.functional.cross_entropy(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                torch.nn.utils.clip_grad_norm_(params, 1.0e-2)
                 optimizer.step()
 
-                if (i + 1) % 100 == 0:
+                if (i + 1) % 500 == 0:
                     try:
                         grad_sum = 0.0
                         for p in params:
                             if p.grad is not None:
                                 grad_sum += float(p.grad.detach().abs().sum().item())
                         logger.info(
-                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} grad_sum {grad_sum:.4e} lr {optimizer.param_groups[0]['lr']:.6f}")
+                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} grad_sum {grad_sum:.4e} lr {optimizer.param_groups[0]['lr']:.2e}")
                     except Exception:
                         logger.info(
-                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
+                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.2e}")
 
-            # step scheduler at end of epoch
+            # step scheduler at end of epoch and log updated LR
             scheduler.step()
-            logger.info(
-                f"[sigma] epoch {epoch} end lr {optimizer.param_groups[0]['lr']:.6f}")
+            try:
+                # also include scheduler view if available
+                current_lr = optimizer.param_groups[0]['lr']
+                logger.info(
+                    f"[sigma] epoch {epoch} end lr {current_lr:.2e}")
+            except Exception:
+                pass
 
             # Evaluate on validation split with current sigma after each epoch
             with torch.no_grad():
@@ -460,7 +566,7 @@ if __name__ == "__main__":
         "--test_dataset",
         type=str,
         choices=allowed_test_datasets,
-        default='CIFAR10',
+        default='CIFAR100',
         help="Held-out dataset to sigma-finetune on; one of %(choices)s",
     )
     parser.add_argument("--sigma_epochs", type=int, default=None)
@@ -472,6 +578,8 @@ if __name__ == "__main__":
     parser.add_argument("--sigma-lr-gamma", type=float, default=None)
     # limit number of training samples (0 => use all)
     parser.add_argument("--k", type=int, default=None)
+    # init scale for sigma diagonal
+    parser.add_argument("--sigma_init_scale", type=float, default=None)
     # parse_known_args: leave Hydra args intact
     args, unknown = parser.parse_known_args()
 
@@ -495,5 +603,7 @@ if __name__ == "__main__":
         os.environ["ENERGY_SIGMA_LR_GAMMA"] = str(args.sigma_lr_gamma)
     if getattr(args, "k", None) is not None:
         os.environ["ENERGY_TRAIN_K"] = str(args.k)
+    if getattr(args, "sigma_init_scale", None) is not None:
+        os.environ["ENERGY_SIGMA_INIT_SCALE"] = str(args.sigma_init_scale)
 
     my_app()

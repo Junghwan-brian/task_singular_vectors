@@ -8,27 +8,23 @@ Fred Zhang <frederic.zhang@adelaide.edu.au>
 Australian Institute for Machine Learning
 """
 
-import os
-import argparse
-import sys
-import time
-import json
-import torch
+from warnings import filterwarnings
 import torchvision
-
+import torch
+import json
+import time
+import sys
+import argparse
+import os
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
 from atlas_src.composition import WeightedImageEncoder
-
-# use task vectors and paths from energy (src.*) environment
 from src.models.task_vectors import NonLinearTaskVector
 from src.utils.variables_and_paths import (
     ALL_DATASETS,
     get_zeroshot_path,
     get_finetuned_path,
 )
-
-# utils: mix atlas wrappers with energy scheduler utils
 from src.utils.utils import cosine_lr
 from atlas_src.utils import get_n_shots, TIPWrapper, LPPWrapper, IndexWrapper, _RepeatSampler
 from atlas_src.args import parse_arguments
@@ -37,6 +33,16 @@ from src.datasets.registry import get_dataset
 from src.models.heads import get_classification_head
 from src.datasets.common import get_dataloader, maybe_dictionarize
 from atlas_src.distributed import cleanup_ddp, distribute_loader, is_main_process, setup_ddp
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+)
+
+
+# use task vectors and paths from energy (src.*) environment
+
+# utils: mix atlas wrappers with energy scheduler utils
 
 
 @torch.jit.script
@@ -49,7 +55,7 @@ def main(rank, args):
     # Harmonize save/model locations with energy environment
     if not hasattr(args, 'model_location') or args.model_location is None:
         base_root = args.save if args.save is not None else os.path.expanduser(
-            "./models/checkpoints")
+            "/disk3/junghwan/task_vector/models/checkpoints")
         args.model_location = base_root
     if not hasattr(args, 'save_dir') or args.save_dir is None:
         args.save_dir = os.path.join(args.model_location, args.model)
@@ -60,8 +66,7 @@ def main(rank, args):
     task_vectors = {}
     for dataset in pool:
         # Resolve checkpoints using energy path helpers
-        pretrained_checkpoint = get_zeroshot_path(
-            args.model_location, dataset, args.model)
+        pretrained_checkpoint = f'/disk3/junghwan/task_vector/models/checkpoints/{args.model}/MNISTVal/nonlinear_zeroshot.pt'
         finetuned_checkpoint = get_finetuned_path(
             args.model_location, dataset, args.model)
         task_vectors[dataset] = NonLinearTaskVector(
@@ -438,7 +443,8 @@ if __name__ == "__main__":
     wrapper.add_argument("--subsample", type=str, default=None)
     wrapper.add_argument("--world_size", type=int, default=None)
     wrapper.add_argument("--port", type=int, default=None)
-    wrapper.add_argument("--data_location", type=str, default=None)
+    wrapper.add_argument("--data_location", type=str,
+                         default='/home/junghwan/task_singular_vectors/datasets')
     wrapper.add_argument("--model_location", type=str, default=None)
     wrapper.add_argument("--seed", type=int, default=None)
     wrapper.add_argument("--print_every", type=int, default=None)
@@ -470,6 +476,14 @@ if __name__ == "__main__":
         args.port = cli_args.port
     if cli_args.data_location is not None:
         args.data_location = cli_args.data_location
+    # Align data path handling with energy_train.py: default to "datasets" and expanduser
+    try:
+        if cli_args.data_location is None:
+            args.data_location = os.path.expanduser("datasets")
+        else:
+            args.data_location = os.path.expanduser(args.data_location)
+    except Exception:
+        pass
     if cli_args.model_location is not None:
         args.model_location = cli_args.model_location
     if cli_args.seed is not None:

@@ -4,7 +4,7 @@ import pickle
 import numpy as np
 import torch
 import tqdm
-from src.datasets.common import maybe_dictionarize
+from atlas_src.datasets.common import maybe_dictionarize
 from torch.utils.data.sampler import BatchSampler
 import itertools
 
