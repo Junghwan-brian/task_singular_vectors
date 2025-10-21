@@ -13,84 +13,122 @@ from src.models import ImageClassifier, ImageEncoder, get_classification_head
 from src.utils.variables_and_paths import get_finetuned_path
 from src.utils.sigma_param import SigmaParametrization
 import torch
-from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
+from src.models.task_vectors import NonLinearTaskVector
 from src.eval.aggregation import get_all_checkpoints
 from torch.nn.utils.stateless import functional_call
-import numpy as np
+
+import math
+import torch
+
+
+class FunctionalEncoderWrapper(torch.nn.Module):
+    """
+    평가 시점에만 베이스 파라미터와 현재 시그마 델타를 합성해 forward 하는 래퍼.
+    베이스 모듈의 파라미터는 수정하지 않으며, functional_call로만 합성합니다.
+    """
+
+    def __init__(self, base_encoder: torch.nn.Module, buffers: dict, params: dict):
+        super().__init__()
+        self.base_encoder = base_encoder
+        self._buffers_map = buffers
+        self._params_map = params
+        # preserve preprocessors for downstream dataloader construction
+        self.train_preprocess = getattr(base_encoder, "train_preprocess", None)
+        self.val_preprocess = getattr(base_encoder, "val_preprocess", None)
+
+    def forward(self, x):
+        merged = {}
+        merged.update(self._buffers_map)
+        merged.update(self._params_map)
+        return functional_call(self.base_encoder, merged, (x,))
 
 
 def compute_and_sum_svd_mem_reduction(task_vectors, config):
     """
-    Computes the Singular Value Decomposition (SVD) for each vector in the task_vectors,
-    reduces the dimensionality of the vectors based on the sv_reduction factor, and concatenate
-    the low-rank matrices. If the vector is not a 2D tensor or is "text_projection", it computes the mean of the vectors.
-    Computation of the SVD is performed also for the second operation.
-
-    Args:
-        task_vectors (list): A list of task vector objects, where each object contains a
-                             dictionary of vectors.
-        config (object): Configuration object containing the following attributes:
-                         - DATASETS (list): List of datasets.
-                         - device (torch.device): The device to perform computations on.
-
-    Returns:
-        dict: A dictionary containing the new vectors after SVD computation and merging.
+    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
+    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과 sigma(diag)로 재구성.
     """
-    sv_reduction = 1 / len(config.DATASETS)
     device = config.device
-    print(f"DATSETS: {config.DATASETS}")
+    datasets = list(config.DATASETS)
+    num_tasks = int(len(datasets))
+    print(f"DATSETS: {datasets}")
     print("Computing SVD...")
+
     with torch.no_grad():
         new_vector = {}
-        for key in task_vectors[0].vector:
-            new_vector[key] = {}
-            for i, (task_vector, dataset) in enumerate(
-                zip(task_vectors, config.DATASETS)
-            ):
-                vec = task_vector.vector[key].to(device)
 
-                if (
-                    len(task_vector.vector[key].shape) == 2
-                    and "text_projection" not in key
-                ):
-                    u, s, v = torch.linalg.svd(vec, full_matrices=False)
+        # 공통 필터 함수(임베딩류 제외)
+        def is_matrix_key(tv0, key):
+            return (
+                tv0.vector[key].ndim == 2 and
+                all(t not in key for t in ("text_projection",
+                    "positional", "token_embedding"))
+            )
 
-                    if i == 0:
-                        print(f"Computed SVD for {key}...")
-                        sum_u = torch.zeros_like(u, device=device)
-                        sum_s = torch.zeros_like(s, device=device)
-                        sum_v = torch.zeros_like(v, device=device)
-                    reduced_index_s = int(s.shape[0] * sv_reduction)
+        # 키 순회
+        tv0 = task_vectors[0]
+        for key in tv0.vector:
+            # 2D 행렬이 아니거나 제외 키면: 단순 평균
+            if not is_matrix_key(tv0, key):
+                avg = None
+                for i, tv in enumerate(task_vectors):
+                    vec = tv.vector[key].to(device)
+                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
+                new_vector[key] = avg
+                continue
 
-                    # select only the first reduced_index_s columns of u and place them
-                    sum_u[:, i * reduced_index_s: (i + 1) * reduced_index_s] = u[
-                        :, :reduced_index_s
-                    ]
-                    sum_s[i * reduced_index_s: (i + 1) * reduced_index_s] = s[
-                        :reduced_index_s
-                    ]
-                    # select only the first reduced_index_s rows of v and place them
-                    sum_v[i * reduced_index_s: (i + 1) * reduced_index_s, :] = v[
-                        :reduced_index_s, :
-                    ]
+            # -------- SVD 축 모으기 준비 --------
+            # 첫 태스크에서 모양/순위 파악
+            vec0 = task_vectors[0].vector[key].to(device)
+            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
+            m = int(u0.shape[0])
+            r = int(s0.shape[0])          # 유효 랭크 상한
+            n = int(vh0.shape[1])
 
-                else:
-                    if i == 0:
-                        new_vector[key] = vec.clone()
-                    else:
-                        new_vector[key] += (vec - new_vector[key]) / (i + 1)
+            if r == 0:
+                # 드물지만 0-rank 보호장치
+                new_vector[key] = torch.zeros_like(vec0)
+                continue
 
-            if len(task_vector.vector[key].shape) == 2 and "text_projection" not in key and 'positional' not in key and 'token_embedding' not in key:
-                u_u, s_u, v_u = torch.linalg.svd(sum_u, full_matrices=False)
-                u_v, s_v, v_v = torch.linalg.svd(sum_v, full_matrices=False)
-                # u_u @ v_u 로 sum_u에 대한 orthogonal matrix 생성
-                u_orth = u_u @ v_u
-                v_orth = u_v @ v_v
-                new_vector[key] = [
-                    u_orth,
-                    torch.diag(sum_s),
-                    v_orth
-                ]
+            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
+            num_used = min(num_tasks, r)
+
+            # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
+            k = max(1, r // num_used)
+            chunks = int(k * num_used)    # <= r 보장
+
+            # 버퍼를 '정수 차원'으로 명시해 생성
+            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
+            sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype)
+            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
+
+            # 각 태스크에서 상위 k개 축만 수집
+            for i, tv in enumerate(task_vectors[:num_used]):
+                vec = tv.vector[key].to(device)
+                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
+
+                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
+                r_i = int(s.shape[0])
+                k_i = min(k, r_i)  # 안전 클램프
+
+                start = i * k
+                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
+
+                sum_u[:, start:end] = u[:, :k_i]
+                sum_s[start:end] = s[:k_i]
+                sum_v[start:end, :] = vh[:k_i, :]
+
+            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
+            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
+            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
+            U_orth = u_u @ vh_u          # (m × chunks)
+            V_orth = u_v @ vh_v          # (chunks × n)
+
+            # sigma는 대각으로 유지(여기서는 단순 concat된 sum_s)
+            Sigma = torch.diag(sum_s)
+
+            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
+            new_vector[key] = [U_orth, Sigma, V_orth]
 
     return new_vector
 
@@ -104,71 +142,24 @@ def my_app(cfg: DictConfig) -> None:
             cfg.test_dataset = ""
         if "sigma_epochs" not in cfg:
             cfg.sigma_epochs = 5
-        if "sigma_lr" not in cfg:
-            cfg.sigma_lr = 1e-4
         if "sigma_wd" not in cfg:
             cfg.sigma_wd = 0.0
         # scheduler defaults
         if "sigma_lr_step_size" not in cfg:
             cfg.sigma_lr_step_size = 1
         if "sigma_lr_gamma" not in cfg:
-            cfg.sigma_lr_gamma = 0.1
-        if "batch_size" not in cfg:
-            cfg.batch_size = 256
-        if "device" not in cfg:
-            cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # number of training samples to use (0 => use all)
-        if "train_k" not in cfg:
-            cfg.train_k = 0
-        # init scale for sigma (scale singular values when initializing)
-        if "sigma_init_scale" not in cfg:
-            cfg.sigma_init_scale = 0.0
+            cfg.sigma_lr_gamma = 0.5
+
+        cfg.sigma_lr = float(os.environ["ENERGY_SIGMA_LR"])
+        cfg.sigma_wd = float(os.environ["ENERGY_SIGMA_WD"])
+        cfg.sigma_lr_step_size = int(os.environ["ENERGY_SIGMA_LR_STEP_SIZE"])
+        cfg.sigma_lr_gamma = float(os.environ["ENERGY_SIGMA_LR_GAMMA"])
+        cfg.batch_size = int(os.environ["ENERGY_BATCH_SIZE"])
+        cfg.device = "cuda:3" if torch.cuda.is_available() else "cpu"
 
         # override from environment variables (set by argparse in __main__)
         if os.environ.get("ENERGY_TEST_DATASET", ""):
             cfg.test_dataset = os.environ["ENERGY_TEST_DATASET"]
-        if os.environ.get("ENERGY_SIGMA_EPOCHS", ""):
-            try:
-                cfg.sigma_epochs = int(os.environ["ENERGY_SIGMA_EPOCHS"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_LR", ""):
-            try:
-                cfg.sigma_lr = float(os.environ["ENERGY_SIGMA_LR"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_WD", ""):
-            try:
-                cfg.sigma_wd = float(os.environ["ENERGY_SIGMA_WD"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_LR_STEP_SIZE", ""):
-            try:
-                cfg.sigma_lr_step_size = int(
-                    os.environ["ENERGY_SIGMA_LR_STEP_SIZE"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_LR_GAMMA", ""):
-            try:
-                cfg.sigma_lr_gamma = float(os.environ["ENERGY_SIGMA_LR_GAMMA"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_BATCH_SIZE", ""):
-            try:
-                cfg.batch_size = int(os.environ["ENERGY_BATCH_SIZE"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_TRAIN_K", ""):
-            try:
-                cfg.train_k = int(os.environ["ENERGY_TRAIN_K"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_INIT_SCALE", ""):
-            try:
-                cfg.sigma_init_scale = float(
-                    os.environ["ENERGY_SIGMA_INIT_SCALE"])
-            except Exception:
-                pass
 
     # exclude held-out test dataset from basis building
     test_ds = cfg.test_dataset
@@ -197,7 +188,7 @@ def my_app(cfg: DictConfig) -> None:
         stream_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         logger.addHandler(stream_handler)
-    # prevent propagation to root logger to avoid duplicate logs on stdout
+    # Prevent duplicate logs from propagating to the root/Hydra loggers
     logger.propagate = False
 
     logger.info(cfg.method.full_name)
@@ -228,11 +219,7 @@ def my_app(cfg: DictConfig) -> None:
                     "sigma": sigma_vec,
                 }
         if len(basis) > 0:
-            basis_path = f"basis/svd_basis{'_' + test_ds if test_ds else ''}.pth"
-            # ensure basis directory exists
-            basis_dir = os.path.dirname(basis_path)
-            if basis_dir:
-                os.makedirs(basis_dir, exist_ok=True)
+            basis_path = f"svd_basis{'_' + test_ds if test_ds else ''}.pth"
             torch.save(basis, basis_path)
             logger.info(
                 f"Saved SVD basis for sigma finetuning with {len(basis)} entries -> {basis_path}")
@@ -264,22 +251,20 @@ def my_app(cfg: DictConfig) -> None:
                             candidate = f"{safe_key}_{suffix}"
                         safe_key = candidate
                     sigma_key_map[safe_key] = key
-                    # scale initial sigma to avoid overly large initial deltas
-                    init_sigma = sigma * float(cfg.sigma_init_scale)
-                    sigma_modules[safe_key] = SigmaParametrization(
-                        U, V, init_sigma)
-        sigma_modules = sigma_modules.cuda()
+                    sigma_modules[safe_key] = SigmaParametrization(U, V, sigma)
+        sigma_modules = sigma_modules.to(cfg.device)
 
         # Use train split for sigma finetuning and Val split for evaluation
         train_dataset_name = test_ds
         val_dataset_name = test_ds + "Val"
-        image_encoder = ImageEncoder(cfg.model).cuda()
+        image_encoder = ImageEncoder(cfg.model).to(cfg.device)
         # ensure save_dir exists in cfg for classification head management
         with open_dict(cfg):
             if "save_dir" not in cfg:
                 cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
         classification_head = get_classification_head(cfg, train_dataset_name)
-        model = ImageClassifier(image_encoder, classification_head).cuda()
+        model = ImageClassifier(
+            image_encoder, classification_head).to(cfg.device)
         model.freeze_head()
 
         dataset = get_dataset(
@@ -290,113 +275,6 @@ def my_app(cfg: DictConfig) -> None:
         )
         train_loader = get_dataloader(
             dataset, is_train=True, args=cfg, image_encoder=None)
-
-        # Optionally restrict to k shots per class if cfg.train_k > 0
-        k = int(cfg.train_k)
-        if k is not None and k > 0:
-            base_dataset = getattr(dataset, "train_dataset", None)
-            if base_dataset is None:
-                # fallback to the dataset behind the current loader
-                base_dataset = getattr(train_loader, "dataset", None)
-
-            def _extract_labels(ds):
-                # Handle torch Subset
-                try:
-                    from torch.utils.data import Subset
-                except Exception:
-                    Subset = None
-                if Subset is not None and isinstance(ds, Subset):
-                    underlying = ds.dataset
-                    base_labels = _extract_labels(underlying)
-                    return [base_labels[i] for i in ds.indices]
-                # Common torchvision datasets
-                if hasattr(ds, "targets") and ds.targets is not None:
-                    labels = ds.targets
-                    if hasattr(labels, "tolist"):
-                        labels = labels.tolist()
-                    return list(labels)
-                if hasattr(ds, "labels") and ds.labels is not None:
-                    labels = ds.labels
-                    if hasattr(labels, "tolist"):
-                        labels = labels.tolist()
-                    return list(labels)
-                if hasattr(ds, "samples") and ds.samples is not None:
-                    # ImageFolder-like
-                    try:
-                        return [lbl for _, lbl in ds.samples]
-                    except Exception:
-                        pass
-                # Fallback: iterate once to build labels
-                try:
-                    labels = []
-                    for idx in range(len(ds)):
-                        sample = ds[idx]
-                        if isinstance(sample, dict):
-                            labels.append(int(sample["labels"]))
-                        else:
-                            # (image, label) or (image, label, ...)
-                            labels.append(int(sample[1]))
-                    return labels
-                except Exception:
-                    return None
-
-            if base_dataset is not None:
-                total = len(base_dataset)
-                labels = _extract_labels(base_dataset)
-                if total > 0 and labels is not None and len(labels) == total:
-                    # Build per-class indices
-                    try:
-                        labels_array = np.array(labels)
-                        num_classes = None
-                        if hasattr(base_dataset, "classes") and base_dataset.classes is not None:
-                            try:
-                                num_classes = len(base_dataset.classes)
-                            except Exception:
-                                num_classes = None
-                        if num_classes is None:
-                            num_classes = int(
-                                labels_array.max()) + 1 if labels_array.size > 0 else 0
-
-                        few_shot_indices = []
-                        rng = np.random.default_rng(0)
-                        for c in range(num_classes):
-                            class_indices = np.where(labels_array == c)[0]
-                            if class_indices.size == 0:
-                                continue
-                            # deterministic shuffle then take first k
-                            rng.shuffle(class_indices)
-                            take = min(k, class_indices.size)
-                            few_shot_indices.extend(
-                                class_indices[:take].tolist())
-
-                        if len(few_shot_indices) == 0:
-                            logger.warning(
-                                "Few-shot selection produced 0 indices; using full loader instead.")
-                        else:
-                            num_workers = getattr(
-                                train_loader, "num_workers", 6)
-                            collate_fn = getattr(
-                                train_loader, "collate_fn", None)
-                            train_loader = torch.utils.data.DataLoader(
-                                torch.utils.data.Subset(
-                                    base_dataset, few_shot_indices),
-                                batch_size=cfg.batch_size,
-                                shuffle=True,
-                                num_workers=num_workers,
-                                collate_fn=collate_fn,
-                            )
-                            # Report per-class target k and actual total selected
-                            logger.info(
-                                f"Using few-shot sampling: k={k} per class -> total {len(few_shot_indices)}/{total}.")
-                    except Exception as e:
-                        logger.exception(
-                            f"Failed to build few-shot subset (k={k}): {e}. Using full loader.")
-                else:
-                    logger.warning(
-                        "Could not extract labels for few-shot; using full loader instead.")
-            else:
-                logger.warning(
-                    "Could not locate base train_dataset for few-shot; using full loader instead.")
 
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
@@ -409,28 +287,12 @@ def my_app(cfg: DictConfig) -> None:
         base_params = dict(model.image_encoder.named_parameters())
         base_buffers = dict(model.image_encoder.named_buffers())
 
-        # prepare epoch-wise accuracy accumulation and output directory
-        epoch_top1_list = []
-        epoch_acc_dir = os.path.join(os.getcwd(), "epoch_acc")
-        os.makedirs(epoch_acc_dir, exist_ok=True)
-
         for epoch in range(int(cfg.sigma_epochs)):
             model.train()
-            # keep encoder in eval mode to freeze BN/Dropout statistics
-            try:
-                model.image_encoder.eval()
-            except Exception:
-                pass
-            # log LR at the start of each epoch (before scheduler step)
-            try:
-                logger.info(
-                    f"[sigma] epoch {epoch} start lr {optimizer.param_groups[0]['lr']:.2e}")
-            except Exception:
-                pass
             for i, batch in enumerate(train_loader):
                 batch = maybe_dictionarize(batch)
-                inputs = batch["images"].cuda()
-                labels = batch["labels"].cuda()
+                inputs = batch["images"].to(cfg.device)
+                labels = batch["labels"].to(cfg.device)
 
                 # build delta map with autograd connectivity
                 delta_map = {}
@@ -439,7 +301,9 @@ def my_app(cfg: DictConfig) -> None:
                     if orig_key in base_params and module.sigma.numel() > 0:
                         delta = module()
                         if delta.shape == base_params[orig_key].shape:
-                            delta_map[orig_key] = delta
+                            # ensure delta is on the same device as the base parameter
+                            delta_map[orig_key] = delta.to(
+                                base_params[orig_key].device)
 
                 # combine base params with delta so that grads flow into sigma
                 # detach base params to avoid tracking grads into frozen encoder
@@ -462,51 +326,51 @@ def my_app(cfg: DictConfig) -> None:
                 loss = torch.nn.functional.cross_entropy(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, 1.0e-2)
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()
 
-                if (i + 1) % 500 == 0:
+                if (i + 1) % 100 == 0:
                     try:
                         grad_sum = 0.0
                         for p in params:
                             if p.grad is not None:
                                 grad_sum += float(p.grad.detach().abs().sum().item())
                         logger.info(
-                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} grad_sum {grad_sum:.4e} lr {optimizer.param_groups[0]['lr']:.2e}")
+                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} grad_sum {grad_sum:.4e} lr {optimizer.param_groups[0]['lr']:.6f}")
                     except Exception:
                         logger.info(
-                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.2e}")
+                            f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
 
-            # step scheduler at end of epoch and log updated LR
+            # step scheduler at end of epoch
             scheduler.step()
-            try:
-                # also include scheduler view if available
-                current_lr = optimizer.param_groups[0]['lr']
-                logger.info(
-                    f"[sigma] epoch {epoch} end lr {current_lr:.2e}")
-            except Exception:
-                pass
-
-            # Evaluate on validation split with current sigma after each epoch
+            # Evaluate on held-out dataset
+            # rebuild delta and params map for eval (no grad)
             with torch.no_grad():
-                materialized = {}
-                for name, p in base_params.items():
-                    materialized[name] = p.clone()
+                eval_delta_map = {}
                 for safe_key, module in sigma_modules.items():
                     orig_key = sigma_key_map.get(safe_key, safe_key)
-                    if orig_key in materialized and module.sigma.numel() > 0:
-                        delta = module().to(materialized[orig_key].device)
-                        if materialized[orig_key].shape == delta.shape:
-                            materialized[orig_key] = materialized[orig_key] + delta
-                model.image_encoder.load_state_dict(materialized, strict=False)
-            metrics_epoch = eval_single_dataset(
-                model.image_encoder, val_dataset_name, cfg)
+                    if orig_key in base_params and module.sigma.numel() > 0:
+                        d = module()
+                        if d.shape == base_params[orig_key].shape:
+                            eval_delta_map[orig_key] = d.to(
+                                base_params[orig_key].device)
+
+                eval_params_map = {}
+                for name, p in base_params.items():
+                    if name in eval_delta_map:
+                        eval_params_map[name] = p.detach() + \
+                            eval_delta_map[name]
+                    else:
+                        eval_params_map[name] = p.detach()
+
+                wrapped_encoder = FunctionalEncoderWrapper(
+                    model.image_encoder, base_buffers, eval_params_map
+                )
+
+            metrics = eval_single_dataset(
+                wrapped_encoder, val_dataset_name, cfg)
             logger.info(
-                f"[sigma] epoch {epoch} val top1 {metrics_epoch['top1']*100:.2f}%")
-            try:
-                epoch_top1_list.append(float(metrics_epoch["top1"]))
-            except Exception:
-                pass
+                f"Epoch: {epoch} test Acc on {val_dataset_name}: {metrics['top1']*100:.2f}%")
 
         # Finalize weights and save: materialize the final deltas onto base params
         with torch.no_grad():
@@ -523,10 +387,6 @@ def my_app(cfg: DictConfig) -> None:
             model.image_encoder.load_state_dict(materialized, strict=False)
         ft_path = get_finetuned_path(
             cfg.model_location, train_dataset_name, cfg.model)
-        # ensure directory for finetuned path exists
-        ft_dir = os.path.dirname(ft_path)
-        if ft_dir:
-            os.makedirs(ft_dir, exist_ok=True)
         model.image_encoder.save(ft_path)
         logger.info(f"Saved sigma-finetuned encoder to {ft_path}")
 
@@ -535,24 +395,6 @@ def my_app(cfg: DictConfig) -> None:
             model.image_encoder, val_dataset_name, cfg)
         logger.info(
             f"Test Acc on {val_dataset_name}: {metrics['top1']*100:.2f}%")
-
-        # Save accumulated epoch accuracies to npy using argparse-provided hyperparameters
-        try:
-            fname = (
-                "energy_train"
-                f"acc_{test_ds}_"
-                f"epochs{int(cfg.sigma_epochs)}_"
-                f"lr{cfg.sigma_lr}_"
-                f"wd{cfg.sigma_wd}_"
-                f"bs{cfg.batch_size}_"
-                f"step{cfg.sigma_lr_step_size}_"
-                f"gamma{cfg.sigma_lr_gamma}.npy"
-            )
-            save_path = os.path.join(epoch_acc_dir, fname)
-            np.save(save_path, np.array(epoch_top1_list, dtype=np.float32))
-            logger.info(f"Saved epoch-wise accuracies -> {save_path}")
-        except Exception as e:
-            logger.exception(f"Failed to save epoch-wise accuracies: {e}")
 
 
 if __name__ == "__main__":
@@ -566,20 +408,16 @@ if __name__ == "__main__":
         "--test_dataset",
         type=str,
         choices=allowed_test_datasets,
-        default='CIFAR100',
+        default='CIFAR10',
         help="Held-out dataset to sigma-finetune on; one of %(choices)s",
     )
-    parser.add_argument("--sigma_epochs", type=int, default=None)
-    parser.add_argument("--sigma_lr", type=float, default=None)
-    parser.add_argument("--sigma_wd", type=float, default=None)
-    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--sigma_epochs", type=int, default=5)
+    parser.add_argument("--sigma_lr", type=float, default=1e-3)
+    parser.add_argument("--sigma_wd", type=float, default=0)
+    parser.add_argument("--batch_size", type=int, default=256)
     # scheduler hyperparams
-    parser.add_argument("--sigma-lr-step-size", type=int, default=None)
-    parser.add_argument("--sigma-lr-gamma", type=float, default=None)
-    # limit number of training samples (0 => use all)
-    parser.add_argument("--k", type=int, default=None)
-    # init scale for sigma diagonal
-    parser.add_argument("--sigma_init_scale", type=float, default=None)
+    parser.add_argument("--sigma-lr-step-size", type=int, default=1)
+    parser.add_argument("--sigma-lr-gamma", type=float, default=0.5)
     # parse_known_args: leave Hydra args intact
     args, unknown = parser.parse_known_args()
 
@@ -587,23 +425,12 @@ if __name__ == "__main__":
     # and complain about unrecognized arguments.
     sys.argv = [sys.argv[0]] + unknown
 
-    if args.test_dataset:
-        os.environ["ENERGY_TEST_DATASET"] = args.test_dataset
-    if args.sigma_epochs is not None:
-        os.environ["ENERGY_SIGMA_EPOCHS"] = str(args.sigma_epochs)
-    if args.sigma_lr is not None:
-        os.environ["ENERGY_SIGMA_LR"] = str(args.sigma_lr)
-    if args.sigma_wd is not None:
-        os.environ["ENERGY_SIGMA_WD"] = str(args.sigma_wd)
-    if args.batch_size is not None:
-        os.environ["ENERGY_BATCH_SIZE"] = str(args.batch_size)
-    if getattr(args, "sigma_lr_step_size", None) is not None:
-        os.environ["ENERGY_SIGMA_LR_STEP_SIZE"] = str(args.sigma_lr_step_size)
-    if getattr(args, "sigma_lr_gamma", None) is not None:
-        os.environ["ENERGY_SIGMA_LR_GAMMA"] = str(args.sigma_lr_gamma)
-    if getattr(args, "k", None) is not None:
-        os.environ["ENERGY_TRAIN_K"] = str(args.k)
-    if getattr(args, "sigma_init_scale", None) is not None:
-        os.environ["ENERGY_SIGMA_INIT_SCALE"] = str(args.sigma_init_scale)
+    os.environ["ENERGY_TEST_DATASET"] = args.test_dataset
+    os.environ["ENERGY_SIGMA_EPOCHS"] = str(args.sigma_epochs)
+    os.environ["ENERGY_SIGMA_LR"] = str(args.sigma_lr)
+    os.environ["ENERGY_SIGMA_WD"] = str(args.sigma_wd)
+    os.environ["ENERGY_BATCH_SIZE"] = str(args.batch_size)
+    os.environ["ENERGY_SIGMA_LR_STEP_SIZE"] = str(args.sigma_lr_step_size)
+    os.environ["ENERGY_SIGMA_LR_GAMMA"] = str(args.sigma_lr_gamma)
 
     my_app()
