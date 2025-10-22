@@ -546,7 +546,6 @@ def my_app(cfg: DictConfig) -> None:
 
             # step scheduler at end of epoch
             scheduler.step()
-            asdfasdf
 
             if epoch in eval_epochs:
                 model.eval()
