@@ -1,0 +1,47 @@
+# @package _global_
+defaults:
+- _self_
+- method: TSVM
+
+model: ViT-B-32
+num_tasks: 15
+
+DATASETS: ''
+
+DATASETS_VAL: ''
+
+DATASETS_ALL:
+  - AID
+  - CLRS
+  - EuroSAT_RGB
+  - MLRSNet
+  - NWPU-RESISC45
+  - Optimal-31
+  - PatternNet
+  - RS_C11
+  - RSD46-WHU
+  - RSI-CB128
+  - RSSCN7
+  - SAT-4
+  - SIRI-WHU
+  - UC_Merced
+  - WHU-RS19
+
+cache_dir: None
+world_size: 1
+port: 12355
+n_eval_points: 31
+device: "cuda"
+batch_size: 128
+data_location: "./datasets"
+model_location: "./models/checkpoints_remote_sensing"
+save_subfolder: ""
+svd_keep_topk: 4 
+
+hydra:
+  run:
+    dir: ./logs/remote_sensing/${model}/${method.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ./logs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
