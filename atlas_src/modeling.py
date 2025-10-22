@@ -27,13 +27,22 @@ class ImageEncoder(torch.nn.Module):
         else:
             name = args.model
             pretrained = "openai"
-        (
-            self.model,
-            self.train_preprocess,
-            self.val_preprocess,
-        ) = open_clip.create_model_and_transforms(
-            name, pretrained=pretrained, cache_dir=args.openclip_cachedir
-        )
+        try:
+            (
+                self.model,
+                self.train_preprocess,
+                self.val_preprocess,
+            ) = open_clip.create_model_and_transforms(
+                name, pretrained=pretrained, cache_dir=args.openclip_cachedir
+            )
+        except TypeError:
+            (
+                self.model,
+                self.train_preprocess,
+                self.val_preprocess,
+            ) = open_clip.create_model_and_transforms(
+                name, pretrained=pretrained
+            )
 
         self.cache_dir = args.cache_dir
 
