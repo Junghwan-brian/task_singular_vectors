@@ -16,6 +16,7 @@ import sys
 import time
 import gc
 import json
+import copy
 from pathlib import Path
 
 import torch
@@ -42,6 +43,12 @@ from src.datasets.remote_sensing import (
     get_remote_sensing_classification_head,
     clean_dataset_logs,
 )
+
+
+def cli_flag_provided(flag: str) -> bool:
+    """Return True if a CLI flag like '--batch-size' was explicitly provided."""
+    long_form = f"--{flag}"
+    return any(arg == long_form or arg.startswith(f"{long_form}=") for arg in sys.argv)
 
 
 def finetune_remote_sensing(rank, args, is_multilabel=False):
@@ -95,6 +102,13 @@ def finetune_remote_sensing(rank, args, is_multilabel=False):
         num_workers=6,
         is_multilabel=is_multilabel,  # Pass multi-label flag
     )
+    
+    # Log total number of training samples for visibility
+    try:
+        train_size = len(dataset.train_loader.dataset)
+    except AttributeError:
+        train_size = len(getattr(dataset, "train_dataset", []))
+    print(f"Total training samples for {dataset_name_no_val}: {train_size}")
     
     # Get classification head
     classification_head = get_remote_sensing_classification_head(args, train_dataset, dataset)
@@ -310,6 +324,9 @@ def finetune_remote_sensing(rank, args, is_multilabel=False):
 
 
 if __name__ == "__main__":
+    base_args = parse_arguments()
+    batch_size_overridden = cli_flag_provided("batch-size")
+    
     # ============================================================================
     # Single-Label Datasets (standard image classification)
     # ============================================================================
@@ -363,157 +380,220 @@ if __name__ == "__main__":
         "Million-AID": 2,       # Large dataset, 350x350 (multi-label, 3 labels per image)
         "RSI-CB256": 10,        # ~30,000 train samples, 256x256 (multi-label, 2 labels per image)
     }
-    
-    # ============================================================================
-    # Train Single-Label Datasets
-    # ============================================================================
-    single_trained = 0
-    single_skipped = 0
-    
-    if train_datasets_single:
-        print("\n" + "=" * 100)
-        print(f"SINGLE-LABEL DATASETS: {len(train_datasets_single)} datasets")
-        print("=" * 100 + "\n")
-        
-        for dataset in train_datasets_single:
-            args = parse_arguments()
-            args.lr = 1e-5
-            args.epochs = epochs.get(dataset, 20)  # Default 20 epochs if not specified
-            args.train_dataset = dataset + "Val"
-            args.save_dir = os.path.join(args.model_location, args.model)
-            args.data_location = "./datasets"  # Remote sensing datasets location
-            
-            # Check if already fine-tuned
-            ft_path = get_finetuned_path(args.model_location, args.train_dataset, args.model)
-            print(f"ft_path: {ft_path}")
-            print("models/checkpoints_remote_sensing/ViT-B-32/AIDVal/nonlinear_finetuned.pt")
-            print(os.path.exists(ft_path))
-            if os.path.exists(ft_path):
-                print("\n" + "=" * 100)
-                print(f"[SINGLE-LABEL] SKIPPING {dataset} - Already fine-tuned")
-                print(f"Checkpoint exists: {ft_path}")
-                
-                # Check if training info exists
-                info_path = ft_path.replace('.pt', '_training_info.json')
-                if os.path.exists(info_path):
-                    with open(info_path, 'r') as f:
-                        info = json.load(f)
-                    print(f"Previous training time: {info.get('total_time_minutes', 'N/A'):.2f} minutes")
-                print("=" * 100 + "\n")
-                single_skipped += 1
-                continue
-            
-            # Use all available GPUs
-            args.world_size = torch.cuda.device_count()
-            
-            # Batch size settings
-            args.batch_size = 128 if args.model == "ViT-L-14" else 512
-            args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
-            
-            print("\n" + "=" * 100)
-            print(f"[SINGLE-LABEL] Finetuning {args.model} on {dataset} for {args.epochs} epochs")
-            print(f"Batch size: {args.batch_size} | Grad accumulation: {args.num_grad_accumulation}")
-            print(f"Using {args.world_size} GPUs with DDP")
-            print("=" * 100 + "\n")
-            
-            torch.multiprocessing.spawn(
-                finetune_remote_sensing, args=(args, False), nprocs=args.world_size
-            )
-            
-            single_trained += 1
-            
-            # Clean up GPU memory after each dataset
-            torch.cuda.empty_cache()
-            gc.collect()
-            time.sleep(2)  # Give time for processes to fully terminate
-            
-            print("\n" + "=" * 100)
-            print(f"[SINGLE-LABEL] Completed fine-tuning on {dataset}")
-            print(f"GPU Memory cleaned up")
-            print("=" * 100 + "\n")
-    
-    # ============================================================================
-    # Train Multi-Label Datasets
-    # ============================================================================
-    multi_trained = 0
-    multi_skipped = 0
-    
-    if train_datasets_multi:
-        print("\n" + "=" * 100)
-        print(f"MULTI-LABEL DATASETS: {len(train_datasets_multi)} datasets")
-        print("=" * 100 + "\n")
-        
-        for dataset in train_datasets_multi:
-            args = parse_arguments()
-            args.lr = 1e-5
-            args.epochs = epochs.get(dataset, 20)  # Default 20 epochs if not specified
-            args.train_dataset = dataset + "Val"
-            args.save_dir = os.path.join(args.model_location, args.model)
-            args.data_location = "./datasets"  # Remote sensing datasets location
-            
-            # Check if already fine-tuned
-            ft_path = get_finetuned_path(args.model_location, args.train_dataset, args.model)
-            print(f"ft_path: {ft_path}")
-            if os.path.exists(ft_path):
-                print("\n" + "=" * 100)
-                print(f"[MULTI-LABEL] SKIPPING {dataset} - Already fine-tuned")
-                print(f"Checkpoint exists: {ft_path}")
-                
-                # Check if training info exists
-                info_path = ft_path.replace('.pt', '_training_info.json')
-                if os.path.exists(info_path):
-                    with open(info_path, 'r') as f:
-                        info = json.load(f)
-                    print(f"Previous training time: {info.get('total_time_minutes', 'N/A'):.2f} minutes")
-                print("=" * 100 + "\n")
-                multi_skipped += 1
-                continue
-            
-            # Use all available GPUs
-            args.world_size = torch.cuda.device_count()
-            
-            # Batch size settings
-            args.batch_size = 64 if args.model == "ViT-L-14" else 128
-            args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
-            
-            print("\n" + "=" * 100)
-            print(f"[MULTI-LABEL] Finetuning {args.model} on {dataset} for {args.epochs} epochs")
-            print(f"Batch size: {args.batch_size} | Grad accumulation: {args.num_grad_accumulation}")
-            print(f"Using {args.world_size} GPUs with DDP")
-            print("=" * 100 + "\n")
-            
-            torch.multiprocessing.spawn(
-                finetune_remote_sensing, args=(args, True), nprocs=args.world_size
-            )
-            
-            multi_trained += 1
-            
-            # Clean up GPU memory after each dataset
-            torch.cuda.empty_cache()
-            gc.collect()
-            time.sleep(2)  # Give time for processes to fully terminate
-            
-            print("\n" + "=" * 100)
-            print(f"[MULTI-LABEL] Completed fine-tuning on {dataset}")
-            print(f"GPU Memory cleaned up")
-            print("=" * 100 + "\n")
-    
-    # ============================================================================
-    # Summary
-    # ============================================================================
-    print("\n" + "=" * 100)
-    print("FINE-TUNING SUMMARY")
-    print("=" * 100)
-    print(f"Single-label datasets:")
-    print(f"  Total: {len(train_datasets_single) if train_datasets_single else 0}")
-    print(f"  Trained: {single_trained}")
-    print(f"  Skipped (already fine-tuned): {single_skipped}")
-    print(f"\nMulti-label datasets:")
-    print(f"  Total: {len(train_datasets_multi) if train_datasets_multi else 0}")
-    print(f"  Trained: {multi_trained}")
-    print(f"  Skipped (already fine-tuned): {multi_skipped}")
-    print(f"\nGrand Total:")
-    print(f"  Trained: {single_trained + multi_trained}")
-    print(f"  Skipped: {single_skipped + multi_skipped}")
-    print("=" * 100 + "\n")
 
+    run_all_models = getattr(base_args, "run_all", False)
+    models_to_run = (
+        ["ViT-B-16", "ViT-B-32", "ViT-L-14"] if run_all_models else [base_args.model]
+    )
+
+    overall_results = []
+
+    for model_name in models_to_run:
+        args_template = copy.deepcopy(base_args)
+        args_template.model = model_name
+        args_template.save_dir = os.path.join(
+            args_template.model_location, args_template.model
+        )
+        
+        print("\n" + "=" * 100)
+        print(f"RUNNING FINE-TUNING FOR MODEL: {model_name}")
+        print("=" * 100 + "\n")
+
+        # ----------------------------------------------------------------------
+        # Single-label datasets
+        # ----------------------------------------------------------------------
+        single_trained = 0
+        single_skipped = 0
+
+        if train_datasets_single:
+            print("\n" + "=" * 100)
+            print(
+                f"[{model_name}] SINGLE-LABEL DATASETS: {len(train_datasets_single)} datasets"
+            )
+            print("=" * 100 + "\n")
+
+            for dataset in train_datasets_single:
+                args = copy.deepcopy(args_template)
+                args.lr = 1e-5
+                args.epochs = epochs.get(dataset, 20)
+                args.train_dataset = dataset + "Val"
+                args.data_location = args_template.data_location
+                args.save_dir = os.path.join(args.model_location, args.model)
+
+                ft_path = get_finetuned_path(
+                    args.model_location, args.train_dataset, args.model
+                )
+                if os.path.exists(ft_path):
+                    print("\n" + "=" * 100)
+                    print(
+                        f"[{model_name} | SINGLE-LABEL] SKIPPING {dataset} - Already fine-tuned"
+                    )
+                    print(f"Checkpoint exists: {ft_path}")
+
+                    info_path = ft_path.replace(".pt", "_training_info.json")
+                    if os.path.exists(info_path):
+                        with open(info_path, "r") as f:
+                            info = json.load(f)
+                        print(
+                            f"Previous training time: {info.get('total_time_minutes', 'N/A'):.2f} minutes"
+                        )
+                    print("=" * 100 + "\n")
+                    single_skipped += 1
+                    continue
+
+                args.world_size = torch.cuda.device_count()
+
+                if not batch_size_overridden:
+                    args.batch_size = 128 if args.model == "ViT-L-14" else 512
+                args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
+
+                print("\n" + "=" * 100)
+                print(
+                    f"[{model_name} | SINGLE-LABEL] Finetuning on {dataset} for {args.epochs} epochs"
+                )
+                print(
+                    f"Batch size: {args.batch_size} | Grad accumulation: {args.num_grad_accumulation}"
+                )
+                print(f"Using {args.world_size} GPUs with DDP")
+                print("=" * 100 + "\n")
+
+                torch.multiprocessing.spawn(
+                    finetune_remote_sensing, args=(args, False), nprocs=args.world_size
+                )
+
+                single_trained += 1
+
+                torch.cuda.empty_cache()
+                gc.collect()
+                time.sleep(2)
+
+                print("\n" + "=" * 100)
+                print(
+                    f"[{model_name} | SINGLE-LABEL] Completed fine-tuning on {dataset}"
+                )
+                print("GPU Memory cleaned up")
+                print("=" * 100 + "\n")
+
+        # ----------------------------------------------------------------------
+        # Multi-label datasets
+        # ----------------------------------------------------------------------
+        multi_trained = 0
+        multi_skipped = 0
+
+        if train_datasets_multi:
+            print("\n" + "=" * 100)
+            print(
+                f"[{model_name}] MULTI-LABEL DATASETS: {len(train_datasets_multi)} datasets"
+            )
+            print("=" * 100 + "\n")
+
+            for dataset in train_datasets_multi:
+                args = copy.deepcopy(args_template)
+                args.lr = 1e-5
+                args.epochs = epochs.get(dataset, 20)
+                args.train_dataset = dataset + "Val"
+                args.data_location = args_template.data_location
+                args.save_dir = os.path.join(args.model_location, args.model)
+
+                ft_path = get_finetuned_path(
+                    args.model_location, args.train_dataset, args.model
+                )
+                if os.path.exists(ft_path):
+                    print("\n" + "=" * 100)
+                    print(
+                        f"[{model_name} | MULTI-LABEL] SKIPPING {dataset} - Already fine-tuned"
+                    )
+                    print(f"Checkpoint exists: {ft_path}")
+
+                    info_path = ft_path.replace(".pt", "_training_info.json")
+                    if os.path.exists(info_path):
+                        with open(info_path, "r") as f:
+                            info = json.load(f)
+                        print(
+                            f"Previous training time: {info.get('total_time_minutes', 'N/A'):.2f} minutes"
+                        )
+                    print("=" * 100 + "\n")
+                    multi_skipped += 1
+                    continue
+
+                args.world_size = torch.cuda.device_count()
+
+                if not batch_size_overridden:
+                    args.batch_size = 64 if args.model == "ViT-L-14" else 128
+                args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
+
+                print("\n" + "=" * 100)
+                print(
+                    f"[{model_name} | MULTI-LABEL] Finetuning on {dataset} for {args.epochs} epochs"
+                )
+                print(
+                    f"Batch size: {args.batch_size} | Grad accumulation: {args.num_grad_accumulation}"
+                )
+                print(f"Using {args.world_size} GPUs with DDP")
+                print("=" * 100 + "\n")
+
+                torch.multiprocessing.spawn(
+                    finetune_remote_sensing, args=(args, True), nprocs=args.world_size
+                )
+
+                multi_trained += 1
+
+                torch.cuda.empty_cache()
+                gc.collect()
+                time.sleep(2)
+
+                print("\n" + "=" * 100)
+                print(
+                    f"[{model_name} | MULTI-LABEL] Completed fine-tuning on {dataset}"
+                )
+                print("GPU Memory cleaned up")
+                print("=" * 100 + "\n")
+
+        # ----------------------------------------------------------------------
+        # Summary per model
+        # ----------------------------------------------------------------------
+        print("\n" + "=" * 100)
+        print(f"FINE-TUNING SUMMARY ({model_name})")
+        print("=" * 100)
+        print("Single-label datasets:")
+        print(f"  Total: {len(train_datasets_single) if train_datasets_single else 0}")
+        print(f"  Trained: {single_trained}")
+        print(f"  Skipped (already fine-tuned): {single_skipped}")
+        print("\nMulti-label datasets:")
+        print(f"  Total: {len(train_datasets_multi) if train_datasets_multi else 0}")
+        print(f"  Trained: {multi_trained}")
+        print(f"  Skipped (already fine-tuned): {multi_skipped}")
+        print(f"\nGrand Total:")
+        print(f"  Trained: {single_trained + multi_trained}")
+        print(f"  Skipped: {single_skipped + multi_skipped}")
+        print("=" * 100 + "\n")
+
+        overall_results.append(
+            {
+                "model": model_name,
+                "single_trained": single_trained,
+                "single_skipped": single_skipped,
+                "multi_trained": multi_trained,
+                "multi_skipped": multi_skipped,
+            }
+        )
+
+    if len(overall_results) > 1:
+        total_single_trained = sum(r["single_trained"] for r in overall_results)
+        total_single_skipped = sum(r["single_skipped"] for r in overall_results)
+        total_multi_trained = sum(r["multi_trained"] for r in overall_results)
+        total_multi_skipped = sum(r["multi_skipped"] for r in overall_results)
+
+        print("\n" + "=" * 100)
+        print("AGGREGATED FINE-TUNING SUMMARY (ALL MODELS)")
+        print("=" * 100)
+        print("Single-label datasets:")
+        print(f"  Trained: {total_single_trained}")
+        print(f"  Skipped (already fine-tuned): {total_single_skipped}")
+        print("\nMulti-label datasets:")
+        print(f"  Trained: {total_multi_trained}")
+        print(f"  Skipped (already fine-tuned): {total_multi_skipped}")
+        print(f"\nGrand Total:")
+        print(f"  Trained: {total_single_trained + total_multi_trained}")
+        print(f"  Skipped: {total_single_skipped + total_multi_skipped}")
+        print("=" * 100 + "\n")
