@@ -44,7 +44,7 @@ from src.eval.eval_remote_sensing_comparison import evaluate_encoder_with_datalo
 
 # Dataset-specific epochs for Atlas training (matching fine-tuning epochs)
 ATLAS_EPOCHS_PER_DATASET = {
-    "AID": 30,              # ~10,000 train samples, 600x600
+    "AID": 60,              # ~10,000 train samples, 600x600
     "CLRS": 10,             # ~30,000 train samples, 256x256
     "EuroSAT_RGB": 15,      # ~21,600 train samples, 64x64
     "MLRSNet": 15,          # ~17,000 train samples, 256x256

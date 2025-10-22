@@ -87,7 +87,7 @@ def visualize_sigma_matrices(
                 f"Min: {sigma_vals.min():.4f}"
             )
             ax.text(
-                1.20,
+                1.40,
                 0.5,
                 stats,
                 transform=ax.transAxes,

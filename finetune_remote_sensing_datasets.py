@@ -343,7 +343,7 @@ if __name__ == "__main__":
     # ]
     
     epochs = {
-        "AID": 30,              # ~10,000 train samples, 600x600
+        "AID": 60,              # ~10,000 train samples, 600x600
         "CLRS": 10,             # ~30,000 train samples, 256x256
         "EuroSAT_RGB": 12,      # ~21,600 train samples, 64x64
         "MLRSNet": 15,          # ~17,000 train samples, 256x256
