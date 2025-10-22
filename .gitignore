@@ -13,3 +13,5 @@ logs/*
 *.zip
 datasets/*
 *.json
+*.pt
+*.txt
