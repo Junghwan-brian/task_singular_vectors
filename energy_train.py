@@ -8,6 +8,7 @@ import sys
 from src.eval.aggregation import create_task_vector
 from src.utils.variables_and_paths import ALL_DATASETS
 from src.datasets import get_dataloader, get_dataset, maybe_dictionarize
+from src.datasets.common import SubsetSampler
 from src.eval.eval import eval_single_dataset
 from src.models import ImageClassifier, ImageEncoder, get_classification_head
 from src.utils.variables_and_paths import get_finetuned_path
@@ -16,9 +17,13 @@ import torch
 from src.models.task_vectors import NonLinearTaskVector
 from src.eval.aggregation import get_all_checkpoints
 from torch.nn.utils.stateless import functional_call
+from atlas_src.utils import get_n_shots, IndexWrapper
 
 import math
 import torch
+import torchvision
+import random
+import numpy as np
 
 
 class FunctionalEncoderWrapper(torch.nn.Module):
@@ -46,13 +51,15 @@ class FunctionalEncoderWrapper(torch.nn.Module):
 def compute_and_sum_svd_mem_reduction(task_vectors, config):
     """
     여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
-    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과 sigma(diag)로 재구성.
+    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
+    '재계산된 평균' sigma(diag)로 재구성.
     """
     device = config.device
     datasets = list(config.DATASETS)
     num_tasks = int(len(datasets))
     print(f"DATSETS: {datasets}")
     print("Computing SVD...")
+    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
 
     with torch.no_grad():
         new_vector = {}
@@ -94,12 +101,24 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
             num_used = min(num_tasks, r)
 
             # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
-            k = max(1, r // num_used)
+            # k = max(1, r // num_used)
+            max_per_task = max(1, r // num_used)
+            k = min(desired_k, max_per_task)
+            if desired_k > max_per_task:
+                print(
+                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
+                    desired_k,
+                    max_per_task,
+                    key,
+                    k,
+                )
+
             chunks = int(k * num_used)    # <= r 보장
+            # print(f"chunks: {chunks}")
 
             # 버퍼를 '정수 차원'으로 명시해 생성
             sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
-            sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype)
+            # sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype) # [수정] 더 이상 sum_s 필요 없음
             sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
 
             # 각 태스크에서 상위 k개 축만 수집
@@ -115,7 +134,7 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
                 end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
 
                 sum_u[:, start:end] = u[:, :k_i]
-                sum_s[start:end] = s[:k_i]
+                # sum_s[start:end] = s[:k_i] # [수정] 더 이상 sum_s 필요 없음
                 sum_v[start:end, :] = vh[:k_i, :]
 
             # 직교화(각 집합에 대해 다시 SVD → U*Vh)
@@ -124,8 +143,47 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
             U_orth = u_u @ vh_u          # (m × chunks)
             V_orth = u_v @ vh_v          # (chunks × n)
 
-            # sigma는 대각으로 유지(여기서는 단순 concat된 sum_s)
-            Sigma = torch.diag(sum_s)
+            # -------- [수정된 Sigma 계산 로직 시작] --------
+
+            # 1. 각 태스크 벡터(M_i)를 공통 기저(U_orth, V_orth)로 투영하여
+            #    최적의 대각 행렬(sigma_task)을 찾습니다.
+            #    M_i ≈ U_orth @ Sigma_i @ V_orth 이므로,
+            #    Sigma_i' = U_orth.T @ M_i @ V_orth.T 를 계산합니다.
+
+            all_sigma_diags = []
+
+            # U_orth (m, chunks) -> U_orth.T (chunks, m)
+            # V_orth (chunks, n) -> V_orth.T (n, chunks)
+            U_orth_T = U_orth.T
+            V_orth_T = V_orth.T
+
+            # "모든" 태스크 벡터에 대해 반복 (num_used 뿐만 아니라)
+            for tv in task_vectors:
+                M_i = tv.vector[key].to(device)  # 원본 태스크 행렬 (m, n)
+
+                # Sigma_i_prime = (U_orth.T @ M_i) @ V_orth.T
+                # (chunks, m) @ (m, n) @ (n, chunks) -> (chunks, chunks)
+                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T
+
+                # "이를 diagonal로 만들도록 해야해" -> 대각 성분만 추출
+                sigma_task_diag = torch.diag(Sigma_i_prime)  # (chunks,)
+                all_sigma_diags.append(sigma_task_diag)
+
+            # 2. 모든 태스크의 sigma_task_diag를 평균냅니다.
+            if not all_sigma_diags:
+                # 엣지 케이스 방어
+                Sigma = torch.zeros(
+                    (chunks, chunks), device=device, dtype=u0.dtype)
+            else:
+                # (num_tasks, chunks)
+                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
+                # (chunks,)
+                mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
+
+                # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
+                Sigma = torch.diag(mean_sigma_diag)  # (chunks, chunks)
+
+            # -------- [수정된 Sigma 계산 로직 끝] --------
 
             # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
             new_vector[key] = [U_orth, Sigma, V_orth]
@@ -155,11 +213,31 @@ def my_app(cfg: DictConfig) -> None:
         cfg.sigma_lr_step_size = int(os.environ["ENERGY_SIGMA_LR_STEP_SIZE"])
         cfg.sigma_lr_gamma = float(os.environ["ENERGY_SIGMA_LR_GAMMA"])
         cfg.batch_size = int(os.environ["ENERGY_BATCH_SIZE"])
-        cfg.device = "cuda:3" if torch.cuda.is_available() else "cpu"
+        # atlas 기본과 동일하게 디바이스 자동 선택(고정 GPU 인덱스 제거)
+        cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # few-shot 옵션 (0이면 전체 사용)
+        cfg.k_shot = int(os.environ.get("ENERGY_K_SHOT", "0"))
+        cfg.sigma_epochs = int(os.environ.get("ENERGY_SIGMA_EPOCHS", "5"))
+        cfg.svd_keep_topk = int(os.environ.get("ENERGY_SVD_KEEP_TOPK", "3"))
+        cfg.seed = int(os.environ.get("ENERGY_SEED", "1"))
 
         # override from environment variables (set by argparse in __main__)
         if os.environ.get("ENERGY_TEST_DATASET", ""):
             cfg.test_dataset = os.environ["ENERGY_TEST_DATASET"]
+
+    # atlas 기본과 경로 정렬: model_location/save_dir/data_location 기본값 통일
+    with open_dict(cfg):
+        if not hasattr(cfg, "model_location") or cfg.model_location in (None, ""):
+            # atlas의 기본 동작: args.save가 있으면 우선, 없으면 고정 경로로 폴백
+            base_root = getattr(cfg, "save", None)
+            if base_root is None:
+                base_root = os.path.expanduser(
+                    "/disk3/junghwan/task_vector/models/checkpoints")
+            cfg.model_location = base_root
+        if not hasattr(cfg, "save_dir") or cfg.save_dir in (None, ""):
+            cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
+        if not hasattr(cfg, "data_location") or cfg.data_location in (None, ""):
+            cfg.data_location = os.path.expanduser("datasets")
 
     # exclude held-out test dataset from basis building
     test_ds = cfg.test_dataset
@@ -194,6 +272,18 @@ def my_app(cfg: DictConfig) -> None:
     logger.info(cfg.method.full_name)
     logger.info("\n" + OmegaConf.to_yaml(cfg))
     OmegaConf.set_struct(cfg, True)
+
+    # Set deterministic seed to match atlas for k-shot reproducibility
+    try:
+        random.seed(int(cfg.seed))
+        np.random.seed(int(cfg.seed))
+        torch.manual_seed(int(cfg.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(cfg.seed))
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
 
     # TSV Merge Orthogonalization
     ft_checks, ptm_check = get_all_checkpoints(cfg)
@@ -267,14 +357,52 @@ def my_app(cfg: DictConfig) -> None:
             image_encoder, classification_head).to(cfg.device)
         model.freeze_head()
 
+        preprocess_fn = torchvision.transforms.Compose([
+            torchvision.transforms.RandomResizedCrop(
+                size=224, scale=(0.5, 1),
+                interpolation=torchvision.transforms.InterpolationMode.BICUBIC
+            ), torchvision.transforms.RandomHorizontalFlip(p=0.5),
+        ] + model.train_preprocess.transforms[-3:])
+
         dataset = get_dataset(
             train_dataset_name,
-            model.train_preprocess,
+            preprocess_fn,
             location=cfg.data_location,
             batch_size=cfg.batch_size,
         )
+        # 기본 학습 로더 (atlas와 동일한 k-shot 추출 방식 적용)
         train_loader = get_dataloader(
             dataset, is_train=True, args=cfg, image_encoder=None)
+
+        if int(cfg.k_shot) > 0:
+            try:
+                target_dataset = val_dataset_name
+                int_idx_path = os.path.join(
+                    cfg.save_dir, target_dataset, f"{int(cfg.k_shot)}_shots_{int(cfg.seed)}.pt")
+                os.makedirs(os.path.dirname(int_idx_path), exist_ok=True)
+                if os.path.isfile(int_idx_path) and int(cfg.seed) == 1:
+                    to_keep = torch.load(int_idx_path)
+                else:
+                    to_keep = get_n_shots(
+                        dataset.train_dataset, int(cfg.k_shot),
+                        model.classification_head.out_features, cfg)
+                    torch.save(to_keep, int_idx_path)
+
+                r = len(to_keep) / int(cfg.batch_size)
+                if r < 10:
+                    over_sampling = 10/r
+                    over_sampling = int(over_sampling) + 1
+                    logger.info(f"Oversampling {over_sampling} times")
+                    to_keep = torch.cat([to_keep] * over_sampling)
+
+                index_dataset = IndexWrapper(dataset.train_dataset)
+                sampler = torch.utils.data.SubsetRandomSampler(to_keep)
+                train_loader = torch.utils.data.DataLoader(
+                    index_dataset, batch_size=int(cfg.batch_size), sampler=sampler, num_workers=8)
+                logger.info(
+                    f"Applied atlas-style k-shot sampling: k={cfg.k_shot}, total_selected={len(to_keep)}")
+            except Exception as e:
+                logger.exception(f"k-shot 샘플링 구성 실패: {e}. 기본 전체 데이터로 진행합니다.")
 
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
@@ -415,9 +543,17 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_lr", type=float, default=1e-3)
     parser.add_argument("--sigma_wd", type=float, default=0)
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument(
+        "--k_shot",
+        type=int,
+        default=0,
+        help="클래스별 학습 샘플 수. 0이면 전체 사용",
+    )
     # scheduler hyperparams
-    parser.add_argument("--sigma-lr-step-size", type=int, default=1)
-    parser.add_argument("--sigma-lr-gamma", type=float, default=0.5)
+    parser.add_argument("--sigma_lr_step_size", type=int, default=1)
+    parser.add_argument("--sigma_lr_gamma", type=float, default=0.5)
+    parser.add_argument("--svd_keep_topk", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
     # parse_known_args: leave Hydra args intact
     args, unknown = parser.parse_known_args()
 
@@ -432,5 +568,7 @@ if __name__ == "__main__":
     os.environ["ENERGY_BATCH_SIZE"] = str(args.batch_size)
     os.environ["ENERGY_SIGMA_LR_STEP_SIZE"] = str(args.sigma_lr_step_size)
     os.environ["ENERGY_SIGMA_LR_GAMMA"] = str(args.sigma_lr_gamma)
-
+    os.environ["ENERGY_K_SHOT"] = str(args.k_shot)
+    os.environ["ENERGY_SVD_KEEP_TOPK"] = str(args.svd_keep_topk)
+    os.environ["ENERGY_SEED"] = str(args.seed)
     my_app()

@@ -32,7 +32,8 @@ from src.eval.eval import eval_single_dataset
 from src.datasets.registry import get_dataset
 from src.models.heads import get_classification_head
 from src.datasets.common import get_dataloader, maybe_dictionarize
-from atlas_src.distributed import cleanup_ddp, distribute_loader, is_main_process, setup_ddp
+import random
+import numpy as np
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -51,6 +52,10 @@ def softmax_entropy(x: torch.Tensor) -> torch.Tensor:
     return -(x.softmax(1) * x.log_softmax(1)).sum(1)
 
 
+def is_main_process():
+    return True
+
+
 def main(rank, args):
     # Harmonize save/model locations with energy environment
     if not hasattr(args, 'model_location') or args.model_location is None:
@@ -66,13 +71,23 @@ def main(rank, args):
     task_vectors = {}
     for dataset in pool:
         # Resolve checkpoints using energy path helpers
-        pretrained_checkpoint = f'/disk3/junghwan/task_vector/models/checkpoints/{args.model}/MNISTVal/nonlinear_zeroshot.pt'
+        pretrained_checkpoint = get_zeroshot_path(
+            args.model_location, "MNISTVal", args.model)
         finetuned_checkpoint = get_finetuned_path(
             args.model_location, dataset, args.model)
         task_vectors[dataset] = NonLinearTaskVector(
             args.model, pretrained_checkpoint, finetuned_checkpoint)
 
     args.rank = rank
+    # Set deterministic seed for reproducibility (match energy style)
+    if hasattr(args, 'seed') and args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     if os.path.exists(args.log_path):
         with open(args.log_path, 'r') as f:
             comp_acc = json.load(f)
@@ -84,13 +99,13 @@ def main(rank, args):
         args.epochs = epochs
         zs_json_path = os.path.join(
             args.save_dir, f"{dataset}Val", "zeroshot_accuracies.json")
-        if os.path.isfile(zs_json_path):
-            with open(zs_json_path, 'r') as f:
-                args.zs_acc = json.load(f)
-            comp_acc[f"{dataset}Val_zeroshot"] = args.zs_acc[f"{dataset}Val"]
-        else:
-            if not hasattr(args, 'zs_acc'):
-                args.zs_acc = {}
+        # if os.path.isfile(zs_json_path):
+        #     with open(zs_json_path, 'r') as f:
+        #         args.zs_acc = json.load(f)
+        #     comp_acc[f"{dataset}Val_zeroshot"] = args.zs_acc[f"{dataset}Val"]
+        # else:
+        #     if not hasattr(args, 'zs_acc'):
+        args.zs_acc = {}
 
         if type(args.subsample) == float:
             data_amount = f"{args.subsample*100}%"
@@ -106,8 +121,6 @@ def main(rank, args):
 
 
 def train(task_vectors, args, comp_acc={}):
-
-    setup_ddp(args.rank, args.world_size, port=args.port)
     target_dataset = args.target_dataset
 
     assert args.finetuning_mode in [
@@ -181,14 +194,9 @@ def train(task_vectors, args, comp_acc={}):
     data_loader = torch.utils.data.DataLoader(
         index_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=8)
 
-    # Distribute the data and model across the GPUs.
-    ddp_loader = distribute_loader(data_loader)
-    ddp_model = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[args.rank],
-        find_unused_parameters=False,
-        output_device=args.rank,
-    )
+    # Single-process training
+    ddp_loader = data_loader
+    ddp_model = model
 
     num_batches = len(ddp_loader)
     # Printing loss between four and ten times an epoch
@@ -212,21 +220,21 @@ def train(task_vectors, args, comp_acc={}):
 
     scaler = GradScaler()
     if is_main_process():
-        if f"{target_dataset}_zeroshot" not in comp_acc.keys():
-            comp_acc[f"{target_dataset}_zeroshot"] = eval_single_dataset(
-                image_encoder, target_dataset.replace('Val', ''), args)["top1"]
-            zs_json_path = os.path.join(
-                args.save_dir, f"{target_dataset}", "zeroshot_accuracies.json")
-            os.makedirs(os.path.dirname(zs_json_path), exist_ok=True)
-            with open(zs_json_path, 'w') as f:
-                json.dump(
-                    {f"{target_dataset}": comp_acc[f"{target_dataset}_zeroshot"]}, f, indent=4)
-            args.zs_acc[f"{target_dataset}"] = comp_acc[f"{target_dataset}_zeroshot"]
+        # Always recompute zero-shot to match energy behavior
+        comp_acc[f"{target_dataset}_zeroshot"] = eval_single_dataset(
+            image_encoder, target_dataset, args)["top1"]
+        zs_json_path = os.path.join(
+            args.save_dir, f"{target_dataset}", "zeroshot_accuracies.json")
+        os.makedirs(os.path.dirname(zs_json_path), exist_ok=True)
+        with open(zs_json_path, 'w') as f:
+            json.dump(
+                {f"{target_dataset}": comp_acc[f"{target_dataset}_zeroshot"]}, f, indent=4)
+        args.zs_acc[f"{target_dataset}"] = comp_acc[f"{target_dataset}_zeroshot"]
 
         print(
             f"=> Zero-shot accuracy on {target_dataset}:\t{100*args.zs_acc[target_dataset]:.2f}%.")
 
-    best_coef = ddp_model.module.image_encoder.coef.data.clone()
+    best_coef = ddp_model.image_encoder.coef.data.clone()
     best_acc = args.zs_acc[target_dataset]
     for epoch in range(args.epochs):
         for i, batch in enumerate(ddp_loader):
@@ -273,8 +281,8 @@ def train(task_vectors, args, comp_acc={}):
 
         # Evaluate after each epoch
         if is_main_process():
-            image_encoder = ddp_model.module.image_encoder
-            coef = ddp_model.module.image_encoder.coef
+            image_encoder = ddp_model.image_encoder
+            coef = ddp_model.image_encoder.coef
             acc = eval_single_dataset(
                 image_encoder, target_dataset, args)["top1"]
             if acc > best_acc:
@@ -284,7 +292,7 @@ def train(task_vectors, args, comp_acc={}):
     if is_main_process():
         comp_acc[target_dataset] = best_acc
         target_dataset = target_dataset.replace("Val", "")
-        image_encoder = ddp_model.module.image_encoder
+        image_encoder = ddp_model.image_encoder
         image_encoder.coef = torch.nn.Parameter(best_coef)
         comp_acc[target_dataset] = eval_single_dataset(
             image_encoder, target_dataset, args)["top1"]
@@ -302,7 +310,6 @@ def train(task_vectors, args, comp_acc={}):
         comp_acc = train_adapter(
             ddp_model, ddp_loader, args, comp_acc, which=args.adapter)
 
-    cleanup_ddp()
     return comp_acc
 
 
@@ -328,7 +335,7 @@ def train_adapter(ddp_model, ddp_loader, args, comp_acc, which='lpp'):
     indexes = torch.cat(all_indexes)
     indexes_to_i = {indexes[i].item(): i for i in range(len(indexes))}
 
-    model = ddp_model.module
+    model = ddp_model
     if which == 'lpp':
         if type(args.subsample) == float:
             shots = 100
@@ -345,12 +352,7 @@ def train_adapter(ddp_model, ddp_loader, args, comp_acc, which='lpp'):
         raise NotImplementedError(f"Adapter {which} unknown")
 
     model = model.cuda()
-    ddp_model = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[args.rank],
-        find_unused_parameters=False,
-        output_device=args.rank,
-    )
+    ddp_model = model
 
     params = [p for p in ddp_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=args.wd)
@@ -412,7 +414,7 @@ def train_adapter(ddp_model, ddp_loader, args, comp_acc, which='lpp'):
         # comp_acc[target_dataset+f"_{which}"] = best_acc
         target_dataset = args.target_dataset
         target_dataset = target_dataset.replace("Val", "")
-        image_encoder = ddp_model.module.model.image_encoder
+        image_encoder = ddp_model.model.image_encoder
         comp_acc[target_dataset+f"_{which}"] = eval_single_dataset(
             image_encoder, target_dataset, args, model=ddp_model)["top1"]
         with open(args.log_path, 'w') as f:
@@ -424,7 +426,7 @@ def train_adapter(ddp_model, ddp_loader, args, comp_acc, which='lpp'):
             heads = {}
 
         adapter_coefs = {
-            k: v for k, v in ddp_model.module.state_dict().items() if v.requires_grad}
+            k: v for k, v in ddp_model.state_dict().items() if v.requires_grad}
         heads[target_dataset] = adapter_coefs
         torch.save(heads, args.head_path)
 
@@ -436,7 +438,7 @@ if __name__ == "__main__":
     # Lightweight argparse wrapper to override key hyperparameters via CLI
     wrapper = argparse.ArgumentParser(add_help=False)
     wrapper.add_argument("--model", type=str, default=None)
-    wrapper.add_argument("--batch_size", type=int, default=None)
+    wrapper.add_argument("--batch_size", type=int, default=256)
     wrapper.add_argument("--lr", type=float, default=None)
     wrapper.add_argument("--wd", type=float, default=None)
     wrapper.add_argument("--epochs", type=int, default=None)
@@ -446,10 +448,10 @@ if __name__ == "__main__":
     wrapper.add_argument("--data_location", type=str,
                          default='/home/junghwan/task_singular_vectors/datasets')
     wrapper.add_argument("--model_location", type=str, default=None)
-    wrapper.add_argument("--seed", type=int, default=None)
+    wrapper.add_argument("--seed", type=int, default=42)
     wrapper.add_argument("--print_every", type=int, default=None)
     # dataset controls
-    wrapper.add_argument("--datasets", type=str, default=None,
+    wrapper.add_argument("--datasets", type=str, default='CIFAR10',
                          help="Comma-separated dataset names without 'Val'")
     wrapper.add_argument("--epochs_per_task", type=int, default=10)
 
@@ -506,8 +508,10 @@ if __name__ == "__main__":
                    for d in cli_args.datasets.split(",") if len(d.strip()) > 0]
     else:
         ds_list = list(ALL_DATASETS)
-    target_datasets = {ds: (
-        cli_args.epochs_per_task if cli_args.epochs_per_task is not None else 10) for ds in ds_list}
+    # Use --epochs if provided, otherwise use --epochs_per_task
+    epochs_to_use = cli_args.epochs if cli_args.epochs is not None else (
+        cli_args.epochs_per_task if cli_args.epochs_per_task is not None else 10)
+    target_datasets = {ds: epochs_to_use for ds in ds_list}
     args.target_datasets = target_datasets
     # HACK: Some command line arguments are overwritten by defaults here.
     args.lr = 1e-1
