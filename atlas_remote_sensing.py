@@ -10,6 +10,7 @@ import argparse
 import sys
 import time
 import json
+import copy
 import torch
 import torchvision
 import logging
@@ -19,6 +20,7 @@ from omegaconf import OmegaConf
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
 from atlas_src.composition import WeightedImageEncoder
+from atlas_src.utils import TIPWrapper, LPPWrapper
 
 # Task vectors from energy environment
 from src.models.task_vectors import NonLinearTaskVector
@@ -42,9 +44,24 @@ from src.datasets.remote_sensing import (
 # Evaluation function
 from src.eval.eval_remote_sensing_comparison import evaluate_encoder_with_dataloader
 
+
+def _sanitize_value(val):
+    if isinstance(val, float):
+        val = f"{val:.6g}"
+    elif isinstance(val, bool):
+        val = int(val)
+    return ''.join(ch if ch.isalnum() or ch in ['-', '_'] else '_' for ch in str(val).replace('.', 'p'))
+
+
+def build_atlas_config_tag(num_basis: int, args) -> str:
+    count_part = _sanitize_value(max(num_basis, 0))
+    k_part = _sanitize_value(getattr(args, 'k', 'na'))
+    lr_part = _sanitize_value(getattr(args, 'lr', 'na'))
+    return f"atlas_{count_part}_{k_part}_{lr_part}"
+
 # Dataset-specific epochs for Atlas training (matching fine-tuning epochs)
 ATLAS_EPOCHS_PER_DATASET = {
-    "AID": 60,              # ~10,000 train samples, 600x600
+    "AID": 10,              # ~10,000 train samples, 600x600
     "CLRS": 10,             # ~30,000 train samples, 256x256
     "EuroSAT_RGB": 15,      # ~21,600 train samples, 64x64
     "MLRSNet": 15,          # ~17,000 train samples, 256x256
@@ -61,6 +78,23 @@ ATLAS_EPOCHS_PER_DATASET = {
     "UC_Merced": 100,       # ~2,100 train samples, 256x256
     "WHU-RS19": 150,        # ~1,000 train samples, 600x600
 }
+# ATLAS_EPOCHS_PER_DATASET = {
+#     "AID": 5,              # ~10,000 train samples, 600x600
+#     "CLRS": 5,             # ~30,000 train samples, 256x256
+#     "EuroSAT_RGB": 5,      # ~21,600 train samples, 64x64
+#     "MLRSNet": 5,          # ~17,000 train samples, 256x256
+#     "NWPU-RESISC45": 5,    # ~25,200 train samples, 256x256
+#     "Optimal-31": 5,       # ~6,200 train samples, 256x256
+#     "PatternNet": 5,       # ~10,000 train samples, 256x256
+#     "RS_C11": 5,           # ~5,000 train samples, 512x512
+#     "RSD46-WHU": 5,        # ~10,000 train samples, 256x256
+#     "RSI-CB128": 5,        # ~18,000 train samples, 128x128
+#     "RSSCN7": 5,           # ~2,800 train samples, 400x400
+#     "SAT-4": 5,             # ~60,000 train samples, 28x28
+#     "SIRI-WHU": 5,        # ~2,400 train samples, 200x200
+#     "UC_Merced": 5,       # ~2,100 train samples, 256x256
+#     "WHU-RS19": 5,        # ~1,000 train samples, 600x600
+# }
 
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
@@ -72,6 +106,254 @@ def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
         for i in range(max_evals)
     }
     return eval_epochs
+
+
+class ValidationRecorder:
+    """Utility to collect validation metrics without duplicating closure logic."""
+
+    def __init__(self, start_time: float, val_history: list):
+        self.start_time = float(start_time)
+        self.val_history = val_history
+        self.eval_counter = 0
+
+    def __call__(self, stage: str, epoch_value, accuracy_value):
+        record = {
+            "stage": stage,
+            "epoch": int(epoch_value),
+            "accuracy": float(accuracy_value),
+            "elapsed_seconds": float(time.time() - self.start_time),
+            "evaluation_index": int(self.eval_counter),
+        }
+        self.val_history.append(record)
+        self.eval_counter += 1
+        return record
+
+
+def evaluate_adapter_model(adapter_model, dataloader, device: str) -> float:
+    """Compute top-1 accuracy for the adapter-enhanced classifier."""
+    adapter_model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = maybe_dictionarize(batch)
+            inputs = batch["images"].to(device)
+            labels = batch["labels"]
+            if not torch.is_tensor(labels):
+                labels = torch.tensor(labels)
+            labels = labels.to(device)
+            if labels.ndim > 1:
+                labels = labels.argmax(dim=1)
+            logits = adapter_model(inputs)
+            preds = logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+    return correct / total if total else 0.0
+
+
+def train_adapter_remote(
+    model: ImageClassifier,
+    base_train_loader,
+    val_loader,
+    args,
+    logger,
+    save_dir: str,
+):
+    """Optional TIP / LP++ adapter fine-tuning for remote sensing Atlas."""
+
+    adapter_choice = getattr(args, "adapter", None)
+    if not adapter_choice:
+        return None
+
+    adapter_choice = adapter_choice.lower()
+    if adapter_choice in ("", "none"):
+        return None
+
+    internal_choice = adapter_choice
+    if adapter_choice == "lp++":
+        internal_choice = "lpp"
+    display_choice = "lp++" if internal_choice == "lpp" else internal_choice
+
+    if internal_choice not in {"tip", "lpp"}:
+        logger.warning(
+            f"[adapter:{adapter_choice}] Unsupported adapter requested; skipping."
+        )
+        return None
+
+    device = next(model.parameters()).device
+
+    base_dataset = base_train_loader.dataset
+    batch_size = getattr(base_train_loader, "batch_size", args.batch_size)
+    num_workers = getattr(base_train_loader, "num_workers", 0)
+    pin_memory = getattr(base_train_loader, "pin_memory", True)
+
+    cache_loader = torch.utils.data.DataLoader(
+        base_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    adapter_train_loader = torch.utils.data.DataLoader(
+        base_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    logger.info(f"[adapter:{display_choice}] Building feature cache for adapter warm-up...")
+    features_cache = []
+    labels_cache = []
+    model.eval()
+    with torch.no_grad():
+        for batch in cache_loader:
+            batch = maybe_dictionarize(batch)
+            inputs = batch["images"].to(device)
+            logits, feats = model(inputs, return_features=True)
+            features_cache.append(feats.detach().cpu())
+            labels = batch["labels"]
+            if not torch.is_tensor(labels):
+                labels = torch.tensor(labels)
+            labels_cache.append(labels.detach().cpu().long())
+
+    if not features_cache:
+        logger.warning("[adapter] Training dataset is empty; skipping adapter training.")
+        return None
+
+    features_cache = torch.cat(features_cache, dim=0)
+    labels_cache = torch.cat(labels_cache, dim=0).long()
+    model.train()
+
+    shots_value = None
+    if internal_choice == "lpp":
+        shots = getattr(args, "k", None)
+        if shots is None or shots <= 0:
+            shots = 100
+        shots_value = int(shots)
+        logger.info(f"[adapter:lp++] Initializing LP++ with shots={shots_value}")
+        adapter_model = LPPWrapper(model, features_cache, labels_cache, shots_value)
+        adapter_lr = float(getattr(adapter_model, "lr_temp", args.lr))
+        adapter_epochs = 5
+    else:
+        adapter_model = TIPWrapper(model, features_cache, labels_cache)
+        adapter_lr = 1e-3
+        adapter_epochs = 5
+
+    adapter_model = adapter_model.to(device)
+
+    params = [p for p in adapter_model.parameters() if p.requires_grad]
+    if not params:
+        logger.warning("[adapter] No trainable parameters found; skipping adapter training.")
+        return None
+
+    num_batches = len(adapter_train_loader)
+    if num_batches == 0:
+        logger.warning("[adapter] No batches available; skipping adapter training.")
+        return None
+
+    grad_accum = max(1, getattr(args, "num_grad_accumulation", 1))
+    total_scheduler_steps = max(1, adapter_epochs * num_batches // grad_accum)
+    optimizer = torch.optim.AdamW(params, lr=adapter_lr, weight_decay=args.wd)
+    scheduler = cosine_lr(optimizer, adapter_lr, 0, total_scheduler_steps)
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    eval_epochs = compute_eval_epochs(adapter_epochs)
+    loss_history = []
+    val_history = []
+    epoch_loss_history = []
+
+    train_start = time.time()
+    record_validation = ValidationRecorder(train_start, val_history)
+
+    initial_acc = evaluate_adapter_model(adapter_model, val_loader, device)
+    record_validation("initial", -1, initial_acc)
+    logger.info(
+        f"[adapter:{display_choice}] Initial accuracy {initial_acc * 100:.2f}%"
+    )
+    best_acc = initial_acc
+    best_state = copy.deepcopy(adapter_model.state_dict())
+
+    step = 0
+    for epoch in range(adapter_epochs):
+        adapter_model.train()
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
+        for i, batch in enumerate(adapter_train_loader):
+            batch = maybe_dictionarize(batch)
+            inputs = batch["images"].to(device)
+            labels = batch["labels"]
+            if not torch.is_tensor(labels):
+                labels = torch.tensor(labels)
+            labels = labels.to(device)
+            if labels.ndim > 1:
+                labels = labels.argmax(dim=1)
+
+            logits = adapter_model(inputs)
+            loss = loss_fn(logits, labels)
+            epoch_loss_sum += float(loss.item())
+            epoch_loss_count += 1
+
+            loss_history.append(
+                {
+                    "epoch": int(epoch),
+                    "iteration": int(i),
+                    "global_step": int(epoch * num_batches + i),
+                    "loss": float(loss.item()),
+                }
+            )
+
+            (loss / grad_accum).backward()
+
+            if (i + 1) % grad_accum == 0:
+                scheduler(step)
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                step += 1
+        avg_epoch_loss = epoch_loss_sum / max(epoch_loss_count, 1)
+        epoch_loss_history.append(avg_epoch_loss)
+        logger.info(
+            f"[adapter:{display_choice}] epoch {epoch}: train loss {avg_epoch_loss:.6f}"
+        )
+
+        if epoch in eval_epochs:
+            acc = evaluate_adapter_model(adapter_model, val_loader, device)
+            record_validation("epoch", epoch, acc)
+            logger.info(
+                f"[adapter:{display_choice}] epoch {epoch}: accuracy {acc * 100:.2f}%"
+            )
+            if acc > best_acc:
+                best_acc = acc
+                best_state = copy.deepcopy(adapter_model.state_dict())
+
+    adapter_model.load_state_dict(best_state)
+    final_acc = evaluate_adapter_model(adapter_model, val_loader, device)
+    record_validation("final", adapter_epochs, final_acc)
+    training_time = time.time() - train_start
+    logger.info(
+        f"[adapter:{display_choice}] Final accuracy {final_acc * 100:.2f}% (best {best_acc * 100:.2f}%)"
+    )
+
+    summary = {
+        "adapter_type": display_choice,
+        "adapter_internal_type": internal_choice,
+        "epochs": int(adapter_epochs),
+        "learning_rate": float(adapter_lr),
+        "training_time": training_time,
+        "final_accuracy": float(final_acc),
+        "best_val_accuracy": float(best_acc),
+        "loss_history": loss_history,
+        "epoch_loss_history": epoch_loss_history,
+        "validation_history": val_history,
+        "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
+    }
+    if shots_value is not None:
+        summary["shots"] = shots_value
+
+    model.train()
+
+    return summary
 
 
 @torch.jit.script
@@ -89,6 +371,8 @@ def run_single(args):
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter('%(message)s'))
         logger.addHandler(handler)
+
+    logger.info(f"Adapter option: {getattr(args, 'adapter_display', 'none')}")
 
     if not hasattr(args, 'model_location') or args.model_location is None:
         args.model_location = os.path.expanduser("./models/checkpoints_remote_sensing")
@@ -193,9 +477,23 @@ def train_single_task(args, comp_acc=None, logger=None):
     # Remove the task vector for the target task (leave-one-out)
     available_task_vectors = [
         v for k, v in task_vectors.items() if orig_dataset != k]
+    expected_basis_count = len(getattr(args, "basis_datasets_list", []))
+    actual_basis_count = len(available_task_vectors)
+    if expected_basis_count and actual_basis_count != expected_basis_count:
+        logger.warning(
+            f"Loaded {actual_basis_count} of {expected_basis_count} requested task vectors "
+            "because some checkpoints were missing."
+        )
     
     logger.info(f"Using {len(available_task_vectors)} task vectors for composition")
     logger.info(f"Target dataset: {orig_dataset} (held out)")
+
+    config_tag = getattr(args, 'config_tag', None)
+    if not config_tag:
+        basis_count_for_tag = expected_basis_count or actual_basis_count
+        config_tag = build_atlas_config_tag(basis_count_for_tag, args)
+        args.config_tag = config_tag
+    logger.info(f"Using config tag: {config_tag}")
 
     # Create WeightedImageEncoder with task vectors
     image_encoder = ImageEncoder(args)
@@ -283,34 +581,35 @@ def train_single_task(args, comp_acc=None, logger=None):
     )
 
     scaler = GradScaler()
-    
+    overall_start = time.time()
+
+    eval_epochs = compute_eval_epochs(args.epochs)
+    loss_history = []
+    val_history = []
+    record_validation = ValidationRecorder(overall_start, val_history)
+
     # Load validation dataset using get_dataloader (unified evaluation approach)
     val_loader = get_dataloader(eval_dataset, is_train=False, args=args, image_encoder=None)
     
     # Evaluate zeroshot accuracy using unified evaluation function
-    if f"{target_dataset}_zeroshot" not in comp_acc.keys():
-        logger.info(f"Evaluating zero-shot accuracy on {target_dataset}...")
-
-        image_encoder.eval()
-        classification_head.eval()
-
-        zeroshot_metrics = evaluate_encoder_with_dataloader(
-            image_encoder, classification_head, val_loader, 'cuda')
-        zeroshot_acc = zeroshot_metrics['top1']
-
-        comp_acc[f"{target_dataset}_zeroshot"] = zeroshot_acc
-        args.zs_acc[f"{target_dataset}"] = zeroshot_acc
-
-        image_encoder.train()
-        classification_head.train()
-
+    image_encoder.eval()
+    classification_head.eval()
+    pretrained_metrics = evaluate_encoder_with_dataloader(
+        image_encoder, classification_head, val_loader, 'cuda')
+    pretrained_acc = pretrained_metrics['top1']
+    comp_acc[f"{target_dataset}_zeroshot"] = pretrained_acc
+    args.zs_acc[f"{target_dataset}"] = pretrained_acc
     logger.info(
-        f"=> Zero-shot accuracy on {target_dataset}:\t{100*args.zs_acc[target_dataset]:.2f}%.")
+        f"=> Zero-shot accuracy on {target_dataset}:\t{100*pretrained_acc:.2f}%.")
+
+    record_validation("pretrained", -2, pretrained_acc)
+    record_validation("zeroshot", -1, pretrained_acc)
+
+    image_encoder.train()
+    classification_head.train()
 
     best_coef = model.image_encoder.coef.data.clone()
-    best_acc = args.zs_acc[target_dataset]
-    eval_epochs = compute_eval_epochs(args.epochs)
-    loss_history = []
+    best_acc = pretrained_acc
     train_start = time.time()
 
     logger.info(f"Starting training for {args.epochs} epochs...")
@@ -361,10 +660,9 @@ def train_single_task(args, comp_acc=None, logger=None):
                 and ((i + 1) % args.num_grad_accumulation == 0)
             ):
                 percent_complete = 100 * (i + 1) / len(train_loader)
-                print(
+                logger.info(
                     f"Train Epoch: {epoch} [{percent_complete:.0f}% {i + 1}/{num_batches}]\t"
-                    f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}",
-                    flush=True,
+                    f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}"
                 )
 
         # Evaluate after selected epochs using unified evaluation function
@@ -385,6 +683,7 @@ def train_single_task(args, comp_acc=None, logger=None):
             classification_head.train()
             
             logger.info(f"Epoch {epoch}: Accuracy = {100*acc:.2f}%")
+            record_validation("epoch", epoch, acc)
             
             if acc > best_acc:
                 best_acc = acc
@@ -408,15 +707,17 @@ def train_single_task(args, comp_acc=None, logger=None):
     comp_acc[target_dataset_clean] = final_acc
 
     logger.info(f"Final test accuracy: {100*final_acc:.2f}%")
+    record_validation("final", args.epochs, final_acc)
 
     # Save coefficients to dataset-specific directory
     k = getattr(args, 'k', 0)
-    shot_folder = f"{k}shot" if k > 0 else "fullshot"
+    shot_folder = f"{k}shots" if k > 0 else "fullshots"
 
     save_dir = os.path.join(
         args.model_location,
         args.model,
         target_dataset,
+        config_tag,
         shot_folder
     )
     os.makedirs(save_dir, exist_ok=True)
@@ -424,6 +725,22 @@ def train_single_task(args, comp_acc=None, logger=None):
     atlas_path = os.path.join(save_dir, "atlas.pt")
     torch.save(best_coef, atlas_path)
     logger.info(f"✓ Saved learned atlas coefficients to {atlas_path}")
+
+    adapter_summary = train_adapter_remote(model, train_loader, val_loader, args, logger, save_dir)
+    if adapter_summary:
+        adapter_results_path = os.path.join(
+            save_dir,
+            f"atlas_adapter_{adapter_summary['adapter_type']}.json",
+        )
+        adapter_summary_with_path = dict(adapter_summary)
+        adapter_summary_with_path["results_path"] = adapter_results_path
+        with open(adapter_results_path, "w") as f:
+            json.dump(adapter_summary_with_path, f, indent=4)
+        adapter_summary = adapter_summary_with_path
+        comp_acc[f"{target_dataset_clean}_{adapter_summary['adapter_type']}"] = adapter_summary["final_accuracy"]
+        logger.info(
+            f"[adapter:{adapter_summary['adapter_type']}] Saved adapter results to {adapter_results_path}"
+        )
 
     log_path = os.path.join(save_dir, "atlas_results.json")
     gpu_peak_mem_mb = None
@@ -442,6 +759,15 @@ def train_single_task(args, comp_acc=None, logger=None):
         "batch_size": args.batch_size,
         "gpu_peak_mem_mb": gpu_peak_mem_mb,
         "loss_history": loss_history,
+        "validation_history": val_history,
+        "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
+        "pretrained_accuracy": float(pretrained_acc),
+        "zeroshot_accuracy": float(pretrained_acc),
+        "config_tag": config_tag,
+        "adapter_choice": ("none" if not getattr(args, "adapter", None) else (
+            "lp++" if args.adapter == "lpp" else args.adapter
+        )),
+        "adapter_results": adapter_summary,
     }
     with open(log_path, 'w') as f:
         json.dump(result_log, f, indent=4)
@@ -470,27 +796,33 @@ if __name__ == "__main__":
     wrapper.add_argument("--k", type=int, default=0,
                          help="k-shot per class (e.g., 16 = 16 samples per class). "
                               "Set to 0 to use full dataset (default: 16)")
+    wrapper.add_argument("--config_tag", type=str, default=None,
+                         help="Optional tag to group outputs for this configuration")
     wrapper.add_argument("--data_location", type=str, default="./datasets")
     wrapper.add_argument("--model_location", type=str, default="./models/checkpoints_remote_sensing")
     wrapper.add_argument("--seed", type=int, default=1)
     wrapper.add_argument("--print_every", type=int, default=10)
     
     # Dataset controls (similar to energy_train_remote_sensing.py)
-    wrapper.add_argument("--test_dataset", type=str, default=None,
-                         help="Single dataset to train on (leave-one-out with others as basis)")
-    wrapper.add_argument("--datasets", type=str, default=None,
-                         help="Comma-separated dataset names without 'Val' (alternative to --test_dataset)")
+    wrapper.add_argument("--test_dataset", type=str, required=True,
+                         help="Dataset to treat as target (leave-one-out with others as basis)")
     wrapper.add_argument("--epochs_per_task", type=int, default=10)
-    wrapper.add_argument("--run_all", action="store_true",
-                         help="Run atlas for all datasets in DATASETS_ALL (leave-one-out)")
     
     # Atlas-specific options
     wrapper.add_argument("--blockwise_coef", action="store_true", default=True,
                          help="Learn coefficient per parameter block")
     wrapper.add_argument("--partition", type=int, default=None,
                          help="Partition size for fine-grained coefficient learning")
+    wrapper.add_argument("--adapter", type=str, default="none",
+                         choices=["none", "tip", "lp++"],
+                         help="Optionally train an adapter (TIP or LP++) after learning atlas coefficients")
 
     cli_args, unknown = wrapper.parse_known_args()
+    unknown = list(unknown)
+    adapter_option = (cli_args.adapter or "none").lower()
+    if adapter_option != "none":
+        passthrough = "lpp" if adapter_option == "lp++" else adapter_option
+        unknown.extend(["--adapter", passthrough])
 
     # Import atlas args parser for remaining arguments
     from atlas_src.args import parse_arguments
@@ -520,7 +852,13 @@ if __name__ == "__main__":
         args.blockwise_coef = cli_args.blockwise_coef
     if cli_args.partition is not None:
         args.partition = cli_args.partition
-    
+    if cli_args.config_tag is not None:
+        args.config_tag = cli_args.config_tag
+    if getattr(args, "adapter", None):
+        args.adapter_display = "lp++" if args.adapter == "lpp" else args.adapter
+    else:
+        args.adapter_display = "none"
+
     # Set k-shot parameter
     if cli_args.k is not None:
         args.k = cli_args.k
@@ -534,137 +872,44 @@ if __name__ == "__main__":
     args.print_every = 10
     args.epochs_per_task = cli_args.epochs_per_task
     
-    # If --run_all is specified, run for each dataset in DATASETS_ALL sequentially
-    if cli_args.run_all:
-        if "DATASETS_ALL" not in config or not config.DATASETS_ALL:
-            print("ERROR: DATASETS_ALL not found or empty in config_remote_sensing.yaml")
-            sys.exit(1)
-        
-        all_datasets = list(config.DATASETS_ALL)
-        total = len(all_datasets)
-        
-        print("\n" + "=" * 100)
-        print(f"🚀 RUNNING ATLAS FOR ALL {total} DATASETS (Leave-One-Out)")
-        print("=" * 100)
-        print(f"Datasets: {', '.join(all_datasets)}")
-        k_str = f"{args.k}-shot per class" if args.k > 0 else "full dataset"
-        print(f"Config: model={args.model}, k={k_str}, epochs_per_task={args.epochs_per_task}")
-        print("=" * 100 + "\n")
-        
-        failed_datasets = []
-        
-        for idx, test_dataset in enumerate(all_datasets, 1):
-            # Get dataset-specific epochs
-            dataset_epochs = ATLAS_EPOCHS_PER_DATASET.get(test_dataset, args.epochs_per_task)
-            
-            print("\n" + "=" * 100)
-            print(f"📊 [{idx}/{total}] Processing: {test_dataset} as TARGET dataset")
-            print(f"    Basis datasets: {total - 1} datasets (all except {test_dataset})")
-            print(f"    Training epochs: {dataset_epochs} (auto-determined based on dataset size)")
-            print("=" * 100 + "\n")
-            
-            # Build command to run this script with specific test_dataset
-            cmd = [
-                sys.executable,  # Python interpreter
-                __file__,        # This script
-                "--test_dataset", test_dataset,
-                "--model", args.model,
-                "--k", str(args.k),
-                "--epochs_per_task", str(args.epochs_per_task),
-                "--batch_size", str(args.batch_size),
-                "--lr", str(args.lr),
-                "--wd", str(args.wd if hasattr(args, 'wd') else 0.0),
-                "--data_location", args.data_location,
-                "--model_location", args.model_location,
-                "--seed", str(args.seed),
-            ] + unknown  # Pass through any remaining args
-            
-            if cli_args.blockwise_coef:
-                cmd.append("--blockwise_coef")
-            if cli_args.partition is not None:
-                cmd.extend(["--partition", str(cli_args.partition)])
-            
-            print(f"🔧 Running command: {' '.join(cmd)}\n")
-            
-            # Explicitly pass environment variables to subprocess (includes CUDA_VISIBLE_DEVICES)
-            env = os.environ.copy()
-            
-            try:
-                result = subprocess.run(cmd, check=True, env=env)
-                print(f"\n✅ [{idx}/{total}] Successfully completed: {test_dataset}")
-            except subprocess.CalledProcessError as e:
-                print(f"\n❌ [{idx}/{total}] FAILED: {test_dataset} (exit code: {e.returncode})")
-                failed_datasets.append(test_dataset)
-            except Exception as e:
-                print(f"\n❌ [{idx}/{total}] ERROR: {test_dataset} - {str(e)}")
-                failed_datasets.append(test_dataset)
-            
-            print("=" * 100)
-        
-        # Final summary
-        print("\n" + "=" * 100)
-        print("🏁 ATLAS TRAINING COMPLETED FOR ALL DATASETS")
-        print("=" * 100)
-        print(f"Total datasets: {total}")
-        print(f"Successful: {total - len(failed_datasets)}")
-        print(f"Failed: {len(failed_datasets)}")
-        if failed_datasets:
-            print(f"Failed datasets: {', '.join(failed_datasets)}")
-        print("=" * 100 + "\n")
-        
-        sys.exit(0 if len(failed_datasets) == 0 else 1)
-    
+
+    logger = logging.getLogger(__name__)
+    args.test_dataset = cli_args.test_dataset
+    args.basis_datasets = [d for d in config.DATASETS_ALL if d != cli_args.test_dataset]
+    args.target_datasets = {cli_args.test_dataset: args.epochs_per_task}
+    logger.info(f"Leave-one-out mode: Test dataset = {args.test_dataset}")
+    logger.info(f"Basis datasets: {len(args.basis_datasets)} datasets")
+
+    # Setup logging directory (legacy - results now saved per-dataset)
+    if not hasattr(args, 'logdir'):
+        args.logdir = os.path.join("logs", "atlas_remote_sensing", args.model)
     else:
-        # Single dataset mode or explicit datasets list
-        if cli_args.test_dataset:
-            # Single test dataset mode (leave-one-out)
-            args.test_dataset = cli_args.test_dataset
-            args.basis_datasets = [d for d in config.DATASETS_ALL if d != cli_args.test_dataset]
-            print(f"Leave-one-out mode: Test dataset = {args.test_dataset}")
-            print(f"Basis datasets: {len(args.basis_datasets)} datasets")
-        elif cli_args.datasets is not None and len(cli_args.datasets.strip()) > 0:
-            # Multiple datasets specified explicitly
-            ds_list = [d.strip() for d in cli_args.datasets.split(",") if len(d.strip()) > 0]
-            target_datasets = {ds: args.epochs_per_task for ds in ds_list}
-            args.target_datasets = target_datasets
-            print(f"Training on {len(ds_list)} specified datasets")
-        else:
-            # Default: use a subset or all from config
-            print("No --test_dataset or --datasets specified. Using default subset.")
-            ds_list = ["EuroSAT_RGB", "AID", "CLRS"]  # Small default subset for testing
-            target_datasets = {ds: args.epochs_per_task for ds in ds_list}
-            args.target_datasets = target_datasets
+        args.logdir += f"/{args.model}"
+    
+    if args.k > 0:
+        args.logdir += f"/{args.k}shots"
+    else:
+        args.logdir += "/fullshot"
 
-        # Setup logging directory (legacy - results now saved per-dataset)
-        if not hasattr(args, 'logdir'):
-            args.logdir = os.path.join("logs", "atlas_remote_sensing", args.model)
-        else:
-            args.logdir += f"/{args.model}"
-        
-        if args.k > 0:
-            args.logdir += f"/{args.k}shots"
-        else:
-            args.logdir += "/fullshot"
+    if args.seed is not None:
+        args.logdir += f"/{args.seed}"
 
-        if args.seed is not None:
-            args.logdir += f"/{args.seed}"
+    # Legacy paths (kept for compatibility, actual results saved per-dataset)
+    args.head_path = os.path.join(args.logdir, "learned_composition_remote_sensing.pt")
+    args.log_path = os.path.join(args.logdir, "learned_composition_remote_sensing.json")
 
-        # Legacy paths (kept for compatibility, actual results saved per-dataset)
-        args.head_path = os.path.join(args.logdir, "learned_composition_remote_sensing.pt")
-        args.log_path = os.path.join(args.logdir, "learned_composition_remote_sensing.json")
+    os.makedirs(args.logdir, exist_ok=True)
+    
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(args.logdir, "atlas_remote_sensing.log")),
+        ]
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    logging.getLogger(__name__).addHandler(console_handler)
 
-        os.makedirs(args.logdir, exist_ok=True)
-        
-        # Setup logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-            handlers=[
-                logging.FileHandler(os.path.join(args.logdir, "atlas_remote_sensing.log")),
-            ]
-        )
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(logging.Formatter('%(message)s'))
-        logging.getLogger(__name__).addHandler(console_handler)
-
-        run_single(args)
+    run_single(args)

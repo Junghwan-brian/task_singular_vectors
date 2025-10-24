@@ -828,8 +828,12 @@ def split_remote_sensing_train_into_train_val(
     )
     
     print(f"Split train dataset: {train_size} train, {val_size} val (seed={seed})")
+
+    # Preserve original test split so evaluations can use it
+    original_test_dataset = getattr(dataset, "test_dataset", None)
+    original_test_loader = getattr(dataset, "test_loader", None)
     
-    # Update dataset
+    # Update dataset with new train split
     dataset.train_dataset = trainset
     dataset.train_loader = DataLoader(
         dataset.train_dataset,
@@ -839,13 +843,22 @@ def split_remote_sensing_train_into_train_val(
         pin_memory=True,
     )
     
-    dataset.test_dataset = valset
-    dataset.test_loader = DataLoader(
-        dataset.test_dataset,
-        batch_size=dataset.test_loader.batch_size,
-        num_workers=dataset.test_loader.num_workers,
+    # Store validation split separately while keeping original test split
+    dataset.val_dataset = valset
+    dataset.val_loader = DataLoader(
+        dataset.val_dataset,
+        batch_size=dataset.train_loader.batch_size,
+        shuffle=False,
+        num_workers=dataset.train_loader.num_workers,
         pin_memory=True,
     )
+    
+    if original_test_dataset is not None:
+        dataset.test_dataset = original_test_dataset
+    if original_test_loader is not None:
+        dataset.test_loader = original_test_loader
+    
+    dataset.has_val_split = True
     
     return dataset
 
@@ -922,4 +935,3 @@ def get_remote_sensing_dataset(
             num_workers=num_workers,
             **kwargs
         )
-

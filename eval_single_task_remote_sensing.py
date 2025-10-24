@@ -102,13 +102,13 @@ def build_results_table(
     ax.axis("off")
     ax.axis("tight")
 
-    cols = ["Variant", "Training Data", "Training Time (s)", "Accuracy (%)"]
+    cols = ["Config", "Variant", "Training Data", "Training Time (s)", "Accuracy (%)"]
     table = ax.table(
         cellText=[[row[c] for c in cols] for _, row in df.iterrows()],
         colLabels=cols,
         cellLoc="left",
         loc="center",
-        colWidths=[0.28, 0.24, 0.22, 0.18],
+        colWidths=[0.18, 0.26, 0.20, 0.18, 0.18],
     )
 
     table.auto_set_font_size(False)
@@ -120,7 +120,7 @@ def build_results_table(
         table[(0, idx)].set_text_props(weight="bold", color="white")
 
     for row_idx in range(1, len(df) + 1):
-        variant = table[(row_idx, 0)].get_text().get_text().lower()
+        variant = table[(row_idx, 1)].get_text().get_text().lower()
         for col_idx in range(len(cols)):
             if "energy" in variant:
                 table[(row_idx, col_idx)].set_facecolor("#C6E0B4")
@@ -189,10 +189,36 @@ def discover_shot_dirs(dataset_dir: str, shots_filter: Optional[set]) -> List[st
     return shot_dirs
 
 
+def discover_config_shot_dirs(dataset_dir: str, shots_filter: Optional[set]) -> List[Tuple[Optional[str], List[str]]]:
+    configs: List[Tuple[Optional[str], List[str]]] = []
+    entries = sorted(os.listdir(dataset_dir))
+    legacy_shots: List[str] = []
+    for entry in entries:
+        path = os.path.join(dataset_dir, entry)
+        if not os.path.isdir(path):
+            continue
+        if entry.endswith("shot") or entry.endswith("shots"):
+            if not shots_filter or entry in shots_filter:
+                legacy_shots.append(entry)
+        else:
+            shots = discover_shot_dirs(path, shots_filter)
+            if shots:
+                configs.append((entry, shots))
+    if configs:
+        return configs
+    if legacy_shots:
+        return [(None, legacy_shots)]
+    return []
+
+
 def format_shot_name(shot_folder: str) -> str:
-    if shot_folder.lower() == "fullshot":
+    name = shot_folder.lower()
+    if name in {"fullshot", "fullshots"}:
         return "Full dataset"
-    if shot_folder.endswith("shot"):
+    if name.endswith("shots"):
+        core = shot_folder[:-5]
+        return f"{core}-shot"
+    if name.endswith("shot"):
         return shot_folder.replace("shot", "-shot")
     return shot_folder
 
@@ -220,6 +246,7 @@ def evaluate_base_variants(
     val_loader,
     model: str,
     device: str,
+    config_label: str,
 ) -> List[Dict[str, str]]:
     variants = [
         (
@@ -249,6 +276,7 @@ def evaluate_base_variants(
         results.append(
             {
                 "Variant": variant_name,
+                "Config": config_label,
                 "Training Data": training_data,
                 "Training Time (s)": "N/A",
                 "Accuracy (%)": f"{accuracy:.2f}",
@@ -266,8 +294,12 @@ def evaluate_shot_variants(
     val_loader,
     model: str,
     device: str,
+    config_tag: Optional[str],
 ) -> Optional[List[Dict[str, str]]]:
-    shot_dir = os.path.join(dataset_dir, shot_folder)
+    if config_tag:
+        shot_dir = os.path.join(dataset_dir, config_tag, shot_folder)
+    else:
+        shot_dir = os.path.join(dataset_dir, shot_folder)
     if not os.path.isdir(shot_dir):
         LOGGER.debug(f"Shot directory missing, skipping: {shot_dir}")
         return None
@@ -316,6 +348,7 @@ def evaluate_shot_variants(
         results.append(
             {
                 "Variant": variant_name,
+                "Config": config_tag or "-",
                 "Training Data": format_shot_name(shot_folder),
                 "Training Time (s)": training_time if training_time != "N/A" else "N/A",
                 "Accuracy (%)": f"{accuracy:.2f}",
@@ -333,7 +366,7 @@ def evaluate_shot_variants(
 def evaluate_dataset(
     dataset: str,
     dataset_dir: str,
-    shot_folders: Sequence[str],
+    shots_filter: Optional[set],
     model: str,
     data_location: str,
     batch_size: int,
@@ -365,28 +398,38 @@ def evaluate_dataset(
 
     val_loader = get_dataloader(val_dataset, is_train=False, args=args_ns, image_encoder=None)
 
-    base_results = evaluate_base_variants(
-        dataset, dataset_dir, classification_head, val_loader, model, device
-    )
-    if not base_results:
-        LOGGER.warning(f"{dataset}: unable to compute base results; skipping dataset.")
+    config_shots = discover_config_shot_dirs(dataset_dir, shots_filter)
+    if not config_shots:
+        LOGGER.warning(f"{dataset}: no shot/config folders found; skipping.")
         return
 
-    for shot_folder in shot_folders:
-        shot_results = evaluate_shot_variants(
-            dataset,
-            dataset_dir,
-            shot_folder,
-            base_results,
-            classification_head,
-            val_loader,
-            model,
-            device,
+    for config_tag, shot_folders in config_shots:
+        label = config_tag or "-"
+        base_results = evaluate_base_variants(
+            dataset, dataset_dir, classification_head, val_loader, model, device, label
         )
-        if shot_results is None:
+        if not base_results:
+            LOGGER.warning(f"{dataset}: unable to compute base results for config {label}; skipping.")
             continue
-        shot_dir = os.path.join(dataset_dir, shot_folder)
-        build_results_table(shot_results, shot_dir, dataset, model, shot_folder)
+        for shot_folder in shot_folders:
+            shot_results = evaluate_shot_variants(
+                dataset,
+                dataset_dir,
+                shot_folder,
+                base_results,
+                classification_head,
+                val_loader,
+                model,
+                device,
+                config_tag,
+            )
+            if shot_results is None:
+                continue
+            if config_tag:
+                shot_dir = os.path.join(dataset_dir, config_tag, shot_folder)
+            else:
+                shot_dir = os.path.join(dataset_dir, shot_folder)
+            build_results_table(shot_results, shot_dir, dataset, model, shot_folder)
 
 
 # ---------------------------------------------------------------------------
@@ -439,14 +482,10 @@ def main():
     shots_filter = normalize_shot_filter(args.shots)
 
     for dataset, dataset_dir in dataset_dirs:
-        shot_folders = discover_shot_dirs(dataset_dir, shots_filter)
-        if not shot_folders:
-            LOGGER.warning(f"{dataset}: no shot folders found; skipping.")
-            continue
         evaluate_dataset(
             dataset=dataset,
             dataset_dir=dataset_dir,
-            shot_folders=shot_folders,
+            shots_filter=shots_filter,
             model=args.model,
             data_location=args.data_location,
             batch_size=args.batch_size,

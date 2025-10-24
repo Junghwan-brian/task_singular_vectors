@@ -1,7 +1,8 @@
 import os
 import time
-import hydra
+import json
 import logging
+from types import SimpleNamespace
 from omegaconf import DictConfig, OmegaConf, open_dict
 import argparse
 import sys
@@ -16,6 +17,82 @@ from src.utils.sigma_param import SigmaParametrization
 import torch
 from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
 from torch.nn.utils.stateless import functional_call
+from atlas_remote_sensing import train_adapter_remote
+
+
+class AdapterCompatibleClassifier(torch.nn.Module):
+    """Wrap an ImageClassifier to expose return_features inference for adapters."""
+
+    def __init__(self, base_model: torch.nn.Module):
+        super().__init__()
+        self.base_model = base_model
+
+    @property
+    def image_encoder(self):
+        return self.base_model.image_encoder
+
+    @property
+    def classification_head(self):
+        return self.base_model.classification_head
+
+    @property
+    def train_preprocess(self):
+        return getattr(self.base_model, "train_preprocess", None)
+
+    @property
+    def val_preprocess(self):
+        return getattr(self.base_model, "val_preprocess", None)
+
+    def freeze_head(self):
+        return self.base_model.freeze_head()
+
+    def forward(self, inputs, return_features: bool = False):
+        features = self.image_encoder(inputs)
+        logits = self.classification_head(features)
+        if return_features:
+            norm = features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            return logits, features / norm
+        return logits
+
+def _sanitize_value(val):
+    if isinstance(val, float):
+        val = f"{val:.6g}"
+    elif isinstance(val, bool):
+        val = int(val)
+    return ''.join(ch if ch.isalnum() or ch in ['-', '_'] else '_' for ch in str(val).replace('.', 'p'))
+
+
+def build_energy_config_tag(cfg) -> str:
+    num_tasks_minus_one = _sanitize_value(max(int(getattr(cfg, "num_tasks", 0)) - 1, 0))
+    k_part = _sanitize_value(getattr(cfg, "train_k", 0))
+    lr_part = _sanitize_value(cfg.sigma_lr)
+    svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
+    init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
+    return f"energy_{num_tasks_minus_one}_{k_part}_{lr_part}_{svd_part}_{init_mode_part}"
+
+
+def normalize_adapter_choice(value: str) -> str:
+    val = (value or "none").strip().lower()
+    if val in {"lp++", "lpp"}:
+        return "lp++"
+    if val == "tip":
+        return "tip"
+    return "none"
+
+
+def adapter_path_tag(display: str) -> str:
+    display = (display or "none").strip().lower()
+    if display in {"", "none"}:
+        return "none"
+    if display == "lp++":
+        return "lp++"
+    return display.replace(" ", "_")
+
+
+def load_config(path: str) -> DictConfig:
+    cfg = OmegaConf.load(path)
+    OmegaConf.set_struct(cfg, False)
+    return cfg
 
 # Import remote sensing specific modules
 from src.datasets.remote_sensing import (
@@ -33,7 +110,7 @@ from src.eval.eval_remote_sensing_comparison import (
 # Dataset-specific epochs for sigma training
 # These match the fine-tuning epochs from finetune_remote_sensing_datasets.py
 SIGMA_EPOCHS_PER_DATASET = {
-    "AID": 60,              # ~10,000 train samples, 600x600
+    "AID": 10,              # ~10,000 train samples, 600x600
     "CLRS": 10,             # ~30,000 train samples, 256x256
     "EuroSAT_RGB": 12,      # ~21,600 train samples, 64x64
     "MLRSNet": 15,          # ~17,000 train samples, 256x256
@@ -49,6 +126,23 @@ SIGMA_EPOCHS_PER_DATASET = {
     "UC_Merced": 100,       # ~2,100 train samples, 256x256
     "WHU-RS19": 150,        # ~1,000 train samples, 600x600
 }
+# SIGMA_EPOCHS_PER_DATASET = {
+#     "AID": 5,              # ~10,000 train samples, 600x600
+#     "CLRS": 5,             # ~30,000 train samples, 256x256
+#     "EuroSAT_RGB": 5,      # ~21,600 train samples, 64x64
+#     "MLRSNet": 5,          # ~17,000 train samples, 256x256
+#     "NWPU-RESISC45": 5,    # ~25,200 train samples, 256x256
+#     "Optimal-31": 5,       # ~6,200 train samples, 256x256
+#     "PatternNet": 5,       # ~10,000 train samples, 256x256
+#     "RS_C11": 5,           # ~5,000 train samples, 512x512
+#     "RSD46-WHU": 5,        # ~10,000 train samples, 256x256
+#     "RSI-CB128": 5,        # ~18,000 train samples, 128x128
+#     "RSSCN7": 5,           # ~2,800 train samples, 400x400
+#     "SAT-4": 5,             # ~60,000 train samples, 28x28
+#     "SIRI-WHU": 5,        # ~2,400 train samples, 200x200
+#     "UC_Merced": 5,       # ~2,100 train samples, 256x256
+#     "WHU-RS19": 5,        # ~1,000 train samples, 600x600
+# }
 
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
@@ -62,7 +156,123 @@ def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
     return eval_epochs
 
 
-def compute_and_sum_svd_mem_reduction(task_vectors, config):
+def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
+    """
+    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
+    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
+    '재계산된 평균' sigma(diag)로 재구성.
+    """
+    device = config.device
+    datasets = list(config.DATASETS)
+    num_tasks = int(len(datasets))
+    print(f"DATSETS: {datasets}")
+    print("Computing SVD...")
+    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
+    with torch.no_grad():
+        new_vector = {}
+        # 공통 필터 함수(임베딩류 제외)
+        def is_matrix_key(tv0, key):
+            return (
+                tv0.vector[key].ndim == 2 and
+                all(t not in key for t in ("text_projection",
+                    "positional", "token_embedding"))
+            )
+        # 키 순회
+        tv0 = task_vectors[0]
+        for key in tv0.vector:
+            # 2D 행렬이 아니거나 제외 키면: 단순 평균
+            if not is_matrix_key(tv0, key):
+                avg = None
+                for i, tv in enumerate(task_vectors):
+                    vec = tv.vector[key].to(device)
+                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
+                new_vector[key] = avg
+                continue
+            # -------- SVD 축 모으기 준비 --------
+            # 첫 태스크에서 모양/순위 파악
+            vec0 = task_vectors[0].vector[key].to(device)
+            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
+            m = int(u0.shape[0])
+            r = int(s0.shape[0])          # 유효 랭크 상한
+            n = int(vh0.shape[1])
+            if r == 0:
+                # 드물지만 0-rank 보호장치
+                new_vector[key] = torch.zeros_like(vec0)
+                continue
+            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
+            num_used = min(num_tasks, r)
+            # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
+            # k = max(1, r // num_used)
+            max_per_task = max(1, r // num_used)
+            k = min(desired_k, max_per_task)
+            if desired_k > max_per_task:
+                print(
+                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
+                    desired_k,
+                    max_per_task,
+                    key,
+                    k,
+                )
+            chunks = int(k * num_used)    # <= r 보장
+            # print(f"chunks: {chunks}")
+            # 버퍼를 '정수 차원'으로 명시해 생성
+            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
+            # sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype) # [수정] 더 이상 sum_s 필요 없음
+            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
+            # 각 태스크에서 상위 k개 축만 수집
+            for i, tv in enumerate(task_vectors[:num_used]):
+                vec = tv.vector[key].to(device)
+                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
+                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
+                r_i = int(s.shape[0])
+                k_i = min(k, r_i)  # 안전 클램프
+                start = i * k
+                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
+                sum_u[:, start:end] = u[:, :k_i]
+                # sum_s[start:end] = s[:k_i] # [수정] 더 이상 sum_s 필요 없음
+                sum_v[start:end, :] = vh[:k_i, :]
+            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
+            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
+            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
+            U_orth = u_u @ vh_u          # (m × chunks)
+            V_orth = u_v @ vh_v          # (chunks × n)
+            # -------- [수정된 Sigma 계산 로직 시작] --------
+            # 1. 각 태스크 벡터(M_i)를 공통 기저(U_orth, V_orth)로 투영하여
+            #    최적의 대각 행렬(sigma_task)을 찾습니다.
+            #    M_i ≈ U_orth @ Sigma_i @ V_orth 이므로,
+            #    Sigma_i' = U_orth.T @ M_i @ V_orth.T 를 계산합니다.
+            all_sigma_diags = []
+            # U_orth (m, chunks) -> U_orth.T (chunks, m)
+            # V_orth (chunks, n) -> V_orth.T (n, chunks)
+            U_orth_T = U_orth.T
+            V_orth_T = V_orth.T
+            # "모든" 태스크 벡터에 대해 반복 (num_used 뿐만 아니라)
+            for tv in task_vectors:
+                M_i = tv.vector[key].to(device)  # 원본 태스크 행렬 (m, n)
+                # Sigma_i_prime = (U_orth.T @ M_i) @ V_orth.T
+                # (chunks, m) @ (m, n) @ (n, chunks) -> (chunks, chunks)
+                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T
+                # "이를 diagonal로 만들도록 해야해" -> 대각 성분만 추출
+                sigma_task_diag = torch.diag(Sigma_i_prime)  # (chunks,)
+                all_sigma_diags.append(sigma_task_diag)
+            # 2. 모든 태스크의 sigma_task_diag를 평균냅니다.
+            if not all_sigma_diags:
+                # 엣지 케이스 방어
+                Sigma = torch.zeros(
+                    (chunks, chunks), device=device, dtype=u0.dtype)
+            else:
+                # (num_tasks, chunks)
+                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
+                # (chunks,)
+                mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
+                # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
+                Sigma = torch.diag(mean_sigma_diag)  # (chunks, chunks)
+            # -------- [수정된 Sigma 계산 로직 끝] --------
+            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
+            new_vector[key] = [U_orth, Sigma, V_orth]
+    return new_vector
+
+def compute_and_sum_svd_mem_reduction_tsvm(task_vectors, config):
     """
     여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
     각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과 sigma(diag)로 재구성.
@@ -150,8 +360,7 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
     return new_vector
 
 
-@hydra.main(config_path="config", config_name="config_remote_sensing", version_base="1.3")
-def my_app(cfg: DictConfig) -> None:
+def run_energy(cfg: DictConfig) -> None:
 
     # Use Hydra's logger (already configured)
     logger = logging.getLogger(__name__)
@@ -188,6 +397,14 @@ def my_app(cfg: DictConfig) -> None:
         # number of training samples per class to use (0 => use all)
         if "train_k" not in cfg:
             cfg.train_k = 0
+        if "num_grad_accumulation" not in cfg:
+            cfg.num_grad_accumulation = 1
+        if "adapter" not in cfg:
+            cfg.adapter = "none"
+        if "adapter_lr" not in cfg:
+            cfg.adapter_lr = cfg.sigma_lr
+        if "adapter_wd" not in cfg:
+            cfg.adapter_wd = cfg.sigma_wd
 
         # override from environment variables (manual override if needed)
         if os.environ.get("ENERGY_SIGMA_EPOCHS", ""):
@@ -227,6 +444,18 @@ def my_app(cfg: DictConfig) -> None:
                 cfg.train_k = int(os.environ["ENERGY_TRAIN_K"])
             except Exception:
                 pass
+        if os.environ.get("ENERGY_ADAPTER", ""):
+            cfg.adapter = os.environ["ENERGY_ADAPTER"]
+        cfg.adapter = normalize_adapter_choice(cfg.adapter)
+        cfg.adapter_display = cfg.adapter if cfg.adapter != "none" else "none"
+        cfg.adapter_lr = float(getattr(cfg, "adapter_lr", cfg.sigma_lr))
+        cfg.adapter_wd = float(getattr(cfg, "adapter_wd", cfg.sigma_wd))
+
+        env_config_tag = os.environ.get("ENERGY_CONFIG_TAG", "").strip()
+        if env_config_tag:
+            cfg.config_tag = env_config_tag
+        elif "config_tag" not in cfg or not cfg.config_tag:
+            cfg.config_tag = build_energy_config_tag(cfg)
     
     # exclude held-out test dataset from basis building
     test_ds = cfg.test_dataset
@@ -246,10 +475,13 @@ def my_app(cfg: DictConfig) -> None:
     cfg.num_tasks = len(base_list)
     cfg.DATASETS_VAL = [dataset + "Val" for dataset in base_list]
     cfg.data_location = os.path.expanduser(cfg.data_location)
+    cfg.config_tag = getattr(cfg, "config_tag", build_energy_config_tag(cfg))
     OmegaConf.set_struct(cfg, True)
 
-    logger.info(cfg.method.full_name)
-    OmegaConf.set_struct(cfg, True)
+    logger.info(f"Using config tag: {cfg.config_tag}")
+    adapter_display = cfg.adapter_display if hasattr(cfg, "adapter_display") else "none"
+    adapter_tag = adapter_path_tag(adapter_display)
+    logger.info(f"Adapter option: {adapter_display}")
 
     # TSV Merge Orthogonalization
     # Load fine-tuned checkpoints for basis tasks
@@ -284,7 +516,13 @@ def my_app(cfg: DictConfig) -> None:
 
     # create final task vector with timing
     svd_start = time.time()
-    svd_dict = compute_and_sum_svd_mem_reduction(task_vectors, cfg)
+    init_mode = getattr(cfg, "initialize_sigma", "average").lower()
+    if init_mode == "tsvm":
+        logger.info("Using TSVM SVD initialization")
+        svd_dict = compute_and_sum_svd_mem_reduction_tsvm(task_vectors, cfg)
+    else:
+        logger.info("Using average SVD initialization")
+        svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
     svd_time = time.time() - svd_start
     logger.info(f"Computed SVD bases in {svd_time:.2f}s")
 
@@ -303,6 +541,8 @@ def my_app(cfg: DictConfig) -> None:
 
 
     # If a held-out test dataset is provided, train sigma only on that dataset and evaluate
+    sigma_trainable_params = None
+
     if test_ds:
         logger.info(f"Sigma-only finetuning on held-out dataset: {test_ds}")
 
@@ -337,13 +577,14 @@ def my_app(cfg: DictConfig) -> None:
 
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+        sigma_trainable_params = trainable_params
         
         # Use train split for sigma finetuning and Val split for evaluation
         val_dataset_name = test_ds + "Val"
         
         # Determine k-shot folder structure
         k = int(cfg.train_k)
-        shot_folder = f"{k}shot" if k > 0 else "fullshot"
+        shot_folder = f"{k}shots" if k > 0 else "fullshots"
         
         # Ensure save_dir exists in cfg for classification head management
         with open_dict(cfg):
@@ -414,12 +655,14 @@ def my_app(cfg: DictConfig) -> None:
                 logger.error(f"Failed to apply k-shot sampling: {e}")
                 logger.warning("Falling back to full training set")
 
-        energy_save_dir = os.path.join(
+        config_dir = os.path.join(
             cfg.model_location,
             cfg.model,
             val_dataset_name,
-            shot_folder
+            cfg.config_tag,
         )
+        os.makedirs(config_dir, exist_ok=True)
+        energy_save_dir = os.path.join(config_dir, shot_folder)
         os.makedirs(energy_save_dir, exist_ok=True)
 
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
@@ -458,17 +701,54 @@ def my_app(cfg: DictConfig) -> None:
         # Prepare evaluation schedule and history tracking
         eval_epochs = compute_eval_epochs(int(cfg.sigma_epochs))
         loss_history = []
+        val_history = []
+        eval_counter = 0
+
+        def record_validation(stage: str, epoch_value, accuracy_value):
+            """Record evaluation metadata for result serialization."""
+            nonlocal eval_counter
+            record = {
+                "stage": stage,
+                "epoch": int(epoch_value),
+                "accuracy": float(accuracy_value),
+                "elapsed_seconds": float(time.time() - overall_start),
+                "evaluation_index": int(eval_counter),
+            }
+            val_history.append(record)
+            eval_counter += 1
+            return record
 
         # Prepare visualization directory
-        visualization_dir = os.path.join(energy_save_dir, "sigma_visualization")
+        visualization_dir = os.path.join(
+            energy_save_dir, f"sigma_visualization_{adapter_tag}"
+        )
         os.makedirs(visualization_dir, exist_ok=True)
 
         # Log zeroshot accuracy before any sigma updates
         model.eval()
         with torch.no_grad():
-            zeroshot_metrics = evaluate_encoder_with_dataloader(
-                model.image_encoder, classification_head, val_loader, cfg.device)
-        logger.info(f"Zeroshot validation accuracy (epoch -1): {zeroshot_metrics['top1'] * 100:.2f}%")
+            pretrained_metrics = evaluate_encoder_with_dataloader(model.image_encoder, classification_head, val_loader, cfg.device)
+            pretrained_acc = pretrained_metrics['top1']
+            logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
+            record_validation("pretrained", -2, pretrained_acc)
+
+            eval_params = {}
+            for name, p in base_params.items():
+                eval_params[name] = p.clone()
+            for safe_key, module in sigma_modules.items():
+                orig_key = sigma_key_map.get(safe_key, safe_key)
+                if orig_key in eval_params and module.sigma.numel() > 0:
+                    delta = module().to(eval_params[orig_key].device)
+                    if eval_params[orig_key].shape == delta.shape:
+                        eval_params[orig_key] = eval_params[orig_key] + delta
+
+            model.image_encoder.load_state_dict(eval_params, strict=False)
+            zeroshot_metrics = evaluate_encoder_with_dataloader(model.image_encoder, classification_head, val_loader, cfg.device)
+            zeroshot_acc = zeroshot_metrics['top1']
+            logger.info(f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
+            record_validation("zeroshot", -1, zeroshot_acc)
+            model.image_encoder.load_state_dict(base_state_dict, strict=False)
+
         sigma_records = []
         records = visualize_sigma_matrices(
             sigma_modules,
@@ -567,6 +847,7 @@ def my_app(cfg: DictConfig) -> None:
                     val_acc = val_metrics['top1']
 
                     logger.info(f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
+                    record_validation("epoch", epoch, val_acc)
 
                     model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
@@ -615,6 +896,7 @@ def my_app(cfg: DictConfig) -> None:
             final_acc = final_metrics['top1']
         
         logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
+        record_validation("final", int(cfg.sigma_epochs), final_acc)
 
         training_time = time.time() - overall_start
         gpu_peak_mem_mb = None
@@ -681,8 +963,29 @@ def my_app(cfg: DictConfig) -> None:
                 plt.savefig(overview_path, dpi=300, bbox_inches="tight", facecolor="white")
                 plt.close()
 
+        # Optional adapter fine-tuning (TIP / LP++) after sigma training
+        adapter_summary = None
+        adapter_result_tag = adapter_tag
+        if cfg.adapter != "none":
+            adapter_args = SimpleNamespace(
+                adapter=cfg.adapter,
+                batch_size=int(cfg.batch_size),
+                num_grad_accumulation=int(getattr(cfg, "num_grad_accumulation", 1)),
+                wd=float(getattr(cfg, "adapter_wd", cfg.sigma_wd)),
+                lr=float(getattr(cfg, "adapter_lr", cfg.sigma_lr)),
+                k=int(getattr(cfg, "train_k", 0)),
+            )
+            adapter_ready_model = AdapterCompatibleClassifier(model)
+            adapter_summary = train_adapter_remote(
+                adapter_ready_model, train_loader, val_loader, adapter_args, logger, energy_save_dir
+            )
+            if adapter_summary:
+                adapter_result_tag = adapter_path_tag(adapter_summary["adapter_type"])
+
         # Save results to JSON
-        results_path = os.path.join(energy_save_dir, "energy_results.json")
+        results_path = os.path.join(
+            energy_save_dir, f"energy_results_{adapter_result_tag}.json"
+        )
         results = {
             "target_dataset": test_ds,
             "final_accuracy": float(final_acc),
@@ -691,20 +994,30 @@ def my_app(cfg: DictConfig) -> None:
             "sigma_epochs": cfg.sigma_epochs,
             "sigma_lr": cfg.sigma_lr,
             "svd_keep_topk": getattr(cfg, "svd_keep_topk", 2),
+            "initialize_sigma": getattr(cfg, "initialize_sigma", None),
+            "adapter_choice": cfg.adapter,
             "training_time": training_time,
-            "trainable_params": trainable_params,
+            "trainable_params": sigma_trainable_params,
             "batch_size": cfg.batch_size,
             "gpu_peak_mem_mb": gpu_peak_mem_mb,
             "loss_history": loss_history,
+            "validation_history": val_history,
+            "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
+            "pretrained_accuracy": float(pretrained_acc),
+            "zeroshot_accuracy": float(zeroshot_acc),
+            "config_tag": cfg.config_tag,
+            "adapter_results": adapter_summary,
         }
-        
-        import json
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=4)
         logger.info(f"✓ Saved results to {results_path}")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    )
     parser = argparse.ArgumentParser(add_help=False)
     from src.datasets.remote_sensing import REMOTE_SENSING_DATASETS
     allowed_test_datasets = sorted(list(REMOTE_SENSING_DATASETS.keys()))
@@ -717,6 +1030,7 @@ if __name__ == "__main__":
         help="Held-out dataset to sigma-finetune on; one of %(choices)s. "
              "Sigma epochs will be automatically set based on dataset size.",
     )
+    parser.add_argument("--config_file", type=str, default="config/config_remote_sensing.yaml")
     parser.add_argument("--sigma_epochs", type=int, default=None,
                         help="Manual override for sigma epochs (optional, auto-determined by default)")
     parser.add_argument("--sigma_lr", type=float, default=1e-3)
@@ -726,119 +1040,56 @@ if __name__ == "__main__":
     parser.add_argument("--sigma-lr-gamma", type=float, default=1.0)
     parser.add_argument("--k", type=int, default=0,
                         help="Number of samples per class for few-shot learning (0 or None = use all)")
-    parser.add_argument("--run_all", action="store_true",
-                        help="Run energy training for all datasets in DATASETS_ALL (leave-one-out)")
-    # parse_known_args: leave Hydra args intact
-    args, unknown = parser.parse_known_args()
-    # Remove recognized app-specific args so Hydra doesn't see them
-    # and complain about unrecognized arguments.
-    sys.argv = [sys.argv[0]] + unknown
+    parser.add_argument("--config_tag", type=str, default=None,
+                        help="Optional tag to group outputs for this configuration")
+    parser.add_argument("--initialize_sigma", type=str, default=None,
+                        choices=["average", "tsvm"],
+                        help="Initialization strategy for sigma basis")
+    parser.add_argument("--adapter", type=str, default=None,
+                        choices=["none", "tip", "lp++"],
+                        help="Optional adapter to train after sigma optimization (TIP or LP++)")
+    parser.add_argument("--adapter_lr", type=float, default=None,
+                        help="Learning rate for adapter training (defaults to sigma_lr)")
+    parser.add_argument("--adapter_wd", type=float, default=None,
+                        help="Weight decay for adapter training (defaults to sigma_wd)")
+    parser.add_argument("--adapter_grad_accum", type=int, default=None,
+                        help="Gradient accumulation steps for adapter training (default: 1)")
+    args = parser.parse_args()
 
-    # If --run_all is specified, run for each dataset in DATASETS_ALL sequentially
-    if args.run_all:
-        import subprocess
-        from omegaconf import OmegaConf
-        
-        # Load config to get DATASETS_ALL
-        config_path = os.path.join(os.path.dirname(__file__), "config", "config_remote_sensing.yaml")
-        config = OmegaConf.load(config_path)
-        
-        if "DATASETS_ALL" not in config or not config.DATASETS_ALL:
-            print("ERROR: DATASETS_ALL not found or empty in config_remote_sensing.yaml")
-            sys.exit(1)
-        
-        all_datasets = list(config.DATASETS_ALL)
-        total = len(all_datasets)
-        
-        print("\n" + "=" * 100)
-        print(f"🚀 RUNNING ENERGY TRAINING FOR ALL {total} DATASETS (Leave-One-Out)")
-        print("=" * 100)
-        print(f"Datasets: {', '.join(all_datasets)}")
-        k_str = f"{args.k}-shot per class" if args.k else "Full dataset"
-        print(f"Config: sigma_epochs=AUTO (per dataset), sigma_lr={args.sigma_lr}, batch_size={args.batch_size}, k={k_str}")
-        print("=" * 100 + "\n")
-        
-        failed_datasets = []
-        
-        for idx, test_dataset in enumerate(all_datasets, 1):
-            # Get auto-determined sigma_epochs for this dataset
-            dataset_epochs = SIGMA_EPOCHS_PER_DATASET.get(test_dataset, 10)
-            
-            print("\n" + "=" * 100)
-            print(f"📊 [{idx}/{total}] Processing: {test_dataset} as TEST dataset")
-            print(f"    Basis datasets: {total - 1} datasets (all except {test_dataset})")
-            print(f"    Sigma epochs: {dataset_epochs} (auto-determined)")
-            print("=" * 100 + "\n")
-            
-            # Build command to run this script with specific test_dataset
-            # Override DATASETS=[] to force using DATASETS_ALL (leave-one-out mode)
-            # Note: sigma_epochs is NOT passed - it will be auto-determined by dataset
-            cmd = [
-                sys.executable,  # Python interpreter
-                __file__,        # This script
-                "--test_dataset", test_dataset,
-                "--sigma_lr", str(args.sigma_lr),
-                "--sigma_wd", str(args.sigma_wd),
-                "--batch_size", str(args.batch_size),
-                "--sigma-lr-step-size", str(args.sigma_lr_step_size),
-                "--sigma-lr-gamma", str(args.sigma_lr_gamma),
-                "DATASETS=[]",  # Force empty DATASETS to trigger DATASETS_ALL usage
-            ] + unknown  # Pass through any Hydra overrides
-            
-            # Add manual sigma_epochs override if specified
-            if args.sigma_epochs is not None:
-                cmd.insert(-1, "--sigma_epochs")
-                cmd.insert(-1, str(args.sigma_epochs))
-            
-            # Add k-shot parameter if specified
-            if args.k is not None:
-                cmd.insert(-1, "--k")
-                cmd.insert(-1, str(args.k))
-            
-            print(f"🔧 Running command: {' '.join(cmd)}\n")
-            
-            try:
-                result = subprocess.run(cmd, check=True)
-                print(f"\n✅ [{idx}/{total}] Successfully completed: {test_dataset}")
-            except subprocess.CalledProcessError as e:
-                print(f"\n❌ [{idx}/{total}] FAILED: {test_dataset} (exit code: {e.returncode})")
-                failed_datasets.append(test_dataset)
-            except Exception as e:
-                print(f"\n❌ [{idx}/{total}] ERROR: {test_dataset} - {str(e)}")
-                failed_datasets.append(test_dataset)
-            
-            print("=" * 100)
-        
-        # Final summary
-        print("\n" + "=" * 100)
-        print("🏁 ENERGY TRAINING COMPLETED FOR ALL DATASETS")
-        print("=" * 100)
-        print(f"Total datasets: {total}")
-        print(f"Successful: {total - len(failed_datasets)}")
-        print(f"Failed: {len(failed_datasets)}")
-        if failed_datasets:
-            print(f"Failed datasets: {', '.join(failed_datasets)}")
-        print("=" * 100 + "\n")
-        
-        sys.exit(0 if len(failed_datasets) == 0 else 1)
-    
-    else:
-        # Single dataset mode (original behavior)
-        if args.test_dataset:
-            os.environ["ENERGY_TEST_DATASET"] = args.test_dataset
-        if args.sigma_epochs is not None:
-            os.environ["ENERGY_SIGMA_EPOCHS"] = str(args.sigma_epochs)
-        if args.sigma_lr is not None:
-            os.environ["ENERGY_SIGMA_LR"] = str(args.sigma_lr)
-        if args.sigma_wd is not None:
-            os.environ["ENERGY_SIGMA_WD"] = str(args.sigma_wd)
-        if args.batch_size is not None:
-            os.environ["ENERGY_BATCH_SIZE"] = str(args.batch_size)
-        if getattr(args, "sigma_lr_step_size", None) is not None:
-            os.environ["ENERGY_SIGMA_LR_STEP_SIZE"] = str(args.sigma_lr_step_size)
-        if getattr(args, "sigma_lr_gamma", None) is not None:
-            os.environ["ENERGY_SIGMA_LR_GAMMA"] = str(args.sigma_lr_gamma)
-        if getattr(args, "k", None) is not None:
-            os.environ["ENERGY_TRAIN_K"] = str(args.k)
 
-        my_app()
+    if not args.test_dataset:
+        parser.error("--test_dataset must be specified")
+
+    cfg = load_config(args.config_file)
+
+    if args.test_dataset:
+        cfg.test_dataset = args.test_dataset
+    if args.sigma_epochs is not None:
+        cfg.sigma_epochs = args.sigma_epochs
+    if args.sigma_lr is not None:
+        cfg.sigma_lr = args.sigma_lr
+    if args.sigma_wd is not None:
+        cfg.sigma_wd = args.sigma_wd
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if getattr(args, "sigma_lr_step_size", None) is not None:
+        cfg.sigma_lr_step_size = args.sigma_lr_step_size
+    if getattr(args, "sigma_lr_gamma", None) is not None:
+        cfg.sigma_lr_gamma = args.sigma_lr_gamma
+    if getattr(args, "k", None) is not None:
+        cfg.train_k = args.k
+    if getattr(args, "initialize_sigma", None) is not None:
+        cfg.initialize_sigma = args.initialize_sigma
+    if getattr(args, "config_tag", None):
+        cfg.config_tag = args.config_tag
+    if getattr(args, "adapter", None) is not None:
+        cfg.adapter = args.adapter
+    if getattr(args, "adapter_lr", None) is not None:
+        cfg.adapter_lr = args.adapter_lr
+    if getattr(args, "adapter_wd", None) is not None:
+        cfg.adapter_wd = args.adapter_wd
+    if getattr(args, "adapter_grad_accum", None) is not None:
+        cfg.num_grad_accumulation = args.adapter_grad_accum
+
+    OmegaConf.set_struct(cfg, True)
+    run_energy(cfg)

@@ -237,7 +237,7 @@ class LPPWrapper(torch.nn.Module):
             p.requires_grad = False
 
         self.model = model
-        from src.lpplusplus import init_lp
+        from atlas_src.lpplusplus import init_lp
         self.adapter, self.alpha_vec, self.lr_alpha, self.lr_temp = init_lp(
             features_cache, labels, self.model.classification_head.weight.T / 100., shots)
 
