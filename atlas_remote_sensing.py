@@ -16,6 +16,7 @@ import torchvision
 import logging
 import subprocess
 from omegaconf import OmegaConf
+from tqdm.auto import tqdm
 
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
@@ -27,6 +28,7 @@ from src.models.task_vectors import NonLinearTaskVector
 from src.utils.variables_and_paths import (
     get_zeroshot_path,
     get_finetuned_path,
+    TQDM_BAR_FORMAT,
 )
 
 # Utils
@@ -234,11 +236,11 @@ def train_adapter_remote(
         logger.info(f"[adapter:lp++] Initializing LP++ with shots={shots_value}")
         adapter_model = LPPWrapper(model, features_cache, labels_cache, shots_value)
         adapter_lr = float(getattr(adapter_model, "lr_temp", args.lr))
-        adapter_epochs = 5
+        adapter_epochs = 300
     else:
         adapter_model = TIPWrapper(model, features_cache, labels_cache)
         adapter_lr = 1e-3
-        adapter_epochs = 5
+        adapter_epochs = 10
 
     adapter_model = adapter_model.to(device)
 
@@ -528,19 +530,46 @@ def train_single_task(args, comp_acc=None, logger=None):
     model.freeze_head()
     model = model.cuda()
 
-    eval_dataset = get_remote_sensing_dataset(
-        target_dataset,
-        model.val_preprocess,
-        location=args.data_location,
-        batch_size=args.batch_size,
-        num_workers=8,
-    )
+    eval_dataset = None
+    val_loader = None
+    with tqdm(
+        total=2,
+        desc=f"Preparing validation dataloader ({target_dataset})",
+        leave=False,
+        bar_format=TQDM_BAR_FORMAT,
+    ) as val_progress:
+        eval_dataset = get_remote_sensing_dataset(
+            target_dataset,
+            model.val_preprocess,
+            location=args.data_location,
+            batch_size=args.batch_size,
+            num_workers=8,
+        )
+        val_progress.update(1)
+        val_loader = get_dataloader(
+            eval_dataset, is_train=False, args=args, image_encoder=None
+        )
+        dataset_size = None
+        if hasattr(val_loader, "dataset"):
+            try:
+                dataset_size = len(val_loader.dataset)
+            except TypeError:
+                dataset_size = None
+        if dataset_size is not None:
+            val_progress.set_postfix_str(f"samples={dataset_size}")
+        val_progress.update(1)
 
     # Few-shot sampling using unified k-shot function
     k = getattr(args, 'k', 0)
     logger.info("Using full training dataset (no k-shot sampling)" if k <= 0 else f"Applying k-shot sampling: {k} samples per class")
     if k > 0:
-        selected_indices = sample_k_shot_indices(train_dataset, k, seed=0, verbose=True)
+        selected_indices = sample_k_shot_indices(
+            train_dataset,
+            k,
+            seed=0,
+            verbose=True,
+            progress_desc=f"{target_dataset} {k}-shot",
+        )
         base_dataset = getattr(train_dataset, "train_dataset", train_dataset)
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.Subset(base_dataset, selected_indices),
@@ -588,9 +617,6 @@ def train_single_task(args, comp_acc=None, logger=None):
     val_history = []
     record_validation = ValidationRecorder(overall_start, val_history)
 
-    # Load validation dataset using get_dataloader (unified evaluation approach)
-    val_loader = get_dataloader(eval_dataset, is_train=False, args=args, image_encoder=None)
-    
     # Evaluate zeroshot accuracy using unified evaluation function
     image_encoder.eval()
     classification_head.eval()
@@ -787,90 +813,128 @@ if __name__ == "__main__":
 
     # Lightweight argparse wrapper to override key hyperparameters via CLI
     wrapper = argparse.ArgumentParser(add_help=False)
-    wrapper.add_argument("--model", type=str, default=default_model,
-                         help=f"Model architecture (default: {default_model} from config)")
+    wrapper.add_argument("--model", type=str, default=None,
+                         help=f"Model architecture (config default: {default_model})")
     wrapper.add_argument("--batch_size", type=int, default=None)
     wrapper.add_argument("--lr", type=float, default=None)
     wrapper.add_argument("--wd", type=float, default=None)
     wrapper.add_argument("--epochs", type=int, default=None)
-    wrapper.add_argument("--k", type=int, default=0,
+    wrapper.add_argument("--k", type=int, default=None,
                          help="k-shot per class (e.g., 16 = 16 samples per class). "
-                              "Set to 0 to use full dataset (default: 16)")
+                              "Set to 0 to use full dataset.")
     wrapper.add_argument("--config_tag", type=str, default=None,
                          help="Optional tag to group outputs for this configuration")
-    wrapper.add_argument("--data_location", type=str, default="./datasets")
-    wrapper.add_argument("--model_location", type=str, default="./models/checkpoints_remote_sensing")
-    wrapper.add_argument("--seed", type=int, default=1)
-    wrapper.add_argument("--print_every", type=int, default=10)
+    wrapper.add_argument("--data_location", type=str, default=None)
+    wrapper.add_argument("--model_location", type=str, default=None)
+    wrapper.add_argument("--seed", type=int, default=None)
+    wrapper.add_argument("--print_every", type=int, default=None)
     
     # Dataset controls (similar to energy_train_remote_sensing.py)
     wrapper.add_argument("--test_dataset", type=str, required=True,
                          help="Dataset to treat as target (leave-one-out with others as basis)")
-    wrapper.add_argument("--epochs_per_task", type=int, default=10)
+    wrapper.add_argument("--epochs_per_task", type=int, default=None)
     
     # Atlas-specific options
-    wrapper.add_argument("--blockwise_coef", action="store_true", default=True,
+    wrapper.add_argument("--blockwise_coef", dest="blockwise_coef", action="store_true",
                          help="Learn coefficient per parameter block")
+    wrapper.add_argument("--no-blockwise_coef", dest="blockwise_coef", action="store_false",
+                         help=argparse.SUPPRESS)
+    wrapper.set_defaults(blockwise_coef=None)
     wrapper.add_argument("--partition", type=int, default=None,
                          help="Partition size for fine-grained coefficient learning")
-    wrapper.add_argument("--adapter", type=str, default="none",
+    wrapper.add_argument("--adapter", type=str, default=None,
                          choices=["none", "tip", "lp++"],
                          help="Optionally train an adapter (TIP or LP++) after learning atlas coefficients")
 
     cli_args, unknown = wrapper.parse_known_args()
     unknown = list(unknown)
-    adapter_option = (cli_args.adapter or "none").lower()
-    if adapter_option != "none":
-        passthrough = "lpp" if adapter_option == "lp++" else adapter_option
-        unknown.extend(["--adapter", passthrough])
+    adapter_override = None
+    adapter_option = (cli_args.adapter or "").lower()
+    if adapter_option and adapter_option != "none":
+        adapter_override = "lpp" if adapter_option == "lp++" else adapter_option
+        unknown.extend(["--adapter", adapter_override])
 
     # Import atlas args parser for remaining arguments
     from atlas_src.args import parse_arguments
     sys.argv = [sys.argv[0]] + unknown
     args = parse_arguments()
 
-    # Overlay CLI overrides
-    if cli_args.model is not None:
-        args.model = cli_args.model
-    if cli_args.batch_size is not None:
-        args.batch_size = cli_args.batch_size
-    if cli_args.lr is not None:
-        args.lr = cli_args.lr
-    if cli_args.wd is not None:
-        args.wd = cli_args.wd
-    if cli_args.epochs is not None:
-        args.epochs = cli_args.epochs
-    if cli_args.data_location is not None:
-        args.data_location = cli_args.data_location
-    if cli_args.model_location is not None:
-        args.model_location = cli_args.model_location
-    if cli_args.seed is not None:
-        args.seed = cli_args.seed
-    if cli_args.print_every is not None:
-        args.print_every = cli_args.print_every
-    if cli_args.blockwise_coef is not None:
-        args.blockwise_coef = cli_args.blockwise_coef
-    if cli_args.partition is not None:
-        args.partition = cli_args.partition
-    if cli_args.config_tag is not None:
-        args.config_tag = cli_args.config_tag
-    if getattr(args, "adapter", None):
-        args.adapter_display = "lp++" if args.adapter == "lpp" else args.adapter
-    else:
-        args.adapter_display = "none"
+    def apply_values(namespace, values, skip_none=True):
+        for key, value in values.items():
+            if skip_none and value is None:
+                continue
+            setattr(namespace, key, value)
 
-    # Set k-shot parameter
+    config_dict = OmegaConf.to_container(config, resolve=True)
+    apply_values(args, config_dict)
+
+    cli_override_dict = {
+        key: value
+        for key, value in vars(cli_args).items()
+        if value is not None and key not in {"adapter"}
+    }
+    apply_values(args, cli_override_dict)
+
+    if adapter_override is not None:
+        args.adapter = adapter_override
+    if not getattr(args, "adapter", None):
+        args.adapter = "none"
+    args.adapter_display = "lp++" if args.adapter == "lpp" else args.adapter
+
+    if getattr(args, "model", None) is None:
+        args.model = default_model
+
     if cli_args.k is not None:
         args.k = cli_args.k
-    else:
-        args.k = 16  # default: 16-shot
+    elif "train_k" in config_dict and config_dict["train_k"] is not None:
+        args.k = config_dict["train_k"]
+    elif getattr(args, "k", None) is None:
+        args.k = 0
+    args.k = int(args.k)
 
-    # Default hyperparameters (following atlas.py)
-    args.lr = 1e-1
-    args.batch_size = 32 if args.model == "ViT-L-14" else 512
-    args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
-    args.print_every = 10
-    args.epochs_per_task = cli_args.epochs_per_task
+    if "lr" not in cli_override_dict:
+        if config_dict.get("lr") is not None:
+            args.lr = config_dict["lr"]
+        else:
+            args.lr = 1e-1
+    if "batch_size" not in cli_override_dict:
+        if config_dict.get("batch_size") is not None:
+            args.batch_size = config_dict["batch_size"]
+        else:
+            args.batch_size = 32 if args.model == "ViT-L-14" else 512
+    if "num_grad_accumulation" not in cli_override_dict:
+        if config_dict.get("num_grad_accumulation") is not None:
+            args.num_grad_accumulation = config_dict["num_grad_accumulation"]
+        else:
+            args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
+    if "print_every" not in cli_override_dict:
+        args.print_every = config_dict.get("print_every", 10) or 10
+    if "epochs_per_task" not in cli_override_dict:
+        args.epochs_per_task = config_dict.get("epochs_per_task", 10)
+    if "blockwise_coef" not in cli_override_dict:
+        if config_dict.get("blockwise_coef") is not None:
+            args.blockwise_coef = config_dict["blockwise_coef"]
+        else:
+            args.blockwise_coef = True
+    if "data_location" not in cli_override_dict and config_dict.get("data_location") is not None:
+        args.data_location = config_dict["data_location"]
+    if "model_location" not in cli_override_dict and config_dict.get("model_location") is not None:
+        args.model_location = config_dict["model_location"]
+    if "seed" not in cli_override_dict:
+        if config_dict.get("seed") is not None:
+            args.seed = config_dict["seed"]
+        elif cli_args.seed is not None:
+            args.seed = cli_args.seed
+        else:
+            args.seed = 1
+
+    args.lr = float(args.lr)
+    args.batch_size = int(args.batch_size)
+    args.num_grad_accumulation = int(args.num_grad_accumulation)
+    args.print_every = int(args.print_every)
+    args.epochs_per_task = int(args.epochs_per_task)
+
+    args.test_dataset = cli_args.test_dataset
     
 
     logger = logging.getLogger(__name__)

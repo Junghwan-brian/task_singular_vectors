@@ -7,12 +7,18 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 import argparse
 import sys
 import torchvision
+from tqdm.auto import tqdm
 
 from src.eval.aggregation import create_task_vector
-from src.utils.variables_and_paths import ALL_DATASETS
+from src.utils.variables_and_paths import (
+    ALL_DATASETS,
+    TQDM_BAR_FORMAT,
+    get_energy_finetuned_path,
+    get_finetuned_path,
+    get_zeroshot_path,
+)
 from src.datasets import get_dataloader, maybe_dictionarize
 from src.models import ImageClassifier, ImageEncoder
-from src.utils.variables_and_paths import get_finetuned_path, get_zeroshot_path, get_energy_finetuned_path
 from src.utils.sigma_param import SigmaParametrization
 import torch
 from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
@@ -143,6 +149,38 @@ SIGMA_EPOCHS_PER_DATASET = {
 #     "UC_Merced": 5,       # ~2,100 train samples, 256x256
 #     "WHU-RS19": 5,        # ~1,000 train samples, 600x600
 # }
+
+ENERGY_ENV_OVERRIDE_MAP = {
+    "ENERGY_TEST_DATASET": ("test_dataset", str),
+    "ENERGY_SIGMA_EPOCHS": ("sigma_epochs", int),
+    "ENERGY_SIGMA_LR": ("sigma_lr", float),
+    "ENERGY_SIGMA_WD": ("sigma_wd", float),
+    "ENERGY_SIGMA_LR_STEP_SIZE": ("sigma_lr_step_size", int),
+    "ENERGY_SIGMA_LR_GAMMA": ("sigma_lr_gamma", float),
+    "ENERGY_BATCH_SIZE": ("batch_size", int),
+    "ENERGY_TRAIN_K": ("train_k", int),
+    "ENERGY_ADAPTER": ("adapter", str),
+    "ENERGY_ADAPTER_LR": ("adapter_lr", float),
+    "ENERGY_ADAPTER_WD": ("adapter_wd", float),
+    "ENERGY_CONFIG_TAG": ("config_tag", str),
+}
+
+ENERGY_PRIMITIVE_DEFAULTS = {
+    "test_dataset": "",
+    "sigma_epochs": None,
+    "sigma_lr": None,
+    "sigma_wd": None,
+    "sigma_lr_step_size": None,
+    "sigma_lr_gamma": None,
+    "batch_size": None,
+    "device": None,
+    "train_k": None,
+    "num_grad_accumulation": None,
+    "adapter": None,
+    "adapter_lr": None,
+    "adapter_wd": None,
+    "config_tag": None,
+}
 
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
@@ -362,99 +400,69 @@ def compute_and_sum_svd_mem_reduction_tsvm(task_vectors, config):
 
 def run_energy(cfg: DictConfig) -> None:
 
-    # Use Hydra's logger (already configured)
     logger = logging.getLogger(__name__)
-    
+    logger.setLevel(logging.INFO)
     # add defaults for test-time sigma finetuning
     with open_dict(cfg):
-        if "test_dataset" not in cfg:
-            cfg.test_dataset = ""
-        
-        # override test_dataset from environment variable first
-        if os.environ.get("ENERGY_TEST_DATASET", ""):
-            cfg.test_dataset = os.environ["ENERGY_TEST_DATASET"]
-        
-        # Set sigma_epochs based on test_dataset (matches fine-tuning epochs)
-        if cfg.test_dataset and cfg.test_dataset in SIGMA_EPOCHS_PER_DATASET:
-            cfg.sigma_epochs = SIGMA_EPOCHS_PER_DATASET[cfg.test_dataset]
-            logger.info(f"✓ Auto-set sigma_epochs={cfg.sigma_epochs} for {cfg.test_dataset}")
-        elif "sigma_epochs" not in cfg:
-            cfg.sigma_epochs = 10  # default fallback
-        
-        if "sigma_lr" not in cfg:
-            cfg.sigma_lr = 5e-6
-        if "sigma_wd" not in cfg:
-            cfg.sigma_wd = 0.0
-        # scheduler defaults
-        if "sigma_lr_step_size" not in cfg:
-            cfg.sigma_lr_step_size = 1
-        if "sigma_lr_gamma" not in cfg:
-            cfg.sigma_lr_gamma = 1.0
-        if "batch_size" not in cfg:
-            cfg.batch_size = 128
-        if "device" not in cfg:
+        for key, default in ENERGY_PRIMITIVE_DEFAULTS.items():
+            if key not in cfg or cfg[key] is None:
+                cfg[key] = default
+
+        for env_key, (cfg_key, caster) in ENERGY_ENV_OVERRIDE_MAP.items():
+            raw_value = os.environ.get(env_key, "")
+            if not raw_value:
+                continue
+            try:
+                value_to_cast = raw_value.strip() if caster is str else raw_value
+                cfg_value = caster(value_to_cast)
+            except ValueError:
+                logger.warning(f"Ignoring invalid environment override {env_key}={raw_value}")
+                continue
+            cfg[cfg_key] = cfg_value
+
+        test_ds = (cfg.test_dataset or "").strip()
+        cfg.test_dataset = test_ds
+        if test_ds and test_ds in SIGMA_EPOCHS_PER_DATASET and cfg.sigma_epochs is None:
+            cfg.sigma_epochs = SIGMA_EPOCHS_PER_DATASET[test_ds]
+            logger.info(f"✓ Auto-set sigma_epochs={cfg.sigma_epochs} for {test_ds}")
+
+        if cfg.sigma_epochs is None:
+            cfg.sigma_epochs = 10
+
+        numeric_defaults = {
+            "sigma_lr": 5e-6,
+            "sigma_wd": 0.0,
+            "sigma_lr_step_size": 1,
+            "sigma_lr_gamma": 1.0,
+            "batch_size": 128,
+            "train_k": 0,
+            "num_grad_accumulation": 1,
+        }
+        for key, default in numeric_defaults.items():
+            if key not in cfg or cfg[key] is None:
+                cfg[key] = default
+
+        if not cfg.device:
             cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # number of training samples per class to use (0 => use all)
-        if "train_k" not in cfg:
-            cfg.train_k = 0
-        if "num_grad_accumulation" not in cfg:
-            cfg.num_grad_accumulation = 1
-        if "adapter" not in cfg:
-            cfg.adapter = "none"
-        if "adapter_lr" not in cfg:
-            cfg.adapter_lr = cfg.sigma_lr
-        if "adapter_wd" not in cfg:
-            cfg.adapter_wd = cfg.sigma_wd
 
-        # override from environment variables (manual override if needed)
-        if os.environ.get("ENERGY_SIGMA_EPOCHS", ""):
-            try:
-                cfg.sigma_epochs = int(os.environ["ENERGY_SIGMA_EPOCHS"])
-                logger.info(f"Manual override: sigma_epochs={cfg.sigma_epochs}")
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_LR", ""):
-            try:
-                cfg.sigma_lr = float(os.environ["ENERGY_SIGMA_LR"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_WD", ""):
-            try:
-                cfg.sigma_wd = float(os.environ["ENERGY_SIGMA_WD"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_LR_STEP_SIZE", ""):
-            try:
-                cfg.sigma_lr_step_size = int(
-                    os.environ["ENERGY_SIGMA_LR_STEP_SIZE"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_SIGMA_LR_GAMMA", ""):
-            try:
-                cfg.sigma_lr_gamma = float(os.environ["ENERGY_SIGMA_LR_GAMMA"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_BATCH_SIZE", ""):
-            try:
-                cfg.batch_size = int(os.environ["ENERGY_BATCH_SIZE"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_TRAIN_K", ""):
-            try:
-                cfg.train_k = int(os.environ["ENERGY_TRAIN_K"])
-            except Exception:
-                pass
-        if os.environ.get("ENERGY_ADAPTER", ""):
-            cfg.adapter = os.environ["ENERGY_ADAPTER"]
+        cfg.sigma_lr = float(cfg.sigma_lr)
+        cfg.sigma_wd = float(cfg.sigma_wd)
+        cfg.sigma_lr_gamma = float(cfg.sigma_lr_gamma)
+        cfg.sigma_lr_step_size = int(cfg.sigma_lr_step_size)
+        cfg.batch_size = int(cfg.batch_size)
+        cfg.train_k = int(cfg.train_k)
+        cfg.num_grad_accumulation = int(cfg.num_grad_accumulation)
+
         cfg.adapter = normalize_adapter_choice(cfg.adapter)
+        if cfg.adapter_lr is None:
+            cfg.adapter_lr = cfg.sigma_lr
+        if cfg.adapter_wd is None:
+            cfg.adapter_wd = cfg.sigma_wd
+        cfg.adapter_lr = float(cfg.adapter_lr)
+        cfg.adapter_wd = float(cfg.adapter_wd)
         cfg.adapter_display = cfg.adapter if cfg.adapter != "none" else "none"
-        cfg.adapter_lr = float(getattr(cfg, "adapter_lr", cfg.sigma_lr))
-        cfg.adapter_wd = float(getattr(cfg, "adapter_wd", cfg.sigma_wd))
 
-        env_config_tag = os.environ.get("ENERGY_CONFIG_TAG", "").strip()
-        if env_config_tag:
-            cfg.config_tag = env_config_tag
-        elif "config_tag" not in cfg or not cfg.config_tag:
+        if not cfg.config_tag:
             cfg.config_tag = build_energy_config_tag(cfg)
     
     # exclude held-out test dataset from basis building
@@ -629,7 +637,13 @@ def run_energy(cfg: DictConfig) -> None:
         if k is not None and k > 0:
             logger.info(f"Applying k-shot sampling: {k} samples per class")
             try:
-                selected_indices = sample_k_shot_indices(dataset_train, k, seed=0, verbose=True)
+                selected_indices = sample_k_shot_indices(
+                    dataset_train,
+                    k,
+                    seed=0,
+                    verbose=True,
+                    progress_desc=f"{val_dataset_name} {k}-shot",
+                )
                 
                 # Get base dataset
                 base_dataset = getattr(dataset_train, "train_dataset", None)
@@ -686,17 +700,36 @@ def run_energy(cfg: DictConfig) -> None:
             for name, tensor in model.image_encoder.state_dict().items()
         }
 
-        # Load validation dataset for per-epoch evaluation
+        # Load validation dataset for per-epoch evaluation with progress feedback
         logger.info(f"Loading validation dataset: {val_dataset_name}")
-        val_dataset = get_remote_sensing_dataset(
-            val_dataset_name,
-            image_encoder.val_preprocess,
-            location=cfg.data_location,
-            batch_size=cfg.batch_size,
-            num_workers=6,
-        )
-        val_loader = get_dataloader(
-            val_dataset, is_train=False, args=cfg, image_encoder=None)
+        val_dataset = None
+        val_loader = None
+        with tqdm(
+            total=2,
+            desc=f"Preparing validation dataloader ({val_dataset_name})",
+            leave=False,
+            bar_format=TQDM_BAR_FORMAT,
+        ) as val_progress:
+            val_dataset = get_remote_sensing_dataset(
+                val_dataset_name,
+                image_encoder.val_preprocess,
+                location=cfg.data_location,
+                batch_size=cfg.batch_size,
+                num_workers=6,
+            )
+            val_progress.update(1)
+            val_loader = get_dataloader(
+                val_dataset, is_train=False, args=cfg, image_encoder=None
+            )
+            dataset_size = None
+            if hasattr(val_loader, "dataset"):
+                try:
+                    dataset_size = len(val_loader.dataset)
+                except TypeError:
+                    dataset_size = None
+            if dataset_size is not None:
+                val_progress.set_postfix_str(f"samples={dataset_size}")
+            val_progress.update(1)
         
         # Prepare evaluation schedule and history tracking
         eval_epochs = compute_eval_epochs(int(cfg.sigma_epochs))
@@ -1014,10 +1047,7 @@ def run_energy(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-    )
+
     parser = argparse.ArgumentParser(add_help=False)
     from src.datasets.remote_sensing import REMOTE_SENSING_DATASETS
     allowed_test_datasets = sorted(list(REMOTE_SENSING_DATASETS.keys()))
@@ -1026,19 +1056,19 @@ if __name__ == "__main__":
         "--test_dataset",
         type=str,
         choices=allowed_test_datasets,
-        default='EuroSAT_RGB',
+        default=None,
         help="Held-out dataset to sigma-finetune on; one of %(choices)s. "
              "Sigma epochs will be automatically set based on dataset size.",
     )
     parser.add_argument("--config_file", type=str, default="config/config_remote_sensing.yaml")
     parser.add_argument("--sigma_epochs", type=int, default=None,
                         help="Manual override for sigma epochs (optional, auto-determined by default)")
-    parser.add_argument("--sigma_lr", type=float, default=1e-3)
-    parser.add_argument("--sigma_wd", type=float, default=0.0)
-    parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--sigma-lr-step-size", type=int, default=1)
-    parser.add_argument("--sigma-lr-gamma", type=float, default=1.0)
-    parser.add_argument("--k", type=int, default=0,
+    parser.add_argument("--sigma_lr", type=float, default=None)
+    parser.add_argument("--sigma_wd", type=float, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--sigma-lr-step-size", dest="sigma_lr_step_size", type=int, default=None)
+    parser.add_argument("--sigma-lr-gamma", dest="sigma_lr_gamma", type=float, default=None)
+    parser.add_argument("--k", type=int, default=None,
                         help="Number of samples per class for few-shot learning (0 or None = use all)")
     parser.add_argument("--config_tag", type=str, default=None,
                         help="Optional tag to group outputs for this configuration")
@@ -1057,39 +1087,27 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
 
-    if not args.test_dataset:
-        parser.error("--test_dataset must be specified")
-
     cfg = load_config(args.config_file)
 
-    if args.test_dataset:
-        cfg.test_dataset = args.test_dataset
-    if args.sigma_epochs is not None:
-        cfg.sigma_epochs = args.sigma_epochs
-    if args.sigma_lr is not None:
-        cfg.sigma_lr = args.sigma_lr
-    if args.sigma_wd is not None:
-        cfg.sigma_wd = args.sigma_wd
-    if args.batch_size is not None:
-        cfg.batch_size = args.batch_size
-    if getattr(args, "sigma_lr_step_size", None) is not None:
-        cfg.sigma_lr_step_size = args.sigma_lr_step_size
-    if getattr(args, "sigma_lr_gamma", None) is not None:
-        cfg.sigma_lr_gamma = args.sigma_lr_gamma
-    if getattr(args, "k", None) is not None:
-        cfg.train_k = args.k
-    if getattr(args, "initialize_sigma", None) is not None:
-        cfg.initialize_sigma = args.initialize_sigma
-    if getattr(args, "config_tag", None):
-        cfg.config_tag = args.config_tag
-    if getattr(args, "adapter", None) is not None:
-        cfg.adapter = args.adapter
-    if getattr(args, "adapter_lr", None) is not None:
-        cfg.adapter_lr = args.adapter_lr
-    if getattr(args, "adapter_wd", None) is not None:
-        cfg.adapter_wd = args.adapter_wd
-    if getattr(args, "adapter_grad_accum", None) is not None:
-        cfg.num_grad_accumulation = args.adapter_grad_accum
+    CLI_TO_CFG_KEYS = {
+        "k": "train_k",
+        "adapter_grad_accum": "num_grad_accumulation",
+    }
+    cli_overrides = {}
+    for key, value in vars(args).items():
+        if key == "config_file" or value is None:
+            continue
+        target_key = CLI_TO_CFG_KEYS.get(key, key)
+        cli_overrides[target_key] = value
+    if cli_overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.create(cli_overrides))
+
+    if not cfg.get("test_dataset"):
+        env_test = os.environ.get("ENERGY_TEST_DATASET", "").strip()
+        if env_test:
+            cfg = OmegaConf.merge(cfg, {"test_dataset": env_test})
+        else:
+            parser.error("test_dataset must be provided via config, CLI, or ENV")
 
     OmegaConf.set_struct(cfg, True)
     run_energy(cfg)

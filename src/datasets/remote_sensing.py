@@ -11,8 +11,11 @@ import io
 
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.datasets import ImageFolder
+from tqdm.auto import tqdm
+
+from src.utils.variables_and_paths import TQDM_BAR_FORMAT
 
 
 def clean_dataset_logs(log_filename, dataset_name):
@@ -42,7 +45,7 @@ def clean_dataset_logs(log_filename, dataset_name):
         print(f"Warning: Could not clean logs for {dataset_name}: {e}")
 
 
-def sample_k_shot_indices(dataset, k, seed=0, verbose=True):
+def sample_k_shot_indices(dataset, k, seed=0, verbose=True, progress_desc=None):
     """
     Unified k-shot sampling function for remote sensing datasets.
     
@@ -55,55 +58,104 @@ def sample_k_shot_indices(dataset, k, seed=0, verbose=True):
         k: Number of samples per class
         seed: Random seed for reproducibility (default: 0)
         verbose: Whether to print detailed information (default: True)
+        progress_desc: Optional description prefix for tqdm progress bars
     
     Returns:
         List of indices for the k-shot subset
     """
+    dataset_name = getattr(dataset, "dataset_name", None)
     # Get the base dataset
     if hasattr(dataset, 'train_dataset'):
         base_dataset = dataset.train_dataset
     else:
         base_dataset = dataset
-    
-    # Extract labels from dataset
-    if hasattr(base_dataset, 'targets'):
-        # torchvision.datasets.ImageFolder style
-        labels = np.array(base_dataset.targets)
-    elif hasattr(base_dataset, 'labels'):
-        # Custom dataset with labels attribute
-        labels = np.array(base_dataset.labels)
-    elif hasattr(base_dataset, 'data'):
+        dataset_name = dataset_name or getattr(base_dataset, "dataset_name", None)
+
+    progress_prefix = progress_desc or (dataset_name or "k-shot")
+
+    def _extract_targets(ds):
+        if hasattr(ds, 'targets') and ds.targets is not None:
+            return np.array(ds.targets)
+        if hasattr(ds, 'labels') and ds.labels is not None:
+            return np.array(ds.labels)
+        if hasattr(ds, 'y') and ds.y is not None:
+            return np.array(ds.y)
+        if hasattr(ds, 'samples') and ds.samples is not None:
+            try:
+                return np.array([item[1] for item in ds.samples])
+            except Exception:
+                return None
+        return None
+
+    def _resolve_subset_targets(subset_obj):
+        if not isinstance(subset_obj, Subset):
+            return None
+
+        def _get_indices(obj):
+            idx = getattr(obj, 'indices', None)
+            if idx is None:
+                idx = getattr(obj, '_indices', None)
+            return None if idx is None else np.asarray(idx, dtype=int)
+
+        indices = _get_indices(subset_obj)
+        if indices is None:
+            return None
+
+        parent = subset_obj.dataset
+        while isinstance(parent, Subset):
+            parent_indices = _get_indices(parent)
+            if parent_indices is None:
+                return None
+            indices = parent_indices[indices]
+            parent = parent.dataset
+
+        parent_labels = _extract_targets(parent)
+        if parent_labels is None:
+            return None
+        parent_labels = np.asarray(parent_labels)
+        try:
+            return parent_labels[indices]
+        except Exception:
+            parent_list = parent_labels.tolist()
+            return np.array([parent_list[i] for i in indices])
+
+    labels = _extract_targets(base_dataset)
+
+    if labels is None and isinstance(base_dataset, Subset):
+        labels = _resolve_subset_targets(base_dataset)
+
+    if labels is None and hasattr(base_dataset, 'data'):
         # Some datasets store (data, labels) tuples
         try:
             labels = np.array([item[1] for item in base_dataset.data])
-        except:
-            # Fallback: iterate through dataset
-            labels = []
-            for i in range(len(base_dataset)):
-                try:
-                    _, label = base_dataset[i]
-                    if isinstance(label, torch.Tensor):
-                        label = label.item()
-                    labels.append(label)
-                except:
-                    pass
-            labels = np.array(labels)
-    else:
+        except Exception:
+            labels = None
+
+    if labels is None:
         # Fallback: iterate through dataset
         if verbose:
             print("Extracting labels from dataset by iteration...")
-        labels = []
-        for i in range(len(base_dataset)):
+        labels_list = []
+        iterator = range(len(base_dataset))
+        if verbose:
+            iterator = tqdm(
+                iterator,
+                desc=f"{progress_prefix}: label extraction",
+                total=len(base_dataset),
+                leave=False,
+                bar_format=TQDM_BAR_FORMAT,
+            )
+        for i in iterator:
             try:
                 _, label = base_dataset[i]
                 if isinstance(label, torch.Tensor):
                     label = label.item()
-                labels.append(label)
+                labels_list.append(label)
             except Exception as e:
                 if verbose:
                     print(f"Warning: Failed to get label for index {i}: {e}")
                 continue
-        labels = np.array(labels)
+        labels = np.array(labels_list)
     
     if len(labels) == 0:
         raise ValueError("Could not extract labels from dataset")
@@ -121,7 +173,17 @@ def sample_k_shot_indices(dataset, k, seed=0, verbose=True):
     selected_indices = []
     class_sample_counts = {}
     
-    for cls in unique_classes:
+    class_iterator = unique_classes
+    if verbose:
+        class_iterator = tqdm(
+            unique_classes,
+            desc=f"{progress_prefix}: sampling classes",
+            total=num_classes,
+            leave=False,
+            bar_format=TQDM_BAR_FORMAT,
+        )
+
+    for cls in class_iterator:
         cls_indices = np.where(labels == cls)[0]
         
         if len(cls_indices) < k:
@@ -229,8 +291,6 @@ def get_remote_sensing_classification_head(args, dataset_name, dataset_obj):
     from src.models.modeling import ClassificationHead
     from src.datasets.remote_sensing_templates import get_remote_sensing_template
     import open_clip
-    from tqdm import tqdm
-    from src.utils.variables_and_paths import TQDM_BAR_FORMAT
     
     # Ensure 'Val' suffix
     if not dataset_name.endswith("Val"):
