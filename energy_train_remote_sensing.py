@@ -8,6 +8,7 @@ import argparse
 import sys
 import torchvision
 from tqdm.auto import tqdm
+import pdb
 
 from src.eval.aggregation import create_task_vector
 from src.utils.variables_and_paths import (
@@ -70,11 +71,10 @@ def _sanitize_value(val):
 
 def build_energy_config_tag(cfg) -> str:
     num_tasks_minus_one = _sanitize_value(max(int(getattr(cfg, "num_tasks", 0)) - 1, 0))
-    k_part = _sanitize_value(getattr(cfg, "train_k", 0))
     lr_part = _sanitize_value(cfg.sigma_lr)
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
-    return f"energy_{num_tasks_minus_one}_{k_part}_{lr_part}_{svd_part}_{init_mode_part}"
+    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}"
 
 
 def normalize_adapter_choice(value: str) -> str:
@@ -118,7 +118,7 @@ from src.eval.eval_remote_sensing_comparison import (
 SIGMA_EPOCHS_PER_DATASET = {
     "AID": 10,              # ~10,000 train samples, 600x600
     "CLRS": 10,             # ~30,000 train samples, 256x256
-    "EuroSAT_RGB": 12,      # ~21,600 train samples, 64x64
+    "EuroSAT_RGB": 15,      # ~21,600 train samples, 64x64
     "MLRSNet": 15,          # ~17,000 train samples, 256x256
     "NWPU-RESISC45": 15,    # ~25,200 train samples, 256x256
     "Optimal-31": 50,       # ~6,200 train samples, 256x256
@@ -132,23 +132,6 @@ SIGMA_EPOCHS_PER_DATASET = {
     "UC_Merced": 100,       # ~2,100 train samples, 256x256
     "WHU-RS19": 150,        # ~1,000 train samples, 600x600
 }
-# SIGMA_EPOCHS_PER_DATASET = {
-#     "AID": 5,              # ~10,000 train samples, 600x600
-#     "CLRS": 5,             # ~30,000 train samples, 256x256
-#     "EuroSAT_RGB": 5,      # ~21,600 train samples, 64x64
-#     "MLRSNet": 5,          # ~17,000 train samples, 256x256
-#     "NWPU-RESISC45": 5,    # ~25,200 train samples, 256x256
-#     "Optimal-31": 5,       # ~6,200 train samples, 256x256
-#     "PatternNet": 5,       # ~10,000 train samples, 256x256
-#     "RS_C11": 5,           # ~5,000 train samples, 512x512
-#     "RSD46-WHU": 5,        # ~10,000 train samples, 256x256
-#     "RSI-CB128": 5,        # ~18,000 train samples, 128x128
-#     "RSSCN7": 5,           # ~2,800 train samples, 400x400
-#     "SAT-4": 5,             # ~60,000 train samples, 28x28
-#     "SIRI-WHU": 5,        # ~2,400 train samples, 200x200
-#     "UC_Merced": 5,       # ~2,100 train samples, 256x256
-#     "WHU-RS19": 5,        # ~1,000 train samples, 600x600
-# }
 
 ENERGY_ENV_OVERRIDE_MAP = {
     "ENERGY_TEST_DATASET": ("test_dataset", str),
@@ -203,8 +186,6 @@ def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
     device = config.device
     datasets = list(config.DATASETS)
     num_tasks = int(len(datasets))
-    print(f"DATSETS: {datasets}")
-    print("Computing SVD...")
     desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
     with torch.no_grad():
         new_vector = {}
@@ -302,9 +283,9 @@ def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
                 # (num_tasks, chunks)
                 stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
                 # (chunks,)
-                mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
+                mean_sigma_diag = torch.sum(stacked_sigmas, dim=0)
                 # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
-                Sigma = torch.diag(mean_sigma_diag)  # (chunks, chunks)
+                Sigma = torch.diag(mean_sigma_diag)   # (chunks, chunks)
             # -------- [수정된 Sigma 계산 로직 끝] --------
             # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
             new_vector[key] = [U_orth, Sigma, V_orth]
@@ -319,8 +300,6 @@ def compute_and_sum_svd_mem_reduction_tsvm(task_vectors, config):
     device = config.device
     datasets = list(config.DATASETS)
     num_tasks = int(len(datasets))
-    print(f"DATSETS: {datasets}")
-    print("Computing SVD...")
     desired_k = max(1, int(getattr(config, "svd_keep_topk", 2)))
     with torch.no_grad():
         new_vector = {}
@@ -394,6 +373,7 @@ def compute_and_sum_svd_mem_reduction_tsvm(task_vectors, config):
             # sigma는 대각으로 유지(여기서는 단순 concat된 sum_s)
             Sigma = torch.diag(sum_s)
             # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
+
             new_vector[key] = [U_orth, Sigma, V_orth]
     return new_vector
 
@@ -789,6 +769,7 @@ def run_energy(cfg: DictConfig) -> None:
             epoch=-1,
             save_path=os.path.join(visualization_dir, "sigma_epoch_-1.png"),
             title=f"{test_ds} ({shot_folder})",
+            json_path=os.path.join(visualization_dir, "sigma_epoch_-1.json"),
         )
         if records:
             sigma_records.extend(records)
@@ -890,6 +871,7 @@ def run_energy(cfg: DictConfig) -> None:
                     epoch=epoch,
                     save_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.png"),
                     title=f"{test_ds} ({shot_folder})",
+                    json_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.json"),
                 )
                 if records:
                     sigma_records.extend(records)
@@ -943,58 +925,10 @@ def run_energy(cfg: DictConfig) -> None:
             epoch="final",
             save_path=os.path.join(visualization_dir, "sigma_epoch_final.png"),
             title=f"{test_ds} ({shot_folder})",
+            json_path=os.path.join(visualization_dir, "sigma_epoch_final.json"),
         )
         if records:
             sigma_records.extend(records)
-
-        # sigma 변화 선 그래프 저장 (Early/Middle/Late 한 장)
-        if sigma_records:
-            from collections import defaultdict
-            import numpy as np
-            import matplotlib.pyplot as plt
-
-            def epoch_order(val):
-                if isinstance(val, int):
-                    return val
-                if isinstance(val, str):
-                    if val == "final":
-                        return 10**6
-                    try:
-                        return int(val)
-                    except Exception:
-                        return -10**6
-                return 0
-
-            series_by_label = defaultdict(list)
-            for rec in sigma_records:
-                epoch_val = rec.get("epoch")
-                epoch_label = "final" if epoch_val == "final" else f"epoch {epoch_val}"
-                series_by_label[rec["label"]].append(
-                    (epoch_order(epoch_val), epoch_label, rec["sigma_values"])
-                )
-
-            ordered_labels = [lbl for lbl in ["Early", "Middle", "Late"] if lbl in series_by_label]
-            if not ordered_labels:
-                ordered_labels = sorted(series_by_label.keys())
-            if ordered_labels:
-                fig, axes = plt.subplots(1, len(ordered_labels), figsize=(6 * len(ordered_labels), 4))
-                if len(ordered_labels) == 1:
-                    axes = [axes]
-                for ax, lbl in zip(axes, ordered_labels):
-                    curves = sorted(series_by_label[lbl], key=lambda x: x[0])
-                    if not curves:
-                        continue
-                    x = np.arange(len(curves[0][2]))
-                    for _, epoch_label, sigma_vals in curves:
-                        ax.plot(x, sigma_vals, label=epoch_label)
-                    ax.set_xlabel("Diagonal Index", fontsize=12)
-                    ax.set_ylabel("Sigma Value", fontsize=12)
-                    ax.set_title(f"{lbl} Layer", fontsize=14, fontweight="bold")
-                    ax.legend(fontsize=10)
-                plt.tight_layout()
-                overview_path = os.path.join(visualization_dir, "sigma_line_overview.png")
-                plt.savefig(overview_path, dpi=300, bbox_inches="tight", facecolor="white")
-                plt.close()
 
         # Optional adapter fine-tuning (TIP / LP++) after sigma training
         adapter_summary = None
@@ -1061,6 +995,8 @@ if __name__ == "__main__":
              "Sigma epochs will be automatically set based on dataset size.",
     )
     parser.add_argument("--config_file", type=str, default="config/config_remote_sensing.yaml")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Override vision backbone type (defaults to config file value)")
     parser.add_argument("--sigma_epochs", type=int, default=None,
                         help="Manual override for sigma epochs (optional, auto-determined by default)")
     parser.add_argument("--sigma_lr", type=float, default=None)
@@ -1084,6 +1020,8 @@ if __name__ == "__main__":
                         help="Weight decay for adapter training (defaults to sigma_wd)")
     parser.add_argument("--adapter_grad_accum", type=int, default=None,
                         help="Gradient accumulation steps for adapter training (default: 1)")
+    parser.add_argument("--svd_keep_topk", type=int, default=None,
+                        help="Number of singular vectors to keep per task when building the basis")
     args = parser.parse_args()
 
 

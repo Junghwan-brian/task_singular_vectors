@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 import torch
+import math
+import numpy as np
 from torchvision import transforms
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -267,127 +269,207 @@ def test_all_datasets(location="./datasets"):
     return results
 
 
+
+def _extract_image_and_label(sample):
+    if isinstance(sample, dict):
+        img = sample.get("images") or sample.get("image")
+        label = sample.get("labels") or sample.get("label")
+        return img, label
+    if isinstance(sample, (list, tuple)) and len(sample) >= 2:
+        return sample[0], sample[1]
+    raise ValueError(f"Unsupported sample format: {type(sample)}")
+
+
+def _tensor_to_uint8_image(img):
+    if torch.is_tensor(img):
+        img_np = img.detach().cpu()
+        if img_np.ndim == 3 and img_np.shape[0] in {1, 3}:
+            img_np = img_np.permute(1, 2, 0)
+        img_np = img_np.numpy()
+    elif isinstance(img, Image.Image):
+        img_np = np.array(img)
+    elif isinstance(img, np.ndarray):
+        img_np = img
+    else:
+        return None
+    if img_np.dtype != np.uint8:
+        img_np = np.clip(img_np, 0.0, 1.0)
+        img_np = (img_np * 255).astype(np.uint8)
+    return img_np
+
+
+def _visualize_single_label_dataset(dataset_name, rs_dataset):
+    splits = []
+    for split_name in ["train_dataset", "test_dataset", "val_dataset"]:
+        split = getattr(rs_dataset, split_name, None)
+        if split is not None:
+            splits.append((split_name.replace("_dataset", ""), split))
+    if not splits:
+        splits.append(("dataset", rs_dataset))
+
+    class_to_image = {}
+    num_classes = len(rs_dataset.classnames)
+    print(f"Collecting one sample per class for {dataset_name} ({num_classes} classes)...")
+
+    for split_name, split in splits:
+        print(f"  Traversing {split_name} split (size={len(split)})")
+        for idx in range(len(split)):
+            try:
+                sample = split[idx]
+                img, label = _extract_image_and_label(sample)
+            except Exception:
+                continue
+
+            if img is None or label is None:
+                continue
+
+            if torch.is_tensor(label):
+                if label.ndim != 0:
+                    continue
+                label_idx = int(label.item())
+            elif isinstance(label, (int, np.integer)):
+                label_idx = int(label)
+            else:
+                continue
+
+            if label_idx not in class_to_image:
+                img_np = _tensor_to_uint8_image(img)
+                if img_np is not None:
+                    class_to_image[label_idx] = img_np
+
+            if len(class_to_image) == num_classes:
+                break
+        if len(class_to_image) == num_classes:
+            break
+
+    output_dir = Path("./test_outputs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"{dataset_name}_all_classes.png"
+
+    cols = min(6, max(3, int(math.ceil(math.sqrt(num_classes)))))
+    rows = math.ceil(num_classes / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.5, rows * 2.5))
+    axes = np.array(axes).reshape(rows, cols)
+    flat_axes = axes.flatten()
+
+    for class_idx in range(num_classes):
+        ax = flat_axes[class_idx]
+        img_np = class_to_image.get(class_idx)
+        if img_np is None:
+            ax.axis("off")
+            continue
+        ax.imshow(img_np)
+        title = f"[{class_idx}] {rs_dataset.classnames[class_idx]}"
+        ax.set_title(title, fontsize=8, fontweight="bold", pad=6)
+        ax.axis("off")
+
+    for pad_idx in range(num_classes, len(flat_axes)):
+        flat_axes[pad_idx].axis("off")
+
+    missing = sorted(set(range(num_classes)) - set(class_to_image.keys()))
+    if missing:
+        missing_names = [rs_dataset.classnames[i] for i in missing]
+        print(f"⚠️  Missing samples for classes: {missing_names}")
+    print(f"Collected samples for {len(class_to_image)}/{num_classes} classes")
+
+    fig.suptitle(f"{dataset_name} [SINGLE-LABEL] - One Sample per Class", fontsize=16, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"✓ Saved visualization to {output_file}")
+
+
 def visualize_samples(dataset_name, location="./datasets", num_samples=9):
     """Visualize sample images from a dataset"""
     is_multilabel = dataset_name in MULTILABEL_DATASETS
     label_type = "MULTI-LABEL" if is_multilabel else "SINGLE-LABEL"
-    
-    print(f"\n{'='*100}")
+
+    print("\n" + "=" * 100)
     print(f"Visualizing samples from {dataset_name} [{label_type}]")
-    print(f"{'='*100}\n")
-    
+    print("=" * 100 + "\n")
+
     try:
-        # Load without normalization for visualization
         preprocess = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
         ])
-        
+
         dataset = get_remote_sensing_dataset(
             dataset_name,
             preprocess=preprocess,
             location=location,
             batch_size=num_samples,
             num_workers=0,
-            is_multilabel=is_multilabel,  # Pass multi-label flag
+            is_multilabel=is_multilabel,
         )
-        
+
         print(f"Dataset loaded with {len(dataset.classnames)} classes")
         print(f"Class names preview: {dataset.classnames[:5]}...")
         print(f"Label type: {label_type}")
-        
-        # Check if class names are meaningful
+
         numeric_names = sum(1 for name in dataset.classnames if name.isdigit())
         if numeric_names > len(dataset.classnames) * 0.5:
-            print(f"⚠️  WARNING: Most class names are numeric. This might be an issue!")
+            print("⚠️  WARNING: Most class names are numeric. This might be an issue!")
         else:
-            print(f"✓ Class names are meaningful")
-        
-        # Get a batch
+            print("✓ Class names are meaningful")
+
+        if not is_multilabel:
+            _visualize_single_label_dataset(dataset_name, dataset)
+            return
+
         batch = next(iter(dataset.train_loader))
-        if isinstance(batch, dict):
-            images = batch["images"]
-            labels = batch["labels"]
-        else:
-            images, labels = batch
-        
+        images, labels = _extract_image_and_label(batch)
+        if images is None or labels is None:
+            raise ValueError("Could not obtain batch for visualization")
+
         print(f"Label shape: {labels.shape}")
-        if is_multilabel and len(labels.shape) != 2:
+        if len(labels.shape) != 2:
             print(f"⚠️  WARNING: Expected 2D labels for multi-label, got {len(labels.shape)}D")
-        
-        # Plot
+
         fig, axes = plt.subplots(3, 3, figsize=(15, 15))
         subtitle = f"{dataset_name} [{label_type}] - Sample Images"
         fig.suptitle(subtitle, fontsize=16, fontweight='bold')
-        
+
         for idx in range(min(num_samples, len(images))):
             ax = axes[idx // 3, idx % 3]
-            
-            # Convert tensor to image
-            img = images[idx].permute(1, 2, 0).cpu().numpy()
-            img = (img * 255).astype('uint8')
-            
-            ax.imshow(img)
-            
-            # Generate title based on label type
-            if is_multilabel and len(labels.shape) == 2:
-                # Multi-label: show all active classes
-                active_classes = torch.where(labels[idx] > 0.5)[0].tolist()
-                if len(active_classes) == 0:
-                    title = "No labels"
-                elif len(active_classes) <= 3:
-                    class_names = [dataset.classnames[i] for i in active_classes]
-                    title = "\n".join(class_names)
-                else:
-                    # Too many classes, show count
-                    class_names = [dataset.classnames[i] for i in active_classes[:2]]
-                    title = f"{class_names[0]}\n{class_names[1]}\n+{len(active_classes)-2} more"
+            img_np = _tensor_to_uint8_image(images[idx])
+            if img_np is None:
+                ax.axis('off')
+                continue
+            ax.imshow(img_np)
+
+            active_classes = torch.where(labels[idx] > 0.5)[0].tolist()
+            if len(active_classes) == 0:
+                title = "No labels"
+            elif len(active_classes) <= 3:
+                class_names = [dataset.classnames[i] for i in active_classes]
+                title = "\n".join(class_names)
             else:
-                # Single-label: show one class
-                if len(labels.shape) == 1:
-                    label_idx = labels[idx].item()
-                    class_name = dataset.classnames[label_idx]
-                    title = f"[{label_idx}] {class_name}"
-                else:
-                    title = "Unknown format"
-            
+                class_names = [dataset.classnames[i] for i in active_classes[:2]]
+                title = f"{class_names[0]}\n{class_names[1]}\n+{len(active_classes)-2} more"
+
             ax.set_title(title, fontsize=10, fontweight='bold', pad=10)
             ax.axis('off')
-            
-            # Add a border to make it clearer
             for spine in ax.spines.values():
                 spine.set_edgecolor('gray')
                 spine.set_linewidth(2)
-        
+
         plt.tight_layout()
-        
-        # Save figure
         output_dir = Path("./test_outputs")
         output_dir.mkdir(exist_ok=True)
         output_file = output_dir / f"{dataset_name}_samples.png"
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         print(f"\n✓ Saved visualization to {output_file}")
-        
-        # Print the classes shown
+
         print(f"\nClasses shown in visualization:")
         for idx in range(min(num_samples, len(images))):
-            if is_multilabel and len(labels.shape) == 2:
-                # Multi-label
-                active_classes = torch.where(labels[idx] > 0.5)[0].tolist()
-                class_names = [dataset.classnames[i] for i in active_classes]
-                indices_str = ", ".join([str(i) for i in active_classes])
-                print(f"  Sample {idx}: [{indices_str}] {class_names}")
-            else:
-                # Single-label
-                if len(labels.shape) == 1:
-                    label_idx = labels[idx].item()
-                    class_name = dataset.classnames[label_idx]
-                    print(f"  Sample {idx}: [{label_idx:2d}] {class_name}")
-                else:
-                    print(f"  Sample {idx}: {labels[idx]}")
-        
+            active_classes = torch.where(labels[idx] > 0.5)[0].tolist()
+            class_names = [dataset.classnames[i] for i in active_classes]
+            indices_str = ", ".join([str(i) for i in active_classes])
+            print(f"  Sample {idx}: [{indices_str}] {class_names}")
+
         plt.close()
-        
+
     except Exception as e:
         print(f"❌ Visualization failed: {str(e)}")
         import traceback
@@ -482,4 +564,3 @@ if __name__ == "__main__":
         
         # Exit with error if any tests failed
         sys.exit(0 if all(results.values()) else 1)
-

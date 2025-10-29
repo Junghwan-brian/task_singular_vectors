@@ -35,20 +35,38 @@ import threading
 import time
 from typing import Iterable, List, Sequence
 
-from src.datasets.remote_sensing import REMOTE_SENSING_DATASETS
 
-GPU_IDS = list(range(8))  # Adjust if you have a different number of GPUs
+REMOTE_SENSING_DATASETS = {
+    "AID": 10,
+    "CLRS": 10,
+    "EuroSAT_RGB": 12,
+    "MLRSNet": 15,
+    "NWPU-RESISC45": 15,
+    "Optimal-31": 50,
+    "PatternNet": 20,
+    "RS_C11": 60,
+    "RSD46-WHU": 20,
+    "RSI-CB128": 15,
+    "RSSCN7": 80,
+    "SAT-4": 5,
+    "SIRI-WHU": 100,
+    "UC_Merced": 100,
+    "WHU-RS19": 150,
+}
 
-ENERGY_MODELS = ["ViT-B-16", "ViT-B-32", "ViT-L-16"]
+
+GPU_IDS = list(range(4))  # Default GPU IDs, can be overridden via CLI
+
+ENERGY_MODELS = ["ViT-B-32"]
 ENERGY_INITIALIZE_SIGMA = ["tsvm", "average"]
-ENERGY_ADAPTERS = ["none", "tip", "lp++"]
-ENERGY_K = [0, 1, 2, 4, 8, 16]
-ENERGY_SVD_KEEP_TOPK = [3, 4, 5, 6]
-ENERGY_SIGMA_LR = [1e-2, 1e-3, 1e-4, 1e-1]
+ENERGY_ADAPTERS = ["none", "lp++", "tip"]
+ENERGY_K = [16]
+ENERGY_SVD_KEEP_TOPK = [5]
+ENERGY_SIGMA_LR = [1e-3]
 
-ATLAS_MODELS = ["ViT-B-16", "ViT-B-32", "ViT-L-16"]
-ATLAS_ADAPTERS = ["none", "tip", "lp++"]
-ATLAS_K = [0, 1, 2, 4, 8, 16]
+ATLAS_MODELS = ["ViT-B-32"]
+ATLAS_ADAPTERS = ["none", "lp++", "tip"]
+ATLAS_K = [16]
 
 
 def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
@@ -108,6 +126,7 @@ def build_atlas_commands(datasets: Sequence[str]) -> List[List[str]]:
 def run_commands_in_parallel(
     commands: Sequence[Sequence[str]],
     gpu_ids: Sequence[int],
+    per_gpu: int = 1,
     dry_run: bool = False,
 ) -> None:
     if dry_run:
@@ -119,7 +138,7 @@ def run_commands_in_parallel(
     command_iter = iter(commands)
     failures: List[Sequence[str]] = []
 
-    def worker(gpu_id: int) -> None:
+    def worker(gpu_id: int, slot: int) -> None:
         nonlocal command_iter
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -130,7 +149,7 @@ def run_commands_in_parallel(
                 except StopIteration:
                     return
                 display = " ".join(cmd)
-                print(f"[GPU {gpu_id}] starting: {display}", flush=True)
+                print(f"[GPU {gpu_id} slot {slot}] starting: {display}", flush=True)
 
             start = time.time()
             proc = subprocess.Popen(cmd, env=env)
@@ -139,7 +158,7 @@ def run_commands_in_parallel(
 
             status = "OK" if ret == 0 else f"FAIL ({ret})"
             print(
-                f"[GPU {gpu_id}] finished ({status}) in {elapsed / 60:.2f} min: {' '.join(cmd)}",
+                f"[GPU {gpu_id} slot {slot}] finished ({status}) in {elapsed / 60:.2f} min: {' '.join(cmd)}",
                 flush=True,
             )
 
@@ -147,9 +166,14 @@ def run_commands_in_parallel(
                 with queue_lock:
                     failures.append(cmd)
 
-    threads = [
-        threading.Thread(target=worker, args=(gpu,), daemon=True) for gpu in gpu_ids
-    ]
+    per_gpu = max(1, int(per_gpu))
+    threads = []
+    for gpu in gpu_ids:
+        for slot in range(per_gpu):
+            thread = threading.Thread(target=worker, args=(gpu, slot), daemon=True)
+            threads.append(thread)
+    if not threads:
+        raise ValueError("No GPU workers configured. Check --gpu-ids and --per-gpu arguments.")
     for t in threads:
         t.start()
     for t in threads:
@@ -181,6 +205,18 @@ def main() -> None:
         action="store_true",
         help="Shuffle command order before scheduling",
     )
+    parser.add_argument(
+        "--gpu-ids",
+        type=str,
+        default=None,
+        help="Comma-separated list of GPU IDs to use (default: current GPU_IDS setting)",
+    )
+    parser.add_argument(
+        "--per-gpu",
+        type=int,
+        default=4,
+        help="Number of commands to run concurrently on each GPU",
+    )
     args = parser.parse_args()
 
     datasets = sorted(REMOTE_SENSING_DATASETS.keys())
@@ -201,9 +237,24 @@ def main() -> None:
     if args.limit is not None:
         commands = commands[: args.limit]
 
-    print(f"Prepared {len(commands)} commands across {len(GPU_IDS)} GPUs.")
+    gpu_ids = GPU_IDS
+    if args.gpu_ids is not None:
+        try:
+            gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",") if x.strip() != ""]
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --gpu-ids value: {args.gpu_ids}") from exc
+        if not gpu_ids:
+            raise SystemExit("--gpu-ids produced an empty list")
 
-    run_commands_in_parallel(commands, GPU_IDS, dry_run=args.dry_run)
+    commands_per_gpu = max(1, args.per_gpu)
+
+    total_workers = len(gpu_ids) * commands_per_gpu
+    print(
+        f"Prepared {len(commands)} commands across {len(gpu_ids)} GPUs with {commands_per_gpu} slots each "
+        f"({total_workers} total workers)."
+    )
+
+    run_commands_in_parallel(commands, gpu_ids, per_gpu=commands_per_gpu, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

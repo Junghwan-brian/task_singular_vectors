@@ -15,6 +15,7 @@ import torch
 import torchvision
 import logging
 import subprocess
+from typing import Optional
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
@@ -55,11 +56,19 @@ def _sanitize_value(val):
     return ''.join(ch if ch.isalnum() or ch in ['-', '_'] else '_' for ch in str(val).replace('.', 'p'))
 
 
+def _adapter_path_tag(value: Optional[str]) -> str:
+    value = (value or "none").strip().lower()
+    if value in {"", "none"}:
+        return "none"
+    if value == "lp++":
+        return "lp++"
+    return value.replace(" ", "_")
+
+
 def build_atlas_config_tag(num_basis: int, args) -> str:
     count_part = _sanitize_value(max(num_basis, 0))
-    k_part = _sanitize_value(getattr(args, 'k', 'na'))
     lr_part = _sanitize_value(getattr(args, 'lr', 'na'))
-    return f"atlas_{count_part}_{k_part}_{lr_part}"
+    return f"atlas_{count_part}_{lr_part}"
 
 # Dataset-specific epochs for Atlas training (matching fine-tuning epochs)
 ATLAS_EPOCHS_PER_DATASET = {
@@ -80,24 +89,6 @@ ATLAS_EPOCHS_PER_DATASET = {
     "UC_Merced": 100,       # ~2,100 train samples, 256x256
     "WHU-RS19": 150,        # ~1,000 train samples, 600x600
 }
-# ATLAS_EPOCHS_PER_DATASET = {
-#     "AID": 5,              # ~10,000 train samples, 600x600
-#     "CLRS": 5,             # ~30,000 train samples, 256x256
-#     "EuroSAT_RGB": 5,      # ~21,600 train samples, 64x64
-#     "MLRSNet": 5,          # ~17,000 train samples, 256x256
-#     "NWPU-RESISC45": 5,    # ~25,200 train samples, 256x256
-#     "Optimal-31": 5,       # ~6,200 train samples, 256x256
-#     "PatternNet": 5,       # ~10,000 train samples, 256x256
-#     "RS_C11": 5,           # ~5,000 train samples, 512x512
-#     "RSD46-WHU": 5,        # ~10,000 train samples, 256x256
-#     "RSI-CB128": 5,        # ~18,000 train samples, 128x128
-#     "RSSCN7": 5,           # ~2,800 train samples, 400x400
-#     "SAT-4": 5,             # ~60,000 train samples, 28x28
-#     "SIRI-WHU": 5,        # ~2,400 train samples, 200x200
-#     "UC_Merced": 5,       # ~2,100 train samples, 256x256
-#     "WHU-RS19": 5,        # ~1,000 train samples, 600x600
-# }
-
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
     total_epochs = max(int(total_epochs), 1)
@@ -230,17 +221,15 @@ def train_adapter_remote(
     shots_value = None
     if internal_choice == "lpp":
         shots = getattr(args, "k", None)
-        if shots is None or shots <= 0:
-            shots = 100
         shots_value = int(shots)
         logger.info(f"[adapter:lp++] Initializing LP++ with shots={shots_value}")
         adapter_model = LPPWrapper(model, features_cache, labels_cache, shots_value)
         adapter_lr = float(getattr(adapter_model, "lr_temp", args.lr))
-        adapter_epochs = 300
+        adapter_epochs = 30
     else:
         adapter_model = TIPWrapper(model, features_cache, labels_cache)
         adapter_lr = 1e-3
-        adapter_epochs = 10
+        adapter_epochs = 30
 
     adapter_model = adapter_model.to(device)
 
@@ -248,6 +237,10 @@ def train_adapter_remote(
     if not params:
         logger.warning("[adapter] No trainable parameters found; skipping adapter training.")
         return None
+
+    trainable_param_count = sum(p.numel() for p in params)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
 
     num_batches = len(adapter_train_loader)
     if num_batches == 0:
@@ -259,7 +252,7 @@ def train_adapter_remote(
     optimizer = torch.optim.AdamW(params, lr=adapter_lr, weight_decay=args.wd)
     scheduler = cosine_lr(optimizer, adapter_lr, 0, total_scheduler_steps)
     loss_fn = torch.nn.CrossEntropyLoss()
-
+                                                                                                                            
     eval_epochs = compute_eval_epochs(adapter_epochs)
     loss_history = []
     val_history = []
@@ -337,6 +330,13 @@ def train_adapter_remote(
         f"[adapter:{display_choice}] Final accuracy {final_acc * 100:.2f}% (best {best_acc * 100:.2f}%)"
     )
 
+    gpu_peak_mem_mb = None
+    if torch.cuda.is_available():
+        try:
+            gpu_peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        except Exception:
+            gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
     summary = {
         "adapter_type": display_choice,
         "adapter_internal_type": internal_choice,
@@ -349,6 +349,8 @@ def train_adapter_remote(
         "epoch_loss_history": epoch_loss_history,
         "validation_history": val_history,
         "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
+        "trainable_params": int(trainable_param_count),
+        "gpu_peak_mem_mb": gpu_peak_mem_mb,
     }
     if shots_value is not None:
         summary["shots"] = shots_value
@@ -562,23 +564,43 @@ def train_single_task(args, comp_acc=None, logger=None):
     # Few-shot sampling using unified k-shot function
     k = getattr(args, 'k', 0)
     logger.info("Using full training dataset (no k-shot sampling)" if k <= 0 else f"Applying k-shot sampling: {k} samples per class")
+    train_loader = get_dataloader(
+        train_dataset, is_train=True, args=args, image_encoder=None
+    )
+
     if k > 0:
-        selected_indices = sample_k_shot_indices(
-            train_dataset,
-            k,
-            seed=0,
-            verbose=True,
-            progress_desc=f"{target_dataset} {k}-shot",
-        )
-        base_dataset = getattr(train_dataset, "train_dataset", train_dataset)
-        train_loader = torch.utils.data.DataLoader(
-            torch.utils.data.Subset(base_dataset, selected_indices),
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=8,
-        )
-    else:
-        train_loader = train_dataset.train_loader
+        logger.info(f"Applying k-shot sampling: {k} samples per class")
+        try:
+            selected_indices = sample_k_shot_indices(
+                train_dataset,
+                k,
+                seed=0,
+                verbose=True,
+                progress_desc=f"{target_dataset} {k}-shot",
+            )
+            base_dataset = getattr(train_dataset, "train_dataset", None)
+            if base_dataset is None:
+                base_dataset = getattr(train_loader, "dataset", None)
+            if base_dataset is not None:
+                num_workers = getattr(train_loader, "num_workers", 8)
+                collate_fn = getattr(train_loader, "collate_fn", None)
+                train_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.Subset(base_dataset, selected_indices),
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    collate_fn=collate_fn,
+                )
+                logger.info(
+                    f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples"
+                )
+            else:
+                logger.warning(
+                    "Could not locate base train_dataset for k-shot subsetting; using full loader instead."
+                )
+        except Exception as e:
+            logger.error(f"Failed to apply k-shot sampling: {e}")
+            logger.warning("Falling back to full training set")
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("=" * 80)
@@ -752,23 +774,16 @@ def train_single_task(args, comp_acc=None, logger=None):
     torch.save(best_coef, atlas_path)
     logger.info(f"✓ Saved learned atlas coefficients to {atlas_path}")
 
+    adapter_result_tag = "none"
+    adapter_choice_value = "none"
     adapter_summary = train_adapter_remote(model, train_loader, val_loader, args, logger, save_dir)
     if adapter_summary:
-        adapter_results_path = os.path.join(
-            save_dir,
-            f"atlas_adapter_{adapter_summary['adapter_type']}.json",
-        )
-        adapter_summary_with_path = dict(adapter_summary)
-        adapter_summary_with_path["results_path"] = adapter_results_path
-        with open(adapter_results_path, "w") as f:
-            json.dump(adapter_summary_with_path, f, indent=4)
-        adapter_summary = adapter_summary_with_path
-        comp_acc[f"{target_dataset_clean}_{adapter_summary['adapter_type']}"] = adapter_summary["final_accuracy"]
-        logger.info(
-            f"[adapter:{adapter_summary['adapter_type']}] Saved adapter results to {adapter_results_path}"
-        )
+        adapter_type = adapter_summary.get("adapter_type", "none")
+        adapter_result_tag = _adapter_path_tag(adapter_type)
+    else:
+        adapter_summary = None
 
-    log_path = os.path.join(save_dir, "atlas_results.json")
+    log_path = os.path.join(save_dir, f"atlas_results_{adapter_result_tag}.json")
     gpu_peak_mem_mb = None
     if torch.cuda.is_available():
         gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
@@ -790,9 +805,7 @@ def train_single_task(args, comp_acc=None, logger=None):
         "pretrained_accuracy": float(pretrained_acc),
         "zeroshot_accuracy": float(pretrained_acc),
         "config_tag": config_tag,
-        "adapter_choice": ("none" if not getattr(args, "adapter", None) else (
-            "lp++" if args.adapter == "lpp" else args.adapter
-        )),
+        "adapter_choice": adapter_choice_value,
         "adapter_results": adapter_summary,
     }
     with open(log_path, 'w') as f:
@@ -816,7 +829,7 @@ if __name__ == "__main__":
     wrapper.add_argument("--model", type=str, default=None,
                          help=f"Model architecture (config default: {default_model})")
     wrapper.add_argument("--batch_size", type=int, default=None)
-    wrapper.add_argument("--lr", type=float, default=None)
+    wrapper.add_argument("--lr", type=float, default=1.0e-01)
     wrapper.add_argument("--wd", type=float, default=None)
     wrapper.add_argument("--epochs", type=int, default=None)
     wrapper.add_argument("--k", type=int, default=None,
@@ -901,7 +914,7 @@ if __name__ == "__main__":
         if config_dict.get("batch_size") is not None:
             args.batch_size = config_dict["batch_size"]
         else:
-            args.batch_size = 32 if args.model == "ViT-L-14" else 512
+            args.batch_size = 32 if args.model == "ViT-L-14" else 128
     if "num_grad_accumulation" not in cli_override_dict:
         if config_dict.get("num_grad_accumulation") is not None:
             args.num_grad_accumulation = config_dict["num_grad_accumulation"]

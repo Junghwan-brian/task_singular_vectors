@@ -26,7 +26,7 @@ model_location: ./models/checkpoints_remote_sensing
 n_eval_points: 31
 num_tasks: 15
 sigma_epochs: null
-sigma_lr: 5.0e-06
+sigma_lr: 1.0e-03
 sigma_wd: 0.0
 sigma_lr_step_size: 1
 sigma_lr_gamma: 1.0
@@ -38,5 +38,5 @@ adapter_wd: null
 config_tag: null
 epochs_per_task: 10
 port: 12355
-svd_keep_topk: 4
+svd_keep_topk: 5
 world_size: 1

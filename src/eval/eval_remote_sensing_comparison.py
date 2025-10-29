@@ -54,11 +54,36 @@ def visualize_sigma_matrices(
     save_path: str,
     title: Optional[str] = None,
     cmap: str = "viridis",
+    json_path: Optional[str] = None,
 ) -> List[Dict[str, object]]:
     logger = logging.getLogger(__name__)
     try:
         layers = _select_sigma_layers(sigma_modules, sigma_key_map)
         if not layers:
+            return []
+
+        # Compute global min/max across all sigma diagonals for consistent legends
+        global_min = float("inf")
+        global_max = float("-inf")
+        all_layer_payload: List[Dict[str, object]] = []
+        for safe_key, module in sigma_modules.items():
+            sigma_vals = module.sigma.detach().cpu().numpy()
+            global_min = min(global_min, float(sigma_vals.min()))
+            global_max = max(global_max, float(sigma_vals.max()))
+            orig_key = sigma_key_map.get(safe_key, safe_key)
+            all_layer_payload.append(
+                {
+                    "safe_key": safe_key,
+                    "orig_key": orig_key,
+                    "sigma_values": sigma_vals.tolist(),
+                    "min": float(sigma_vals.min()),
+                    "max": float(sigma_vals.max()),
+                    "mean": float(sigma_vals.mean()),
+                    "std": float(sigma_vals.std()),
+                    "numel": int(sigma_vals.size),
+                }
+            )
+        if not all_layer_payload:
             return []
 
         fig, axes = plt.subplots(1, len(layers), figsize=(7 * len(layers), 4))
@@ -71,7 +96,14 @@ def visualize_sigma_matrices(
             sigma_vals = module.sigma.detach().cpu().numpy()
             diag_matrix = np.diag(sigma_vals)
 
-            im = ax.imshow(diag_matrix, cmap=cmap, aspect="auto", interpolation="nearest")
+            im = ax.imshow(
+                diag_matrix,
+                cmap=cmap,
+                aspect="auto",
+                interpolation="nearest",
+                vmin=global_min,
+                vmax=global_max,
+            )
             ax.set_xlabel("Column Index", fontsize=12)
             ax.set_ylabel("Row Index", fontsize=12)
             ax.set_title(f"{label} Layer\n{orig_key}", fontsize=14)
@@ -116,6 +148,20 @@ def visualize_sigma_matrices(
         plt.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
         plt.close(fig)
         logger.debug(f"Saved sigma visualization: {save_path}")
+
+        if json_path:
+            payload = {
+                "epoch": epoch,
+                "title": title,
+                "global_min": global_min,
+                "global_max": global_max,
+                "layers": all_layer_payload,
+            }
+            os.makedirs(os.path.dirname(json_path), exist_ok=True)
+            with open(json_path, "w") as fp:
+                json.dump(payload, fp, indent=4)
+            logger.debug(f"Saved sigma values to {json_path}")
+
         return results
     except Exception as exc:  # pragma: no cover
         logger.warning(f"Could not visualize sigma matrices: {exc}")
