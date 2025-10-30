@@ -106,8 +106,15 @@ def _atlas_default_lr() -> float:
 
 def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int) -> str:
     datasets_all = _datasets_all_from_config()
-    num_basis = max(len(datasets_all) - 1, 0)
-    num_tasks_minus_one = max(int(num_basis) - 1, 0)
+    configured_tasks = None
+    if isinstance(REMOTE_CFG, dict):
+        configured_tasks = REMOTE_CFG.get("num_tasks")
+    candidate = configured_tasks if configured_tasks is not None else len(datasets_all)
+    try:
+        candidate_int = int(candidate)
+    except (TypeError, ValueError):
+        candidate_int = len(datasets_all)
+    num_tasks_minus_one = max(candidate_int - 1, 0)
     init_value = (init_mode or "average").strip().lower()
     return "energy_{}_{}_{}_{}".format(
         _sanitize_value(num_tasks_minus_one),
