@@ -36,6 +36,141 @@ import time
 from typing import Iterable, List, Sequence
 
 
+def _load_remote_config() -> dict:
+    config_path = os.path.join(os.path.dirname(__file__), "config", "config_remote_sensing.yaml")
+    try:
+        import yaml  # type: ignore
+
+        with open(config_path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+REMOTE_CFG = _load_remote_config()
+
+
+def _resolve_model_root() -> str:
+    default_root = os.path.join(".", "models", "checkpoints_remote_sensing")
+    raw_root = REMOTE_CFG.get("model_location", default_root) if isinstance(REMOTE_CFG, dict) else default_root
+    return os.path.expanduser(raw_root)
+
+
+MODEL_ROOT = _resolve_model_root()
+
+
+def _sanitize_value(val) -> str:
+    if isinstance(val, float):
+        val = f"{val:.6g}"
+    elif isinstance(val, bool):
+        val = int(val)
+    return "".join(
+        ch if (str.isalnum(ch) or ch in {"-", "_"}) else "_"
+        for ch in str(val).replace(".", "p")
+    )
+
+
+def _adapter_tag(value: str) -> str:
+    display = (value or "none").strip().lower()
+    if display in {"", "none"}:
+        return "none"
+    if display in {"lp++", "lpp"}:
+        return "lp++"
+    return display.replace(" ", "_")
+
+
+def _path_exists(path: str) -> bool:
+    return os.path.exists(path) or os.path.exists(os.path.abspath(path))
+
+
+def _datasets_all_from_config() -> Sequence[str]:
+    candidates = REMOTE_CFG.get("DATASETS_ALL") if isinstance(REMOTE_CFG, dict) else None
+    if isinstance(candidates, (list, tuple)):
+        return list(candidates)
+    return list(REMOTE_SENSING_DATASETS.keys())
+
+
+def _atlas_default_lr() -> float:
+    if isinstance(REMOTE_CFG, dict):
+        value = REMOTE_CFG.get("lr")
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return 1e-1
+
+
+def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int) -> str:
+    datasets_all = _datasets_all_from_config()
+    num_basis = max(len(datasets_all) - 1, 0)
+    num_tasks_minus_one = max(int(num_basis) - 1, 0)
+    init_value = (init_mode or "average").strip().lower()
+    return "energy_{}_{}_{}_{}".format(
+        _sanitize_value(num_tasks_minus_one),
+        _sanitize_value(sigma_lr),
+        _sanitize_value(topk),
+        _sanitize_value(init_value),
+    )
+
+
+def _atlas_config_tag(lr: float) -> str:
+    datasets_all = _datasets_all_from_config()
+    num_basis = max(len(datasets_all) - 1, 0)
+    return "atlas_{}_{}".format(
+        _sanitize_value(max(int(num_basis), 0)),
+        _sanitize_value(lr),
+    )
+
+
+def _shot_folder(k: int) -> str:
+    return f"{k}shots" if k > 0 else "fullshots"
+
+
+def _expected_energy_paths(
+    model: str,
+    dataset: str,
+    init_mode: str,
+    adapter: str,
+    sigma_lr: float,
+    topk: int,
+    k: int,
+) -> tuple[str, str]:
+    sigma_lr = float(sigma_lr)
+    topk = int(topk)
+    k = int(k)
+    config_tag = _energy_config_tag(init_mode, sigma_lr, topk)
+    adapter_tag = _adapter_tag(adapter)
+    dataset_dir = f"{dataset}Val"
+    base_dir = os.path.join(MODEL_ROOT, model, dataset_dir, config_tag, _shot_folder(k))
+    energy_pt = os.path.join(base_dir, "energy.pt")
+    results_json = os.path.join(base_dir, f"energy_results_{adapter_tag}.json")
+    return energy_pt, results_json
+
+
+def _expected_atlas_paths(
+    model: str,
+    dataset: str,
+    adapter: str,
+    lr: float,
+    k: int,
+) -> tuple[str, str]:
+    lr = float(lr)
+    k = int(k)
+    config_tag = _atlas_config_tag(lr)
+    adapter_tag = _adapter_tag(adapter)
+    dataset_dir = f"{dataset}Val"
+    base_dir = os.path.join(MODEL_ROOT, model, dataset_dir, config_tag, _shot_folder(k))
+    atlas_pt = os.path.join(base_dir, "atlas.pt")
+    results_json = os.path.join(base_dir, f"atlas_results_{adapter_tag}.json")
+    return atlas_pt, results_json
+
+
+
+
 REMOTE_SENSING_DATASETS = {
     "AID": 10,
     "CLRS": 10,
@@ -80,6 +215,21 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
         ENERGY_SVD_KEEP_TOPK,
         ENERGY_SIGMA_LR,
     ):
+        _, results_json = _expected_energy_paths(
+            model=model,
+            dataset=dataset,
+            init_mode=init_mode,
+            adapter=adapter,
+            sigma_lr=sigma_lr,
+            topk=topk,
+            k=int(k),
+        )
+        if _path_exists(results_json):
+            print(
+                f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}) -> {results_json}",
+                flush=True,
+            )
+            continue
         cmd = [
             sys.executable,
             "energy_train_remote_sensing.py",
@@ -104,9 +254,23 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
 
 def build_atlas_commands(datasets: Sequence[str]) -> List[List[str]]:
     commands: List[List[str]] = []
+    lr_default = _atlas_default_lr()
     for model, adapter, dataset, k in itertools.product(
         ATLAS_MODELS, ATLAS_ADAPTERS, datasets, ATLAS_K
     ):
+        _, results_json = _expected_atlas_paths(
+            model=model,
+            dataset=dataset,
+            adapter=adapter,
+            lr=float(lr_default),
+            k=int(k),
+        )
+        if _path_exists(results_json):
+            print(
+                f"[skip] atlas {model} {dataset} (adapter={adapter}, k={k}) -> {results_json}",
+                flush=True,
+            )
+            continue
         cmd = [
             sys.executable,
             "atlas_remote_sensing.py",
