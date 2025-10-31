@@ -582,8 +582,7 @@ def build_entry_from_json(
         adapter_tag = parse_adapter_tag_from_filename(filename, "energy_results")
     else:
         return None
-
-    method_label, _ = determine_method_label(config_tag, filename, data)
+    method_label, _, _ = determine_method_label(config_tag, filename, data)
     adapter_display = adapter_display_name(adapter_tag)
     metrics = compute_metrics_from_json(method_label, adapter_tag, data)
     return method_label, adapter_display, metrics

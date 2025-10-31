@@ -271,11 +271,9 @@ def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
                 # (num_tasks, chunks)
                 stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
                 # (chunks,)
-                task_energy = torch.linalg.norm(stacked_sigmas, dim=1)  # (num_tasks,)
-                cv = (task_energy.std() / (task_energy.mean()+1e-12)).item()
-                print('--------------------------------')
-                print(cv)
-                print('--------------------------------')
+                # task_energy = torch.linalg.norm(stacked_sigmas, dim=1)  # (num_tasks,)
+                # cv = (task_energy.std() / (task_energy.mean()+1e-12)).item()
+
                 mean_sigma_diag = torch.sum(stacked_sigmas, dim=0)
                 # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
                 Sigma = torch.diag(mean_sigma_diag)   # (chunks, chunks)
@@ -699,7 +697,7 @@ def run_energy(cfg: DictConfig) -> None:
                 selected_indices = sample_k_shot_indices(
                     dataset_train,
                     k,
-                    seed=0,
+                    seed=int(getattr(cfg, 'seed', 1)),
                     verbose=True,
                     progress_desc=f"{val_dataset_name} {k}-shot",
                 )
@@ -858,13 +856,16 @@ def run_energy(cfg: DictConfig) -> None:
         logger.info(f"Train dataset size: {len(train_loader.dataset)}, Batch size: {cfg.batch_size}, Steps per epoch: {len(train_loader)}")
         logger.info(f"Validation dataset size: {len(val_loader.dataset)}")
         
+        epoch_times = []  # Track training time per epoch (excluding validation)
+        
         for epoch in range(int(cfg.sigma_epochs)):
+            epoch_start = time.time()
             model.train()
             for i, batch in enumerate(train_loader):
                 batch = maybe_dictionarize(batch)
                 inputs = batch["images"].cuda()
                 labels = batch["labels"].cuda()
-
+                print(inputs.shape)
                 # build delta map with autograd connectivity
                 delta_map = {}
                 for safe_key, module in sigma_modules.items():
@@ -919,6 +920,10 @@ def run_energy(cfg: DictConfig) -> None:
 
             # step scheduler at end of epoch
             scheduler.step()
+
+            # Record training time for this epoch (before validation)
+            epoch_train_time = time.time() - epoch_start
+            epoch_times.append(epoch_train_time)
 
             if epoch in eval_epochs:
                 model.eval()
@@ -992,7 +997,11 @@ def run_energy(cfg: DictConfig) -> None:
         logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
         record_validation("final", int(cfg.sigma_epochs), final_acc)
 
-        training_time = time.time() - overall_start
+        # Use minimum epoch training time (excluding validation)
+        min_epoch_time = min(epoch_times) if epoch_times else 0.0
+        avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
+        logger.info(f"Training time per epoch - Min: {min_epoch_time:.2f}s, Avg: {avg_epoch_time:.2f}s")
+
         gpu_peak_mem_mb = None
         if torch.cuda.is_available():
             gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
@@ -1042,7 +1051,9 @@ def run_energy(cfg: DictConfig) -> None:
             "svd_keep_topk": getattr(cfg, "svd_keep_topk", 2),
             "initialize_sigma": getattr(cfg, "initialize_sigma", None),
             "adapter_choice": cfg.adapter,
-            "training_time": training_time,
+            "training_time": min_epoch_time,
+            "avg_epoch_time": avg_epoch_time,
+            "all_epoch_times": epoch_times,
             "trainable_params": sigma_trainable_params,
             "batch_size": cfg.batch_size,
             "gpu_peak_mem_mb": gpu_peak_mem_mb,

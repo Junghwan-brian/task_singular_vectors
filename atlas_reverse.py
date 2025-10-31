@@ -1,8 +1,8 @@
-"""Learn the coefficients on task vectors for remote sensing datasets
+"""Learn the coefficients on task vectors for general datasets
 under the few-shot setting and find the optimal combination.
 
-Adapted from atlas.py for remote sensing datasets.
-Uses get_remote_sensing_dataset() instead of get_dataset().
+Adapted from atlas_remote_sensing.py for general datasets.
+Uses get_dataset() instead of get_remote_sensing_dataset().
 """
 
 import os
@@ -41,16 +41,13 @@ from src.utils.variables_and_paths import (
 from src.utils.utils import cosine_lr
 from src.datasets.common import get_dataloader, maybe_dictionarize
 
-# Remote sensing specific imports
-from src.datasets.remote_sensing import (
-    get_remote_sensing_dataset,
-    get_remote_sensing_classification_head,
-    REMOTE_SENSING_DATASETS,
-    sample_k_shot_indices,
-)
+# General dataset imports
+from src.datasets import get_dataset
+from src.models import get_classification_head
+from src.datasets.remote_sensing import sample_k_shot_indices
 
-# Evaluation function
-from src.eval.eval_remote_sensing_comparison import evaluate_encoder_with_dataloader
+# Evaluation function for general datasets
+from src.eval.eval import eval_single_dataset
 
 
 def _sanitize_value(val):
@@ -94,24 +91,28 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     
     return logger
 
-# Dataset-specific epochs for Atlas training (matching fine-tuning epochs)
+# Dataset-specific epochs for Atlas training (general datasets)
 ATLAS_EPOCHS_PER_DATASET = {
-    "AID": 10,              # ~10,000 train samples, 600x600
-    "CLRS": 10,             # ~30,000 train samples, 256x256
-    "EuroSAT_RGB": 15,      # ~21,600 train samples, 64x64
-    "MLRSNet": 15,          # ~17,000 train samples, 256x256
-    "NWPU-RESISC45": 15,    # ~25,200 train samples, 256x256
-    "Optimal-31": 50,       # ~6,200 train samples, 256x256
-    "PatternNet": 20,       # ~10,000 train samples, 256x256
-    "RS_C11": 60,           # ~5,000 train samples, 512x512
-    "RSD46-WHU": 20,        # ~10,000 train samples, 256x256
-    "RSI-CB128": 15,        # ~18,000 train samples, 128x128
-    "RSSCN7": 80,           # ~2,800 train samples, 400x400
-    "SAT-4": 5,             # ~60,000 train samples, 28x28
-    "SAT-6": 10,            # ~40,000 train samples, 28x28
-    "SIRI-WHU": 100,        # ~2,400 train samples, 200x200
-    "UC_Merced": 100,       # ~2,100 train samples, 256x256
-    "WHU-RS19": 150,        # ~1,000 train samples, 600x600
+    "Cars": 10,
+    "CIFAR10": 5,
+    "CIFAR100": 10,
+    "DTD": 15,
+    "EMNIST": 5,
+    "EuroSAT": 15,
+    "FashionMNIST": 5,
+    "FER2013": 10,
+    "Flowers102": 15,
+    "Food101": 10,
+    "GTSRB": 10,
+    "KMNIST": 5,
+    "MNIST": 5,
+    "OxfordIIITPet": 15,
+    "PCAM": 10,
+    "RenderedSST2": 10,
+    "RESISC45": 15,
+    "STL10": 10,
+    "SUN397": 10,
+    "SVHN": 5,
 }
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
@@ -168,7 +169,7 @@ def evaluate_adapter_model(adapter_model, dataloader, device: str) -> float:
     return correct / total if total else 0.0
 
 
-def train_adapter_remote(
+def train_adapter(
     model: ImageClassifier,
     base_train_loader,
     val_loader,
@@ -176,7 +177,7 @@ def train_adapter_remote(
     logger,
     save_dir: str,
 ):
-    """Optional TIP / LP++ adapter fine-tuning for remote sensing Atlas."""
+    """Optional TIP / LP++ adapter fine-tuning for general datasets Atlas."""
 
     adapter_choice = getattr(args, "adapter", None)
     if not adapter_choice:
@@ -397,20 +398,26 @@ def run_single(args):
     logger.info(f"Adapter option: {getattr(args, 'adapter_display', 'none')}")
 
     if not hasattr(args, 'model_location') or args.model_location is None:
-        args.model_location = os.path.expanduser("./models/checkpoints_remote_sensing")
+        args.model_location = os.path.expanduser("./models/checkpoints")
     if not hasattr(args, 'save_dir') or args.save_dir is None:
         args.save_dir = os.path.join(args.model_location, args.model)
+
+    # Import DATASET_REGISTRY here to avoid circular imports
+    from src.datasets.registry import registry as DATASET_REGISTRY
+    
+    # Get list of general datasets (non-Val datasets)
+    GENERAL_DATASETS = {k: v for k, v in DATASET_REGISTRY.items() if not k.endswith("Val")}
 
     test_ds = getattr(args, 'test_dataset', None)
     if hasattr(args, 'basis_datasets') and args.basis_datasets:
         pool = list(args.basis_datasets)
         logger.info(f"Using {len(pool)} explicitly specified basis datasets")
-    elif test_ds and test_ds in REMOTE_SENSING_DATASETS:
-        pool = [d for d in REMOTE_SENSING_DATASETS.keys() if d != test_ds]
+    elif test_ds and test_ds in GENERAL_DATASETS:
+        pool = [d for d in GENERAL_DATASETS.keys() if d != test_ds]
         logger.info(f"Leave-one-out mode: using {len(pool)} datasets as basis (excluding {test_ds})")
     else:
-        pool = list(REMOTE_SENSING_DATASETS.keys())
-        logger.info(f"Using all {len(pool)} remote sensing datasets as basis")
+        pool = list(GENERAL_DATASETS.keys())
+        logger.info(f"Using all {len(pool)} general datasets as basis")
 
     args.basis_datasets_list = pool
     comp_acc = {}
@@ -454,7 +461,7 @@ def run_single(args):
 
 
 def train_single_task(args, comp_acc=None, logger=None):
-    """Train atlas coefficients on remote sensing dataset"""
+    """Train atlas coefficients on general dataset"""
 
     if logger is None:
         logger = setup_simple_logger(__name__)
@@ -538,50 +545,34 @@ def train_single_task(args, comp_acc=None, logger=None):
         torchvision.transforms.RandomHorizontalFlip(p=0.5),
     ] + image_encoder.train_preprocess.transforms[-3:])
 
-    # Load remote sensing dataset
-    train_dataset = get_remote_sensing_dataset(
-        target_dataset,
+    # Load general dataset
+    train_dataset = get_dataset(
+        orig_dataset,
         preprocess_fn,
         location=args.data_location,
         batch_size=args.batch_size,
-        num_workers=8,
     )
 
-    # Get classification head for remote sensing dataset
-    classification_head = get_remote_sensing_classification_head(args, target_dataset, train_dataset)
+    # Get classification head for general dataset
+    classification_head = get_classification_head(args, orig_dataset)
     model = ImageClassifier(image_encoder, classification_head)
 
     model.freeze_head()
     model = model.cuda()
 
+    # Prepare validation dataset
     eval_dataset = None
     val_loader = None
-    with tqdm(
-        total=2,
-        desc=f"Preparing validation dataloader ({target_dataset})",
-        leave=False,
-        bar_format=TQDM_BAR_FORMAT,
-    ) as val_progress:
-        eval_dataset = get_remote_sensing_dataset(
-            target_dataset,
-            model.val_preprocess,
-            location=args.data_location,
-            batch_size=args.batch_size,
-            num_workers=8,
-        )
-        val_progress.update(1)
-        val_loader = get_dataloader(
-            eval_dataset, is_train=False, args=args, image_encoder=None
-        )
-        dataset_size = None
-        if hasattr(val_loader, "dataset"):
-            try:
-                dataset_size = len(val_loader.dataset)
-            except TypeError:
-                dataset_size = None
-        if dataset_size is not None:
-            val_progress.set_postfix_str(f"samples={dataset_size}")
-        val_progress.update(1)
+    logger.info(f"Loading validation dataset: {target_dataset}")
+    eval_dataset = get_dataset(
+        orig_dataset,
+        model.val_preprocess,
+        location=args.data_location,
+        batch_size=args.batch_size,
+    )
+    val_loader = get_dataloader(
+        eval_dataset, is_train=False, args=args, image_encoder=None
+    )
 
     # Few-shot sampling using unified k-shot function
     k = getattr(args, 'k', 0)
@@ -664,8 +655,16 @@ def train_single_task(args, comp_acc=None, logger=None):
     # Evaluate zeroshot accuracy using unified evaluation function
     image_encoder.eval()
     classification_head.eval()
-    pretrained_metrics = evaluate_encoder_with_dataloader(
-        image_encoder, classification_head, val_loader, 'cuda')
+    
+    # Create a temporary config-like object for eval_single_dataset
+    from types import SimpleNamespace
+    # eval_cfg = SimpleNamespace(
+    #     data_location=args.data_location,
+    #     batch_size=args.batch_size,
+    #     device='cuda'
+    # )
+    # print(eval_cfg)
+    pretrained_metrics = eval_single_dataset(image_encoder, target_dataset, args)
     pretrained_acc = pretrained_metrics['top1']
     comp_acc[f"{target_dataset}_zeroshot"] = pretrained_acc
     args.zs_acc[f"{target_dataset}"] = pretrained_acc
@@ -751,8 +750,7 @@ def train_single_task(args, comp_acc=None, logger=None):
             classification_head.eval()
             
             # Use unified evaluation function
-            metrics = evaluate_encoder_with_dataloader(
-                image_encoder, classification_head, val_loader, 'cuda')
+            metrics = eval_single_dataset(image_encoder, target_dataset, args)
             acc = metrics['top1']
             
             # Set back to train mode
@@ -776,8 +774,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     image_encoder.eval()
     classification_head.eval()
 
-    final_metrics = evaluate_encoder_with_dataloader(
-        image_encoder, classification_head, val_loader, 'cuda')
+    final_metrics = eval_single_dataset(image_encoder, target_dataset, args)
     final_acc = final_metrics['top1']
 
     comp_acc[target_dataset_clean] = final_acc
@@ -809,7 +806,7 @@ def train_single_task(args, comp_acc=None, logger=None):
 
     adapter_result_tag = "none"
     adapter_choice_value = "none"
-    adapter_summary = train_adapter_remote(model, train_loader, val_loader, args, logger, save_dir)
+    adapter_summary = train_adapter(model, train_loader, val_loader, args, logger, save_dir)
     if adapter_summary:
         adapter_type = adapter_summary.get("adapter_type", "none")
         adapter_result_tag = _adapter_path_tag(adapter_type)
@@ -856,7 +853,7 @@ def create_atlas_parser(config: OmegaConf) -> argparse.ArgumentParser:
     Based on atlas_src.args.parse_arguments() but with config-based defaults.
     """
     parser = argparse.ArgumentParser(
-        description="Atlas task vector composition for remote sensing datasets",
+        description="Atlas task vector composition for general datasets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -872,7 +869,7 @@ def create_atlas_parser(config: OmegaConf) -> argparse.ArgumentParser:
     parser.add_argument(
         "--config_file",
         type=str,
-        default="config/config_remote_sensing.yaml",
+        default="config/config_reverse.yaml",
         help="Path to configuration YAML file"
     )
     
@@ -892,7 +889,7 @@ def create_atlas_parser(config: OmegaConf) -> argparse.ArgumentParser:
     parser.add_argument(
         "--model_location",
         type=str,
-        default=config.get("model_location", "./models/checkpoints_remote_sensing"),
+        default=config.get("model_location", "./models/checkpoints"),
         help="Directory for model checkpoints"
     )
     
@@ -999,7 +996,7 @@ def create_atlas_parser(config: OmegaConf) -> argparse.ArgumentParser:
     parser.add_argument(
         "--logdir",
         type=str,
-        default="logs/atlas_remote_sensing",
+        default="logs/atlas_reverse",
         help="Directory for logs"
     )
     parser.add_argument(
@@ -1032,7 +1029,7 @@ def create_atlas_parser(config: OmegaConf) -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     # Load config file first
-    config_path = os.path.join(os.path.dirname(__file__), "config", "config_remote_sensing.yaml")
+    config_path = os.path.join(os.path.dirname(__file__), "config", "config_reverse.yaml")
     config = OmegaConf.load(config_path)
     
     # Create parser with config defaults
@@ -1083,11 +1080,11 @@ if __name__ == "__main__":
     os.makedirs(args.logdir, exist_ok=True)
     
     # Legacy paths (kept for compatibility)
-    args.head_path = os.path.join(args.logdir, "learned_composition_remote_sensing.pt")
-    args.log_path = os.path.join(args.logdir, "learned_composition_remote_sensing.json")
+    args.head_path = os.path.join(args.logdir, "learned_composition.pt")
+    args.log_path = os.path.join(args.logdir, "learned_composition.json")
     
     # Setup file logging (with timestamps for the log file)
-    log_file_path = os.path.join(args.logdir, "atlas_remote_sensing.log")
+    log_file_path = os.path.join(args.logdir, "atlas_reverse.log")
     file_handler = logging.FileHandler(log_file_path)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -1103,3 +1100,4 @@ if __name__ == "__main__":
     logger.info(f"Basis datasets: {len(args.basis_datasets)} datasets")
     
     run_single(args)
+

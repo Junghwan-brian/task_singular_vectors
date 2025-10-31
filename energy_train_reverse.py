@@ -26,13 +26,9 @@ import torch
 from src.models.task_vectors import NonLinearTaskVector
 from torch.nn.utils.stateless import functional_call
 
-# Try to import from remote_sensing first (more robust), fallback to atlas
-try:
-    from src.datasets.remote_sensing import sample_k_shot_indices
-    USE_SAMPLE_K_SHOT = True
-except ImportError:
-    from atlas_src.utils import get_n_shots, IndexWrapper
-    USE_SAMPLE_K_SHOT = False
+
+from src.datasets.remote_sensing import sample_k_shot_indices
+
 
 
 class AdapterCompatibleClassifier(torch.nn.Module):
@@ -569,68 +565,34 @@ def run_energy(cfg: DictConfig) -> None:
         if k is not None and k > 0:
             logger.info(f"Applying k-shot sampling: {k} samples per class")
             try:
-                if USE_SAMPLE_K_SHOT:
-                    # Use robust sample_k_shot_indices (more efficient and deterministic)
-                    logger.info("Using sample_k_shot_indices (robust method)")
-                    selected_indices = sample_k_shot_indices(
-                        dataset_train,
-                        k,
-                        seed=int(getattr(cfg, 'seed', 1)),
-                        verbose=True,
-                        progress_desc=f"{test_ds} {k}-shot",
-                    )
-                    
-                    # Get base dataset
-                    base_dataset = getattr(dataset_train, "train_dataset", None)
-                    if base_dataset is None:
-                        base_dataset = getattr(train_loader, "dataset", None)
-                    
-                    if base_dataset is not None:
-                        num_workers = getattr(train_loader, "num_workers", 8)
-                        collate_fn = getattr(train_loader, "collate_fn", None)
-                        train_loader = torch.utils.data.DataLoader(
-                            torch.utils.data.Subset(base_dataset, selected_indices),
-                            batch_size=cfg.batch_size,
-                            shuffle=True,
-                            num_workers=num_workers,
-                            collate_fn=collate_fn,
-                        )
-                        logger.info(
-                            f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples")
-                    else:
-                        logger.warning(
-                            "Could not locate base train_dataset for k-shot subsetting; using full loader instead.")
-                else:
-                    # Fallback to get_n_shots (Atlas original method)
-                    logger.info("Using get_n_shots (Atlas method)")
-                    target_dataset = val_dataset_name
-                    int_idx_path = os.path.join(
-                        cfg.save_dir, target_dataset, f"{k}_shots_{int(cfg.seed)}.pt")
-                    os.makedirs(os.path.dirname(int_idx_path), exist_ok=True)
-                    
-                    if os.path.isfile(int_idx_path):
-                        to_keep = torch.load(int_idx_path)
-                        logger.info(f"Loaded existing k-shot indices from {int_idx_path}")
-                    else:
-                        to_keep = get_n_shots(
-                            dataset_train.train_dataset, k,
-                            model.classification_head.out_features, cfg)
-                        torch.save(to_keep, int_idx_path)
-                        logger.info(f"Saved k-shot indices to {int_idx_path}")
-
-                    r = len(to_keep) / int(cfg.batch_size)
-                    if r < 10:
-                        over_sampling = 10/r
-                        over_sampling = int(over_sampling) + 1
-                        logger.info(f"Oversampling {over_sampling} times")
-                        to_keep = torch.cat([to_keep] * over_sampling)
-
-                    index_dataset = IndexWrapper(dataset_train.train_dataset)
-                    sampler = torch.utils.data.SubsetRandomSampler(to_keep)
+                selected_indices = sample_k_shot_indices(
+                    dataset_train,
+                    k,
+                    seed=int(getattr(cfg, 'seed', 1)),
+                    verbose=True,
+                    progress_desc=f"{test_ds} {k}-shot",
+                )
+                
+                # Get base dataset
+                base_dataset = getattr(dataset_train, "train_dataset", None)
+                if base_dataset is None:
+                    base_dataset = getattr(train_loader, "dataset", None)
+                
+                if base_dataset is not None:
+                    num_workers = getattr(train_loader, "num_workers", 8)
+                    collate_fn = getattr(train_loader, "collate_fn", None)
                     train_loader = torch.utils.data.DataLoader(
-                        index_dataset, batch_size=int(cfg.batch_size), sampler=sampler, num_workers=8)
+                        torch.utils.data.Subset(base_dataset, selected_indices),
+                        batch_size=cfg.batch_size,
+                        shuffle=True,
+                        num_workers=num_workers,
+                        collate_fn=collate_fn,
+                    )
                     logger.info(
-                        f"✓ Created {k}-shot dataloader with {len(to_keep)} samples")
+                        f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples")
+                else:
+                    logger.warning(
+                        "Could not locate base train_dataset for k-shot subsetting; using full loader instead.")
             except Exception as e:
                 logger.error(f"Failed to apply k-shot sampling: {e}")
                 logger.warning("Falling back to full training set")
@@ -716,7 +678,10 @@ def run_energy(cfg: DictConfig) -> None:
         logger.info(f"Starting sigma fine-tuning for {cfg.sigma_epochs} epochs...")
         logger.info(f"Train dataset size: {len(train_loader.dataset)}, Batch size: {cfg.batch_size}, Steps per epoch: {len(train_loader)}")
         
+        epoch_times = []  # Track training time per epoch (excluding validation)
+        
         for epoch in range(int(cfg.sigma_epochs)):
+            epoch_start = time.time()
             model.train()
             for i, batch in enumerate(train_loader):
                 batch = maybe_dictionarize(batch)
@@ -778,6 +743,10 @@ def run_energy(cfg: DictConfig) -> None:
             # step scheduler at end of epoch
             scheduler.step()
 
+            # Record training time for this epoch (before validation)
+            epoch_train_time = time.time() - epoch_start
+            epoch_times.append(epoch_train_time)
+
             if epoch in eval_epochs:
                 model.eval()
                 with torch.no_grad():
@@ -836,7 +805,11 @@ def run_energy(cfg: DictConfig) -> None:
         logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
         record_validation("final", int(cfg.sigma_epochs), final_acc)
 
-        training_time = time.time() - overall_start
+        # Use minimum epoch training time (excluding validation)
+        min_epoch_time = min(epoch_times) if epoch_times else 0.0
+        avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
+        logger.info(f"Training time per epoch - Min: {min_epoch_time:.2f}s, Avg: {avg_epoch_time:.2f}s")
+
         gpu_peak_mem_mb = None
         if torch.cuda.is_available():
             gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
@@ -854,7 +827,9 @@ def run_energy(cfg: DictConfig) -> None:
             "svd_keep_topk": getattr(cfg, "svd_keep_topk", 2),
             "initialize_sigma": getattr(cfg, "initialize_sigma", None),
             "adapter_choice": cfg.adapter,
-            "training_time": training_time,
+            "training_time": min_epoch_time,
+            "avg_epoch_time": avg_epoch_time,
+            "all_epoch_times": epoch_times,
             "trainable_params": sigma_trainable_params,
             "batch_size": cfg.batch_size,
             "gpu_peak_mem_mb": gpu_peak_mem_mb,
