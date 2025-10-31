@@ -70,6 +70,25 @@ def build_atlas_config_tag(num_basis: int, args) -> str:
     lr_part = _sanitize_value(getattr(args, 'lr', 'na'))
     return f"atlas_{count_part}_{lr_part}"
 
+
+def setup_simple_logger(name: str = __name__) -> logging.Logger:
+    """Setup a clean logger with minimal formatting (no INFO/DEBUG prefixes)."""
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    logger.handlers.clear()
+    
+    # Console handler with simple format (just the message)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(console_handler)
+    
+    # Prevent propagation to avoid duplicate logs
+    logger.propagate = False
+    
+    return logger
+
 # Dataset-specific epochs for Atlas training (matching fine-tuning epochs)
 ATLAS_EPOCHS_PER_DATASET = {
     "AID": 10,              # ~10,000 train samples, 600x600
@@ -368,14 +387,8 @@ def softmax_entropy(x: torch.Tensor) -> torch.Tensor:
 
 def run_single(args):
     """Entry point for single-GPU atlas training."""
-
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(message)s'))
-        logger.addHandler(handler)
-
+    
+    logger = setup_simple_logger(__name__)
     logger.info(f"Adapter option: {getattr(args, 'adapter_display', 'none')}")
 
     if not hasattr(args, 'model_location') or args.model_location is None:
@@ -439,12 +452,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     """Train atlas coefficients on remote sensing dataset"""
 
     if logger is None:
-        logger = logging.getLogger(__name__)
-        logger.setLevel(logging.INFO)
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter('%(message)s'))
-            logger.addHandler(handler)
+        logger = setup_simple_logger(__name__)
 
     if comp_acc is None:
         comp_acc = {}
@@ -815,178 +823,256 @@ def train_single_task(args, comp_acc=None, logger=None):
     return comp_acc
 
 
-if __name__ == "__main__":
+def create_atlas_parser(config: OmegaConf) -> argparse.ArgumentParser:
+    """
+    Create argument parser with defaults from config file.
+    Based on atlas_src.args.parse_arguments() but with config-based defaults.
+    """
+    parser = argparse.ArgumentParser(
+        description="Atlas task vector composition for remote sensing datasets",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     
-    # Load config first to get default values
+    # Required arguments
+    parser.add_argument(
+        "--test_dataset",
+        type=str,
+        required=True,
+        help="Target dataset for leave-one-out training"
+    )
+    
+    # Config file
+    parser.add_argument(
+        "--config_file",
+        type=str,
+        default="config/config_remote_sensing.yaml",
+        help="Path to configuration YAML file"
+    )
+    
+    # Model and paths
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=config.get("model", "ViT-B-32"),
+        help="Model architecture"
+    )
+    parser.add_argument(
+        "--data_location",
+        type=str,
+        default=config.get("data_location", "./datasets"),
+        help="Root directory for datasets"
+    )
+    parser.add_argument(
+        "--model_location",
+        type=str,
+        default=config.get("model_location", "./models/checkpoints_remote_sensing"),
+        help="Directory for model checkpoints"
+    )
+    
+    # Training hyperparameters
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=config.get("batch_size", 128),
+        help="Training batch size"
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.1,  # Atlas default
+        help="Learning rate"
+    )
+    parser.add_argument(
+        "--wd",
+        type=float,
+        default=0.1,  # Atlas default
+        help="Weight decay"
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+        help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--num_grad_accumulation",
+        type=int,
+        default=config.get("num_grad_accumulation", 1),
+        help="Gradient accumulation steps"
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=config.get("train_k", 0),
+        help="K-shot samples per class (0=fullshot)"
+    )
+    
+    # Atlas-specific options
+    parser.add_argument(
+        "--blockwise_coef",
+        action="store_true",
+        default=config.get("blockwise_coef", True),
+        help="Learn per-block coefficients"
+    )
+    parser.add_argument(
+        "--partition",
+        type=int,
+        default=None,
+        help="Partition size for fine-grained coefficient learning"
+    )
+    parser.add_argument(
+        "--loss_fn",
+        type=str,
+        default="entropy",
+        choices=["entropy", "cross_entropy"],
+        help="Loss function"
+    )
+    parser.add_argument(
+        "--lp_reg",
+        type=int,
+        default=None,
+        choices=[1, 2],
+        help="Regularization for learned coefficients"
+    )
+    
+    # Adapter options
+    parser.add_argument(
+        "--adapter",
+        type=str,
+        default=config.get("adapter", "none"),
+        choices=["none", "tip", "lp++"],
+        help="Optional adapter after atlas training"
+    )
+    
+    # Other options
+    parser.add_argument(
+        "--epochs_per_task",
+        type=int,
+        default=config.get("epochs_per_task", 10),
+        help="Default epochs per task"
+    )
+    parser.add_argument(
+        "--config_tag",
+        type=str,
+        default=None,
+        help="Custom tag for output directory"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=config.get("seed", 1),
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--print_every",
+        type=int,
+        default=10,
+        help="Print frequency during training"
+    )
+    parser.add_argument(
+        "--logdir",
+        type=str,
+        default="logs/atlas_remote_sensing",
+        help="Directory for logs"
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=config.get("cache_dir", None),
+        help="Cache directory"
+    )
+    parser.add_argument(
+        "--openclip_cachedir",
+        type=str,
+        default=os.path.expanduser("~/openclip-cachedir/open_clip"),
+        help="Directory for caching models from OpenCLIP"
+    )
+    parser.add_argument(
+        "--world_size",
+        type=int,
+        default=config.get("world_size", 1),
+        help="Number of processes for distributed training"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=config.get("port", 12355),
+        help="Port for distributed training"
+    )
+    
+    return parser
+
+
+if __name__ == "__main__":
+    # Load config file first
     config_path = os.path.join(os.path.dirname(__file__), "config", "config_remote_sensing.yaml")
     config = OmegaConf.load(config_path)
     
-    # Get default model from config
-    default_model = config.get("model", "ViT-B-32")
-
-    # Lightweight argparse wrapper to override key hyperparameters via CLI
-    wrapper = argparse.ArgumentParser(add_help=False)
-    wrapper.add_argument("--model", type=str, default=None,
-                         help=f"Model architecture (config default: {default_model})")
-    wrapper.add_argument("--batch_size", type=int, default=None)
-    wrapper.add_argument("--lr", type=float, default=1.0e-01)
-    wrapper.add_argument("--wd", type=float, default=None)
-    wrapper.add_argument("--epochs", type=int, default=None)
-    wrapper.add_argument("--k", type=int, default=None,
-                         help="k-shot per class (e.g., 16 = 16 samples per class). "
-                              "Set to 0 to use full dataset.")
-    wrapper.add_argument("--config_tag", type=str, default=None,
-                         help="Optional tag to group outputs for this configuration")
-    wrapper.add_argument("--data_location", type=str, default=None)
-    wrapper.add_argument("--model_location", type=str, default=None)
-    wrapper.add_argument("--seed", type=int, default=None)
-    wrapper.add_argument("--print_every", type=int, default=None)
+    # Create parser with config defaults
+    parser = create_atlas_parser(config)
+    args = parser.parse_args()
     
-    # Dataset controls (similar to energy_train_remote_sensing.py)
-    wrapper.add_argument("--test_dataset", type=str, required=True,
-                         help="Dataset to treat as target (leave-one-out with others as basis)")
-    wrapper.add_argument("--epochs_per_task", type=int, default=None)
+    # Set device
+    args.device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Atlas-specific options
-    wrapper.add_argument("--blockwise_coef", dest="blockwise_coef", action="store_true",
-                         help="Learn coefficient per parameter block")
-    wrapper.add_argument("--no-blockwise_coef", dest="blockwise_coef", action="store_false",
-                         help=argparse.SUPPRESS)
-    wrapper.set_defaults(blockwise_coef=None)
-    wrapper.add_argument("--partition", type=int, default=None,
-                         help="Partition size for fine-grained coefficient learning")
-    wrapper.add_argument("--adapter", type=str, default=None,
-                         choices=["none", "tip", "lp++"],
-                         help="Optionally train an adapter (TIP or LP++) after learning atlas coefficients")
-
-    cli_args, unknown = wrapper.parse_known_args()
-    unknown = list(unknown)
-    adapter_override = None
-    adapter_option = (cli_args.adapter or "").lower()
-    if adapter_option and adapter_option != "none":
-        adapter_override = "lpp" if adapter_option == "lp++" else adapter_option
-        unknown.extend(["--adapter", adapter_override])
-
-    # Import atlas args parser for remaining arguments
-    from atlas_src.args import parse_arguments
-    sys.argv = [sys.argv[0]] + unknown
-    args = parse_arguments()
-
-    def apply_values(namespace, values, skip_none=True):
-        for key, value in values.items():
-            if skip_none and value is None:
-                continue
-            setattr(namespace, key, value)
-
-    config_dict = OmegaConf.to_container(config, resolve=True)
-    apply_values(args, config_dict)
-
-    cli_override_dict = {
-        key: value
-        for key, value in vars(cli_args).items()
-        if value is not None and key not in {"adapter"}
-    }
-    apply_values(args, cli_override_dict)
-
-    if adapter_override is not None:
-        args.adapter = adapter_override
-    if not getattr(args, "adapter", None):
-        args.adapter = "none"
+    # Normalize adapter choice (lp++ → lpp for internal use)
+    adapter_choice = args.adapter.lower()
+    if adapter_choice == "lp++":
+        args.adapter = "lpp"
     args.adapter_display = "lp++" if args.adapter == "lpp" else args.adapter
-
-    if getattr(args, "model", None) is None:
-        args.model = default_model
-
-    if cli_args.k is not None:
-        args.k = cli_args.k
-    elif "train_k" in config_dict and config_dict["train_k"] is not None:
-        args.k = config_dict["train_k"]
-    elif getattr(args, "k", None) is None:
-        args.k = 0
-    args.k = int(args.k)
-
-    if "lr" not in cli_override_dict:
-        if config_dict.get("lr") is not None:
-            args.lr = config_dict["lr"]
-        else:
-            args.lr = 1e-1
-    if "batch_size" not in cli_override_dict:
-        if config_dict.get("batch_size") is not None:
-            args.batch_size = config_dict["batch_size"]
-        else:
-            args.batch_size = 32 if args.model == "ViT-L-14" else 128
-    if "num_grad_accumulation" not in cli_override_dict:
-        if config_dict.get("num_grad_accumulation") is not None:
-            args.num_grad_accumulation = config_dict["num_grad_accumulation"]
-        else:
-            args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
-    if "print_every" not in cli_override_dict:
-        args.print_every = config_dict.get("print_every", 10) or 10
-    if "epochs_per_task" not in cli_override_dict:
-        args.epochs_per_task = config_dict.get("epochs_per_task", 10)
-    if "blockwise_coef" not in cli_override_dict:
-        if config_dict.get("blockwise_coef") is not None:
-            args.blockwise_coef = config_dict["blockwise_coef"]
-        else:
-            args.blockwise_coef = True
-    if "data_location" not in cli_override_dict and config_dict.get("data_location") is not None:
-        args.data_location = config_dict["data_location"]
-    if "model_location" not in cli_override_dict and config_dict.get("model_location") is not None:
-        args.model_location = config_dict["model_location"]
-    if "seed" not in cli_override_dict:
-        if config_dict.get("seed") is not None:
-            args.seed = config_dict["seed"]
-        elif cli_args.seed is not None:
-            args.seed = cli_args.seed
-        else:
-            args.seed = 1
-
-    args.lr = float(args.lr)
-    args.batch_size = int(args.batch_size)
-    args.num_grad_accumulation = int(args.num_grad_accumulation)
-    args.print_every = int(args.print_every)
-    args.epochs_per_task = int(args.epochs_per_task)
-
-    args.test_dataset = cli_args.test_dataset
     
-
-    logger = logging.getLogger(__name__)
-    args.test_dataset = cli_args.test_dataset
-    args.basis_datasets = [d for d in config.DATASETS_ALL if d != cli_args.test_dataset]
-    args.target_datasets = {cli_args.test_dataset: args.epochs_per_task}
-    logger.info(f"Leave-one-out mode: Test dataset = {args.test_dataset}")
-    logger.info(f"Basis datasets: {len(args.basis_datasets)} datasets")
-
-    # Setup logging directory (legacy - results now saved per-dataset)
-    if not hasattr(args, 'logdir'):
-        args.logdir = os.path.join("logs", "atlas_remote_sensing", args.model)
-    else:
-        args.logdir += f"/{args.model}"
+    # Model-specific adjustments
+    if args.model == "ViT-L-14":
+        if args.batch_size == config.get("batch_size", 128):  # If using default
+            args.batch_size = 32
+        if args.num_grad_accumulation == config.get("num_grad_accumulation", 1):
+            args.num_grad_accumulation = 2
     
+    # Expand paths
+    args.data_location = os.path.expanduser(args.data_location)
+    args.model_location = os.path.expanduser(args.model_location)
+    
+    # Setup save directory
+    if not hasattr(args, 'save_dir') or args.save_dir is None:
+        args.save_dir = os.path.join(args.model_location, args.model)
+    
+    # Initialize zeroshot accuracy dictionary
+    if not hasattr(args, 'zs_acc'):
+        args.zs_acc = {}
+    
+    # Leave-one-out dataset setup
+    args.basis_datasets = [d for d in config.DATASETS_ALL if d != args.test_dataset]
+    args.target_datasets = {args.test_dataset: args.epochs_per_task}
+    
+    # Setup logging directory
+    args.logdir = os.path.join(args.logdir, args.model)
     if args.k > 0:
         args.logdir += f"/{args.k}shots"
     else:
         args.logdir += "/fullshot"
-
     if args.seed is not None:
         args.logdir += f"/{args.seed}"
-
-    # Legacy paths (kept for compatibility, actual results saved per-dataset)
-    args.head_path = os.path.join(args.logdir, "learned_composition_remote_sensing.pt")
-    args.log_path = os.path.join(args.logdir, "learned_composition_remote_sensing.json")
-
+    
     os.makedirs(args.logdir, exist_ok=True)
     
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-        handlers=[
-            logging.FileHandler(os.path.join(args.logdir, "atlas_remote_sensing.log")),
-        ]
-    )
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter('%(message)s'))
-    logging.getLogger(__name__).addHandler(console_handler)
-
+    # Legacy paths (kept for compatibility)
+    args.head_path = os.path.join(args.logdir, "learned_composition_remote_sensing.pt")
+    args.log_path = os.path.join(args.logdir, "learned_composition_remote_sensing.json")
+    
+    # Setup file logging (with timestamps for the log file)
+    log_file_path = os.path.join(args.logdir, "atlas_remote_sensing.log")
+    file_handler = logging.FileHandler(log_file_path)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    # Get root logger and add file handler
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    
+    # Setup clean console logger
+    logger = setup_simple_logger(__name__)
+    logger.info(f"Leave-one-out mode: Test dataset = {args.test_dataset}")
+    logger.info(f"Basis datasets: {len(args.basis_datasets)} datasets")
+    
     run_single(args)

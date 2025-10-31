@@ -8,7 +8,6 @@ import argparse
 import sys
 import torchvision
 from tqdm.auto import tqdm
-import pdb
 import math
 
 from src.eval.aggregation import create_task_vector
@@ -19,13 +18,21 @@ from src.utils.variables_and_paths import (
     get_finetuned_path,
     get_zeroshot_path,
 )
-from src.datasets import get_dataloader, maybe_dictionarize
-from src.models import ImageClassifier, ImageEncoder
+from src.datasets import get_dataloader, maybe_dictionarize, get_dataset
+from src.models import ImageClassifier, ImageEncoder, get_classification_head
 from src.utils.sigma_param import SigmaParametrization
+from src.eval.eval import eval_single_dataset
 import torch
-from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
+from src.models.task_vectors import NonLinearTaskVector
 from torch.nn.utils.stateless import functional_call
-from atlas_remote_sensing import train_adapter_remote
+
+# Try to import from remote_sensing first (more robust), fallback to atlas
+try:
+    from src.datasets.remote_sensing import sample_k_shot_indices
+    USE_SAMPLE_K_SHOT = True
+except ImportError:
+    from atlas_src.utils import get_n_shots, IndexWrapper
+    USE_SAMPLE_K_SHOT = False
 
 
 class AdapterCompatibleClassifier(torch.nn.Module):
@@ -120,37 +127,29 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     
     return logger
 
-# Import remote sensing specific modules
-from src.datasets.remote_sensing import (
-    get_remote_sensing_dataset,
-    get_remote_sensing_classification_head,
-    clean_dataset_logs,
-    sample_k_shot_indices,
-)
-from src.eval.eval_remote_sensing_comparison import (
-    evaluate_encoder_with_dataloader,
-    visualize_sigma_matrices,
-)
 
-
-# Dataset-specific epochs for sigma training
-# These match the fine-tuning epochs from finetune_remote_sensing_datasets.py
+# Dataset-specific epochs for sigma training (general datasets)
 SIGMA_EPOCHS_PER_DATASET = {
-    "AID": 10,              # ~10,000 train samples, 600x600
-    "CLRS": 10,             # ~30,000 train samples, 256x256
-    "EuroSAT_RGB": 15,      # ~21,600 train samples, 64x64
-    "MLRSNet": 15,          # ~17,000 train samples, 256x256
-    "NWPU-RESISC45": 15,    # ~25,200 train samples, 256x256
-    "Optimal-31": 50,       # ~6,200 train samples, 256x256
-    "PatternNet": 20,       # ~10,000 train samples, 256x256
-    "RS_C11": 60,           # ~5,000 train samples, 512x512
-    "RSD46-WHU": 20,        # ~10,000 train samples, 256x256
-    "RSI-CB128": 15,        # ~18,000 train samples, 128x128
-    "RSSCN7": 80,           # ~2,800 train samples, 400x400
-    "SAT-4": 5,             # ~60,000 train samples, 28x28
-    "SIRI-WHU": 100,        # ~2,400 train samples, 200x200
-    "UC_Merced": 100,       # ~2,100 train samples, 256x256
-    "WHU-RS19": 150,        # ~1,000 train samples, 600x600
+    "Cars": 10,
+    "CIFAR10": 5,
+    "CIFAR100": 10,
+    "DTD": 15,
+    "EMNIST": 5,
+    "EuroSAT": 15,
+    "FashionMNIST": 5,
+    "FER2013": 10,
+    "Flowers102": 15,
+    "Food101": 10,
+    "GTSRB": 10,
+    "KMNIST": 5,
+    "MNIST": 5,
+    "OxfordIIITPet": 15,
+    "PCAM": 10,
+    "RenderedSST2": 10,
+    "RESISC45": 15,
+    "STL10": 10,
+    "SUN397": 10,
+    "SVHN": 5,
 }
 
 
@@ -271,12 +270,7 @@ def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
                 # (num_tasks, chunks)
                 stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
                 # (chunks,)
-                task_energy = torch.linalg.norm(stacked_sigmas, dim=1)  # (num_tasks,)
-                cv = (task_energy.std() / (task_energy.mean()+1e-12)).item()
-                print('--------------------------------')
-                print(cv)
-                print('--------------------------------')
-                mean_sigma_diag = torch.sum(stacked_sigmas, dim=0)
+                mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
                 # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
                 Sigma = torch.diag(mean_sigma_diag)   # (chunks, chunks)
             # -------- [수정된 Sigma 계산 로직 끝] --------
@@ -370,124 +364,6 @@ def compute_and_sum_svd_mem_reduction_tsvm(task_vectors, config):
             new_vector[key] = [U_orth, Sigma, V_orth]
     return new_vector
 
-def compute_and_sum_svd_mem_reduction_weighted(task_vectors, config):
-    """
-    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
-    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
-    '부호 정렬 + 에너지 역가중 평균'(A+B)으로 재계산한 sigma(diag)로 재구성.
-    """
-    device = config.device
-    datasets = list(config.DATASETS)
-    num_tasks = int(len(datasets))
-    print(f"DATSETS: {datasets}")
-    print("Computing SVD...")
-    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
-    with torch.no_grad():
-        new_vector = {}
-        # 공통 필터 함수(임베딩류 제외)
-        def is_matrix_key(tv0, key):
-            return (
-                tv0.vector[key].ndim == 2 and
-                all(t not in key for t in ("text_projection",
-                                           "positional", "token_embedding"))
-            )
-        # 키 순회
-        tv0 = task_vectors[0]
-        for key in tv0.vector:
-            # 2D 행렬이 아니거나 제외 키면: 단순 평균
-            if not is_matrix_key(tv0, key):
-                avg = None
-                for i, tv in enumerate(task_vectors):
-                    vec = tv.vector[key].to(device)
-                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
-                new_vector[key] = avg
-                continue
-            # -------- SVD 축 모으기 준비 --------
-            # 첫 태스크에서 모양/순위 파악
-            vec0 = task_vectors[0].vector[key].to(device)
-            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
-            m = int(u0.shape[0])
-            r = int(s0.shape[0])          # 유효 랭크 상한
-            n = int(vh0.shape[1])
-            if r == 0:
-                # 드물지만 0-rank 보호장치
-                new_vector[key] = torch.zeros_like(vec0)
-                continue
-            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
-            num_used = min(num_tasks, r)
-            # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
-            max_per_task = max(1, r // num_used)
-            k = min(desired_k, max_per_task)
-            if desired_k > max_per_task:
-                print(
-                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
-                    desired_k,
-                    max_per_task,
-                    key,
-                    k,
-                )
-            chunks = int(k * num_used)    # <= r 보장
-            # 버퍼 생성
-            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
-            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
-            # 각 태스크에서 상위 k개 축만 수집
-            for i, tv in enumerate(task_vectors[:num_used]):
-                vec = tv.vector[key].to(device)
-                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
-                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
-                r_i = int(s.shape[0])
-                k_i = min(k, r_i)  # 안전 클램프
-                start = i * k
-                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
-                sum_u[:, start:end] = u[:, :k_i]
-                sum_v[start:end, :] = vh[:k_i, :]
-            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
-            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
-            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
-            U_orth = u_u @ vh_u          # (m × chunks)
-            V_orth = u_v @ vh_v          # (chunks × n)
-            # -------- 투영 및 sigma 집계 --------
-            # 1) 각 태스크 M_i를 공통 기저로 투영: P_i = U^T M_i V^T
-            # 2) 대각만 추출해서 쌓기: stacked_sigmas ∈ R^{num_tasks × chunks}
-            U_orth_T = U_orth.T
-            V_orth_T = V_orth.T
-            all_sigma_diags = []
-            for tv in task_vectors:
-                M_i = tv.vector[key].to(device)
-                P_i = (U_orth_T @ M_i) @ V_orth_T     # (chunks, chunks)
-                all_sigma_diags.append(torch.diag(P_i))
-            stacked_sigmas = torch.stack(all_sigma_diags, dim=0)  # (T, C)
-            # ===========================
-            # (A) 부호 정렬 평균 (sign-consistent mean)
-            # 각 컴포넌트 j에 대해 다수(sign of median) 부호로 정렬
-            # ===========================
-            median_vals = stacked_sigmas.median(dim=0).values        # (C,)
-            median_sign = torch.sign(median_vals)                    # {-1,0,1}
-            sum_sign = torch.sign(stacked_sigmas.sum(dim=0))         # 보완용
-            ones = torch.ones_like(median_sign)
-            # median=0이면 sum 기준, 그것도 0이면 +1로
-            sign_vec = torch.where(median_sign != 0, median_sign,
-                                   torch.where(sum_sign != 0, sum_sign, ones))  # (C,)
-            aligned = stacked_sigmas * sign_vec  # (T, C)  ← 부호 정렬 완료
-            # ===========================
-            # (B) 에너지 역가중 평균 (energy-balanced mean)
-            # 태스크별 에너지 e_i = ||aligned[i]||_2,  w_i ∝ 1/e_i
-            # ===========================
-            eps = 1e-12
-            task_energy = torch.linalg.norm(aligned, dim=1).clamp_min(eps)  # (T,)
-            inv_e = 1.0 / task_energy
-            w = inv_e / inv_e.sum()                                         # 정규화 가중치 (T,)
-            mean_sigma_diag = (aligned * w[:, None]).sum(dim=0)             # (C,)
-            # 부호 보정: 평균이 음수가 되면 U 또는 V 컬럼에 부호를 흡수
-            neg_mask = mean_sigma_diag < 0
-            if torch.any(neg_mask):
-                U_orth[:, neg_mask] *= -1
-                mean_sigma_diag[neg_mask] = -mean_sigma_diag[neg_mask]
-            # 최종 Sigma
-            Sigma = torch.diag(mean_sigma_diag)  # (chunks, chunks)
-            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
-            new_vector[key] = [U_orth, Sigma, V_orth]
-    return new_vector
 
 def run_energy(cfg: DictConfig) -> None:
     """
@@ -525,10 +401,11 @@ def run_energy(cfg: DictConfig) -> None:
     test_ds = cfg.test_dataset
     
     # Determine which datasets to use for basis construction
-    # if cfg.DATASETS == "" or not cfg.DATASETS:
-        # If DATASETS is empty or not specified, use DATASETS_ALL
     logger.info("Using DATASETS_ALL for basis construction (leave-one-out mode)")
-    base_list = list(cfg.DATASETS_ALL)
+    if hasattr(cfg, 'DATASETS_ALL') and cfg.DATASETS_ALL:
+        base_list = list(cfg.DATASETS_ALL)
+    else:
+        base_list = ALL_DATASETS[:cfg.num_tasks]
 
     
     # Remove test_dataset from basis list
@@ -587,9 +464,6 @@ def run_energy(cfg: DictConfig) -> None:
     elif init_mode == "average":
         logger.info("Using average SVD initialization")
         svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
-    else:
-        logger.info("Using TIES SVD initialization")
-        svd_dict = compute_and_sum_svd_mem_reduction_weighted(task_vectors, cfg)
     svd_time = time.time() - svd_start
     logger.info(f"Computed SVD bases in {svd_time:.2f}s")
 
@@ -665,8 +539,8 @@ def run_energy(cfg: DictConfig) -> None:
         pretrained_encoder = ImageEncoder(cfg.model).cuda()
         image_encoder = ImageEncoder(cfg.model).cuda()
         
-        # Load remote sensing dataset with consistent train/val split (same as Atlas)
-        logger.info(f"Loading remote sensing dataset for training: {val_dataset_name}")
+        # Load dataset with consistent train/val split
+        logger.info(f"Loading dataset for training: {val_dataset_name}")
         train_preprocess = torchvision.transforms.Compose([
             torchvision.transforms.RandomResizedCrop(
                 size=224,
@@ -676,15 +550,14 @@ def run_energy(cfg: DictConfig) -> None:
             torchvision.transforms.RandomHorizontalFlip(p=0.5),
         ] + image_encoder.train_preprocess.transforms[-3:])
 
-        dataset_train = get_remote_sensing_dataset(
-            val_dataset_name,
+        dataset_train = get_dataset(
+            test_ds,
             train_preprocess,
             location=cfg.data_location,
             batch_size=cfg.batch_size,
-            num_workers=6,
         )
         
-        classification_head = get_remote_sensing_classification_head(cfg, val_dataset_name, dataset_train)
+        classification_head = get_classification_head(cfg, test_ds)
         
         model = ImageClassifier(image_encoder, classification_head).cuda()
         model.freeze_head()
@@ -696,34 +569,68 @@ def run_energy(cfg: DictConfig) -> None:
         if k is not None and k > 0:
             logger.info(f"Applying k-shot sampling: {k} samples per class")
             try:
-                selected_indices = sample_k_shot_indices(
-                    dataset_train,
-                    k,
-                    seed=0,
-                    verbose=True,
-                    progress_desc=f"{val_dataset_name} {k}-shot",
-                )
-                
-                # Get base dataset
-                base_dataset = getattr(dataset_train, "train_dataset", None)
-                if base_dataset is None:
-                    base_dataset = getattr(train_loader, "dataset", None)
-                
-                if base_dataset is not None:
-                    num_workers = getattr(train_loader, "num_workers", 6)
-                    collate_fn = getattr(train_loader, "collate_fn", None)
-                    train_loader = torch.utils.data.DataLoader(
-                        torch.utils.data.Subset(base_dataset, selected_indices),
-                        batch_size=cfg.batch_size,
-                        shuffle=True,
-                        num_workers=num_workers,
-                        collate_fn=collate_fn,
+                if USE_SAMPLE_K_SHOT:
+                    # Use robust sample_k_shot_indices (more efficient and deterministic)
+                    logger.info("Using sample_k_shot_indices (robust method)")
+                    selected_indices = sample_k_shot_indices(
+                        dataset_train,
+                        k,
+                        seed=int(getattr(cfg, 'seed', 1)),
+                        verbose=True,
+                        progress_desc=f"{test_ds} {k}-shot",
                     )
-                    logger.info(
-                        f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples")
+                    
+                    # Get base dataset
+                    base_dataset = getattr(dataset_train, "train_dataset", None)
+                    if base_dataset is None:
+                        base_dataset = getattr(train_loader, "dataset", None)
+                    
+                    if base_dataset is not None:
+                        num_workers = getattr(train_loader, "num_workers", 8)
+                        collate_fn = getattr(train_loader, "collate_fn", None)
+                        train_loader = torch.utils.data.DataLoader(
+                            torch.utils.data.Subset(base_dataset, selected_indices),
+                            batch_size=cfg.batch_size,
+                            shuffle=True,
+                            num_workers=num_workers,
+                            collate_fn=collate_fn,
+                        )
+                        logger.info(
+                            f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples")
+                    else:
+                        logger.warning(
+                            "Could not locate base train_dataset for k-shot subsetting; using full loader instead.")
                 else:
-                    logger.warning(
-                        "Could not locate base train_dataset for k-shot subsetting; using full loader instead.")
+                    # Fallback to get_n_shots (Atlas original method)
+                    logger.info("Using get_n_shots (Atlas method)")
+                    target_dataset = val_dataset_name
+                    int_idx_path = os.path.join(
+                        cfg.save_dir, target_dataset, f"{k}_shots_{int(cfg.seed)}.pt")
+                    os.makedirs(os.path.dirname(int_idx_path), exist_ok=True)
+                    
+                    if os.path.isfile(int_idx_path):
+                        to_keep = torch.load(int_idx_path)
+                        logger.info(f"Loaded existing k-shot indices from {int_idx_path}")
+                    else:
+                        to_keep = get_n_shots(
+                            dataset_train.train_dataset, k,
+                            model.classification_head.out_features, cfg)
+                        torch.save(to_keep, int_idx_path)
+                        logger.info(f"Saved k-shot indices to {int_idx_path}")
+
+                    r = len(to_keep) / int(cfg.batch_size)
+                    if r < 10:
+                        over_sampling = 10/r
+                        over_sampling = int(over_sampling) + 1
+                        logger.info(f"Oversampling {over_sampling} times")
+                        to_keep = torch.cat([to_keep] * over_sampling)
+
+                    index_dataset = IndexWrapper(dataset_train.train_dataset)
+                    sampler = torch.utils.data.SubsetRandomSampler(to_keep)
+                    train_loader = torch.utils.data.DataLoader(
+                        index_dataset, batch_size=int(cfg.batch_size), sampler=sampler, num_workers=8)
+                    logger.info(
+                        f"✓ Created {k}-shot dataloader with {len(to_keep)} samples")
             except Exception as e:
                 logger.error(f"Failed to apply k-shot sampling: {e}")
                 logger.warning("Falling back to full training set")
@@ -759,37 +666,6 @@ def run_energy(cfg: DictConfig) -> None:
             for name, tensor in model.image_encoder.state_dict().items()
         }
 
-        # Load validation dataset for per-epoch evaluation with progress feedback
-        logger.info(f"Loading validation dataset: {val_dataset_name}")
-        val_dataset = None
-        val_loader = None
-        with tqdm(
-            total=2,
-            desc=f"Preparing validation dataloader ({val_dataset_name})",
-            leave=False,
-            bar_format=TQDM_BAR_FORMAT,
-        ) as val_progress:
-            val_dataset = get_remote_sensing_dataset(
-                val_dataset_name,
-                image_encoder.val_preprocess,
-                location=cfg.data_location,
-                batch_size=cfg.batch_size,
-                num_workers=6,
-            )
-            val_progress.update(1)
-            val_loader = get_dataloader(
-                val_dataset, is_train=False, args=cfg, image_encoder=None
-            )
-            dataset_size = None
-            if hasattr(val_loader, "dataset"):
-                try:
-                    dataset_size = len(val_loader.dataset)
-                except TypeError:
-                    dataset_size = None
-            if dataset_size is not None:
-                val_progress.set_postfix_str(f"samples={dataset_size}")
-            val_progress.update(1)
-        
         # Prepare evaluation schedule and history tracking
         eval_epochs = compute_eval_epochs(int(cfg.sigma_epochs))
         loss_history = []
@@ -810,16 +686,10 @@ def run_energy(cfg: DictConfig) -> None:
             eval_counter += 1
             return record
 
-        # Prepare visualization directory
-        visualization_dir = os.path.join(
-            energy_save_dir, f"sigma_visualization_{adapter_tag}"
-        )
-        os.makedirs(visualization_dir, exist_ok=True)
-
         # Log zeroshot accuracy before any sigma updates
         model.eval()
         with torch.no_grad():
-            pretrained_metrics = evaluate_encoder_with_dataloader(model.image_encoder, classification_head, val_loader, cfg.device)
+            pretrained_metrics = eval_single_dataset(pretrained_encoder, val_dataset_name, cfg)
             pretrained_acc = pretrained_metrics['top1']
             logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
             record_validation("pretrained", -2, pretrained_acc)
@@ -835,28 +705,16 @@ def run_energy(cfg: DictConfig) -> None:
                         eval_params[orig_key] = eval_params[orig_key] + delta
 
             model.image_encoder.load_state_dict(eval_params, strict=False)
-            zeroshot_metrics = evaluate_encoder_with_dataloader(model.image_encoder, classification_head, val_loader, cfg.device)
+            zeroshot_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
             zeroshot_acc = zeroshot_metrics['top1']
             logger.info(f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
             record_validation("zeroshot", -1, zeroshot_acc)
             model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
-        sigma_records = []
-        records = visualize_sigma_matrices(
-            sigma_modules,
-            sigma_key_map,
-            epoch=-1,
-            save_path=os.path.join(visualization_dir, "sigma_epoch_-1.png"),
-            title=f"{test_ds} ({shot_folder})",
-            json_path=os.path.join(visualization_dir, "sigma_epoch_-1.json"),
-        )
-        if records:
-            sigma_records.extend(records)
         model.train()
         
         logger.info(f"Starting sigma fine-tuning for {cfg.sigma_epochs} epochs...")
         logger.info(f"Train dataset size: {len(train_loader.dataset)}, Batch size: {cfg.batch_size}, Steps per epoch: {len(train_loader)}")
-        logger.info(f"Validation dataset size: {len(val_loader.dataset)}")
         
         for epoch in range(int(cfg.sigma_epochs)):
             model.train()
@@ -935,8 +793,7 @@ def run_energy(cfg: DictConfig) -> None:
 
                     model.image_encoder.load_state_dict(eval_params, strict=False)
 
-                    val_metrics = evaluate_encoder_with_dataloader(
-                        model.image_encoder, classification_head, val_loader, cfg.device)
+                    val_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
                     val_acc = val_metrics['top1']
 
                     logger.info(f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
@@ -944,16 +801,6 @@ def run_energy(cfg: DictConfig) -> None:
 
                     model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
-                records = visualize_sigma_matrices(
-                    sigma_modules,
-                    sigma_key_map,
-                    epoch=epoch,
-                    save_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.png"),
-                    title=f"{test_ds} ({shot_folder})",
-                    json_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.json"),
-                )
-                if records:
-                    sigma_records.extend(records)
                 model.train()
 
         # Finalize weights and save: materialize the final deltas onto base params
@@ -971,8 +818,6 @@ def run_energy(cfg: DictConfig) -> None:
             model.image_encoder.load_state_dict(materialized, strict=False)
         
         # Save with k-shot folder structure
-        # e.g., models/checkpoints_remote_sensing/ViT-B-32/MLRSNetVal/16shot/energy.pt
-
         os.makedirs(energy_save_dir, exist_ok=True)
         energy_path = os.path.join(energy_save_dir, "energy.pt")
         model.image_encoder.save(energy_path)
@@ -985,8 +830,7 @@ def run_energy(cfg: DictConfig) -> None:
         
         model.eval()
         with torch.no_grad():
-            final_metrics = evaluate_encoder_with_dataloader(
-                model.image_encoder, classification_head, val_loader, cfg.device)
+            final_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
             final_acc = final_metrics['top1']
         
         logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
@@ -998,40 +842,8 @@ def run_energy(cfg: DictConfig) -> None:
             gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
             logger.info(f"Peak GPU memory during training: {gpu_peak_mem_mb:.2f} MB")
 
-        records = visualize_sigma_matrices(
-            sigma_modules,
-            sigma_key_map,
-            epoch="final",
-            save_path=os.path.join(visualization_dir, "sigma_epoch_final.png"),
-            title=f"{test_ds} ({shot_folder})",
-            json_path=os.path.join(visualization_dir, "sigma_epoch_final.json"),
-        )
-        if records:
-            sigma_records.extend(records)
-
-        # Optional adapter fine-tuning (TIP / LP++) after sigma training
-        adapter_summary = None
-        adapter_result_tag = adapter_tag
-        if cfg.adapter != "none":
-            adapter_args = SimpleNamespace(
-                adapter=cfg.adapter,
-                batch_size=int(cfg.batch_size),
-                num_grad_accumulation=int(getattr(cfg, "num_grad_accumulation", 1)),
-                wd=float(getattr(cfg, "adapter_wd", cfg.sigma_wd)),
-                lr=float(getattr(cfg, "adapter_lr", cfg.sigma_lr)),
-                k=int(getattr(cfg, "train_k", 0)),
-            )
-            adapter_ready_model = AdapterCompatibleClassifier(model)
-            adapter_summary = train_adapter_remote(
-                adapter_ready_model, train_loader, val_loader, adapter_args, logger, energy_save_dir
-            )
-            if adapter_summary:
-                adapter_result_tag = adapter_path_tag(adapter_summary["adapter_type"])
-
         # Save results to JSON
-        results_path = os.path.join(
-            energy_save_dir, f"energy_results_{adapter_result_tag}.json"
-        )
+        results_path = os.path.join(energy_save_dir, f"energy_results_none.json")
         results = {
             "target_dataset": test_ds,
             "final_accuracy": float(final_acc),
@@ -1052,7 +864,6 @@ def run_energy(cfg: DictConfig) -> None:
             "pretrained_accuracy": float(pretrained_acc),
             "zeroshot_accuracy": float(zeroshot_acc),
             "config_tag": cfg.config_tag,
-            "adapter_results": adapter_summary,
         }
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=4)
@@ -1060,27 +871,39 @@ def run_energy(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    from src.datasets.remote_sensing import REMOTE_SENSING_DATASETS
+    from src.datasets.registry import registry as DATASET_REGISTRY
     
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Energy-based task vector merging for remote sensing datasets",
+        description="Energy-based task vector merging for general datasets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
     # Required arguments
+    allowed_test_datasets = sorted(
+        [name for name in DATASET_REGISTRY.keys() if not name.endswith("Val")]
+    )
     parser.add_argument(
         "--test_dataset",
         type=str,
         required=True,
-        choices=sorted(list(REMOTE_SENSING_DATASETS.keys())),
+        choices=allowed_test_datasets,
         help="Held-out dataset to train on (sigma epochs auto-set by dataset size)",
     )
     
-    
     # Config and model
-    parser.add_argument("--config_file", type=str, default="config/config_remote_sensing.yaml", help="Path to configuration YAML file")
-    parser.add_argument("--model", type=str, help="Vision backbone (e.g., ViT-B-32, ViT-B-16)")
+    parser.add_argument(
+        "--config_file",
+        type=str,
+        default="config/config_reverse.yaml",
+        help="Path to configuration YAML file"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Vision backbone (e.g., ViT-B-32, ViT-B-16)"
+    )
+    
     # Training hyperparameters
     parser.add_argument("--sigma_epochs", type=int, help="Number of sigma training epochs")
     parser.add_argument("--sigma_lr", type=float, help="Learning rate for sigma optimization")
@@ -1088,7 +911,12 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_lr_step_size", type=int, help="LR scheduler step size")
     parser.add_argument("--sigma_lr_gamma", type=float, help="LR scheduler gamma")
     parser.add_argument("--batch_size", type=int, help="Training batch size")
-    parser.add_argument("--k", type=int, dest="train_k", help="K-shot samples per class (0=fullshot)")
+    parser.add_argument(
+        "--k",
+        type=int,
+        dest="train_k",
+        help="K-shot samples per class (0=fullshot)"
+    )
     
     # SVD and initialization
     parser.add_argument(
@@ -1099,28 +927,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initialize_sigma",
         type=str,
-        choices=["average", "tsvm", "weighted"],
+        choices=["average", "tsvm"],
         help="Initialization strategy for sigma basis"
-    )
-    
-    # Adapter options
-    parser.add_argument(
-        "--adapter",
-        type=str,
-        choices=["none", "tip", "lp++"],
-        help="Optional adapter after sigma training"
-    )
-    parser.add_argument("--adapter_lr", type=float, help="Adapter learning rate")
-    parser.add_argument("--adapter_wd", type=float, help="Adapter weight decay")
-    parser.add_argument(
-        "--adapter_grad_accum",
-        type=int,
-        dest="num_grad_accumulation",
-        help="Gradient accumulation steps for adapter"
     )
     
     # Other
     parser.add_argument("--config_tag", type=str, help="Custom tag for output directory")
+    parser.add_argument("--seed", type=int, default=1, help="Random seed for k-shot sampling")
     
     args = parser.parse_args()
     
@@ -1140,3 +953,4 @@ if __name__ == "__main__":
     
     OmegaConf.set_struct(cfg, True)
     run_energy(cfg)
+
