@@ -795,7 +795,7 @@ def render_summary_tree(collectors: List[DatasetCollector], model: str, model_ro
         {"key": "dataset", "label": "Datasets", "x": 0.05, "color": "#C00000"},
         {"key": "shot", "label": "Shots", "x": 0.20, "color": "#C00000"},
         {"key": "method", "label": "Methods", "x": 0.35, "color": "#C00000"},
-        {"key": "adapter", "label": "Adapter", "x": 0.60, "color": "#C00000"},
+        {"key": "adapter", "label": "Adapter", "x": 0.65, "color": "#C00000"},
         {"key": "accuracy", "label": "Accuracy", "x": 0.82, "color": "#1F4E79"},
         {"key": "initial", "label": "Initial Accuracy", "x": 1.00, "color": "#1F4E79"},
         {"key": "time", "label": "Training Time", "x": 1.20, "color": "#1F4E79"},
@@ -831,7 +831,7 @@ def render_summary_tree(collectors: List[DatasetCollector], model: str, model_ro
         method_text = entry.get("method", "")
         ax.text(0.35, y, method_text, fontsize=11, color="black", ha="left", va="center")
 
-        ax.text(0.60, y, entry.get("adapter", ""), fontsize=11, color="black", ha="left", va="center")
+        ax.text(0.65, y, entry.get("adapter", ""), fontsize=11, color="black", ha="left", va="center")
 
         shot_key = (entry.get("shot_key") or "").lower()
         acc_color = metrics_color
@@ -860,7 +860,7 @@ def render_summary_tree(collectors: List[DatasetCollector], model: str, model_ro
 
     for start, end in method_ranges:
         if end >= start:
-            draw_bracket(ax, 0.55, y_positions[start], y_positions[end], width=0.02, linewidth=1.0)
+            draw_bracket(ax, 0.60, y_positions[start], y_positions[end], width=0.02, linewidth=1.0)
 
     fig.tight_layout()
     image_path = os.path.join(model_root, f"{model}_summary.png")
@@ -883,45 +883,51 @@ def evaluate_dataset(
     batch_size: int,
     num_workers: int,
     device: str,
+    skip_baselines: bool = False,
 ) -> DatasetCollector:
     LOGGER.info(f"Processing dataset: {dataset}")
-    val_name = f"{dataset}Val"
-    template_encoder = ImageEncoder(model).to(device)
-    val_dataset = get_remote_sensing_dataset(
-        val_name,
-        template_encoder.val_preprocess,
-        location=data_location,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
-
-    args_ns = SimpleNamespace(
-        save_dir=os.path.join(dataset_dir, ".."),
-        model=model,
-        device=device,
-        batch_size=batch_size,
-    )
-    classification_head = get_remote_sensing_classification_head(args_ns, val_name, val_dataset)
-    classification_head = classification_head.to(device)
-    classification_head.eval()
-
-    val_loader = get_dataloader(val_dataset, is_train=False, args=args_ns, image_encoder=None)
-
     collector = DatasetCollector(dataset)
-    try:
-        populate_baseline_entries(
-            collector=collector,
-            dataset_dir=dataset_dir,
-            classification_head=classification_head,
-            val_loader=val_loader,
+    
+    # Skip dataset loading if we're not evaluating baselines
+    if not skip_baselines:
+        val_name = f"{dataset}Val"
+        template_encoder = ImageEncoder(model).to(device)
+        val_dataset = get_remote_sensing_dataset(
+            val_name,
+            template_encoder.val_preprocess,
+            location=data_location,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        )
+
+        args_ns = SimpleNamespace(
+            save_dir=os.path.join(dataset_dir, ".."),
             model=model,
             device=device,
+            batch_size=batch_size,
         )
-    finally:
-        del classification_head
-        del val_loader
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        classification_head = get_remote_sensing_classification_head(args_ns, val_name, val_dataset)
+        classification_head = classification_head.to(device)
+        classification_head.eval()
+
+        val_loader = get_dataloader(val_dataset, is_train=False, args=args_ns, image_encoder=None)
+
+        try:
+            populate_baseline_entries(
+                collector=collector,
+                dataset_dir=dataset_dir,
+                classification_head=classification_head,
+                val_loader=val_loader,
+                model=model,
+                device=device,
+            )
+        finally:
+            del classification_head
+            del val_loader
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    else:
+        LOGGER.info(f"{dataset}: Skipping baseline evaluation and dataset loading (--skip_baselines)")
 
     config_shots = discover_config_shot_dirs(dataset_dir, shots_filter)
     for config_tag, shot_folders in config_shots:
@@ -1098,6 +1104,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=6)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--log_level", default="INFO")
+    parser.add_argument(
+        "--skip_baselines",
+        action="store_true",
+        help="Skip evaluation of baseline models (pretrained and full finetuned)",
+    )
     return parser.parse_args()
 
 
@@ -1127,6 +1138,7 @@ def main():
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             device=args.device,
+            skip_baselines=args.skip_baselines,
         )
         collectors.append(collector)
 
