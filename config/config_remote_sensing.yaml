@@ -16,7 +16,7 @@ DATASETS_ALL:
 - UC_Merced
 - WHU-RS19
 DATASETS_VAL: ''
-batch_size: 128
+batch_size: 32
 cache_dir: null
 data_location: ./datasets
 device: cuda

@@ -865,7 +865,6 @@ def run_energy(cfg: DictConfig) -> None:
                 batch = maybe_dictionarize(batch)
                 inputs = batch["images"].cuda()
                 labels = batch["labels"].cuda()
-                print(inputs.shape)
                 # build delta map with autograd connectivity
                 delta_map = {}
                 for safe_key, module in sigma_modules.items():

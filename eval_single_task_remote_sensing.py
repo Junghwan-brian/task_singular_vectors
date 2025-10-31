@@ -280,12 +280,20 @@ def method_display_label(method: str) -> str:
         return METHOD_DISPLAY_NAMES[method]
     if method.startswith("Energy_"):
         parts = method.split("_")
+        if len(parts) >= 4:
+            # Format: Energy_variant_topk_lr
+            lr_display = parts[3].replace('p', '.')
+            return f"Energy({parts[1]}) top-{parts[2]} lr-{lr_display}"
         if len(parts) >= 3:
             return f"Energy({parts[1]}) top-{parts[2]}"
         if len(parts) >= 2:
             return f"Energy({parts[1]})"
     if method.startswith("Zeroshot_"):
         parts = method.split("_")
+        if len(parts) >= 4:
+            # Format: Zeroshot_variant_topk_lr
+            lr_display = parts[3].replace('p', '.')
+            return f"Zeroshot({parts[1]}) top-{parts[2]} lr-{lr_display}"
         if len(parts) >= 3:
             return f"Zeroshot({parts[1]}) top-{parts[2]}"
         if len(parts) >= 2:
@@ -330,16 +338,39 @@ def determine_energy_topk(config_tag: Optional[str], filename: str) -> str:
     return "unknown"
 
 
-def determine_method_label(config_tag: Optional[str], filename: str, data: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+def determine_energy_lr(config_tag: Optional[str], data: Dict[str, Any]) -> str:
+    """Extract learning rate from config_tag or data."""
+    # Try to get from data first (most reliable)
+    lr_candidate = data.get("sigma_lr")
+    if lr_candidate is not None:
+        try:
+            lr_val = float(lr_candidate)
+            # Format as string with 'p' instead of '.'
+            lr_str = f"{lr_val:.6f}".rstrip('0').rstrip('.')
+            return lr_str.replace('.', 'p')
+        except (TypeError, ValueError):
+            pass
+    
+    # Try to extract from config_tag (format: energy_14_0p001_5_tsvm)
+    if config_tag:
+        parts = config_tag.split("_")
+        if len(parts) >= 3 and parts[0].lower() == "energy":
+            return parts[2]
+    
+    return "unknown"
+
+
+def determine_method_label(config_tag: Optional[str], filename: str, data: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
     tag_source = (config_tag or filename or "").lower()
     if tag_source.startswith("atlas"):
-        return "Atlas", None, None
+        return "Atlas", None, None, None
     if tag_source.startswith("energy"):
         variant = determine_energy_variant(config_tag, data, filename)
         topk = determine_energy_topk(config_tag, filename)
-        method_label = f"Energy_{variant}_{topk}" if variant else f"Energy_{topk}"
-        return method_label, variant, topk
-    return "Other", None, None
+        lr = determine_energy_lr(config_tag, data)
+        method_label = f"Energy_{variant}_{topk}_{lr}" if variant else f"Energy_{topk}_{lr}"
+        return method_label, variant, topk, lr
+    return "Other", None, None, None
 
 
 def shot_sort_value(shot: str) -> int:
@@ -582,7 +613,7 @@ def build_entry_from_json(
         adapter_tag = parse_adapter_tag_from_filename(filename, "energy_results")
     else:
         return None
-    method_label, _, _ = determine_method_label(config_tag, filename, data)
+    method_label, _, _, _ = determine_method_label(config_tag, filename, data)
     adapter_display = adapter_display_name(adapter_tag)
     metrics = compute_metrics_from_json(method_label, adapter_tag, data)
     return method_label, adapter_display, metrics
@@ -931,7 +962,7 @@ def evaluate_dataset(
 
     config_shots = discover_config_shot_dirs(dataset_dir, shots_filter)
     for config_tag, shot_folders in config_shots:
-        inferred_method, _, _ = determine_method_label(config_tag, config_tag or "", {})
+        inferred_method, _, _, _ = determine_method_label(config_tag, config_tag or "", {})
         LOGGER.info(f"{dataset}: {config_tag or 'legacy'} -> {inferred_method}, shots={shot_folders}")
         for shot_folder in shot_folders:
             before_count = sum(
