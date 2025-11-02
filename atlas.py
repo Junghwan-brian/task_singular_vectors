@@ -236,9 +236,12 @@ def train(task_vectors, args, comp_acc={}):
 
     best_coef = ddp_model.image_encoder.coef.data.clone()
     best_acc = args.zs_acc[target_dataset]
+    atlas_start_time = time.time()
+    print(f"batch size: {args.batch_size}")
+    print(f"data_loader length: {len(ddp_loader)}")
     for epoch in range(args.epochs):
+        start_time = time.time()
         for i, batch in enumerate(ddp_loader):
-            start_time = time.time()
 
             step = (
                 i // args.num_grad_accumulation
@@ -247,6 +250,7 @@ def train(task_vectors, args, comp_acc={}):
 
             batch = maybe_dictionarize(batch)
             inputs = batch["images"].cuda()
+            print(f"inputs shape: {inputs.shape}")
             data_time = time.time() - start_time
 
             with torch.autocast(device_type='cuda', dtype=torch.float16):
@@ -265,8 +269,6 @@ def train(task_vectors, args, comp_acc={}):
                 scaler.update()
                 optimizer.zero_grad()
 
-            batch_time = time.time() - start_time
-
             if (
                 step % print_every == 0
                 and ((i + 1) % args.num_grad_accumulation == 0)
@@ -275,10 +277,12 @@ def train(task_vectors, args, comp_acc={}):
                 percent_complete = 100 * (i + 1) / len(ddp_loader)
                 print(
                     f"Train Epoch: {epoch} [{percent_complete:.0f}% {i + 1}/{num_batches}]\t"           # noqa: E501
-                    f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}",   # noqa: E501
+                    f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}",   # noqa: E501
                     flush=True,
                 )
 
+        epoch_time = time.time() - start_time
+        print(f"Epoch time: {epoch_time:.3f} seconds")
         # Evaluate after each epoch
         if is_main_process():
             image_encoder = ddp_model.image_encoder
@@ -289,6 +293,8 @@ def train(task_vectors, args, comp_acc={}):
                 best_acc = acc
                 best_coef = coef.data.clone()
 
+    atlas_end_time = time.time()
+    print(f"Atlas time: {atlas_end_time - atlas_start_time:.2f} seconds")
     if is_main_process():
         comp_acc[target_dataset] = best_acc
         target_dataset = target_dataset.replace("Val", "")
@@ -309,7 +315,6 @@ def train(task_vectors, args, comp_acc={}):
     if args.adapter is not None:
         comp_acc = train_adapter(
             ddp_model, ddp_loader, args, comp_acc, which=args.adapter)
-
     return comp_acc
 
 
@@ -454,6 +459,14 @@ if __name__ == "__main__":
     wrapper.add_argument("--datasets", type=str, default='CIFAR10',
                          help="Comma-separated dataset names without 'Val'")
     wrapper.add_argument("--epochs_per_task", type=int, default=10)
+    # adapter controls
+    wrapper.add_argument(
+        "--adapter",
+        type=str,
+        choices=["lpp", "tip"],
+        default=None,
+        help="Enable adapter training: choose 'lpp' or 'tip' (default: disabled)",
+    )
 
     cli_args, unknown = wrapper.parse_known_args()
     # leave unknowns for atlas_src.args.parse_arguments
@@ -492,6 +505,8 @@ if __name__ == "__main__":
         args.seed = cli_args.seed
     if cli_args.print_every is not None:
         args.print_every = cli_args.print_every
+    if hasattr(cli_args, "adapter") and cli_args.adapter is not None:
+        args.adapter = cli_args.adapter
     if cli_args.subsample is not None:
         # allow int or float
         try:
@@ -516,7 +531,7 @@ if __name__ == "__main__":
     # HACK: Some command line arguments are overwritten by defaults here.
     args.lr = 1e-1
     # We use gradient accumulation to simulate larger batch sizes if the model does not fit in memory.
-    args.batch_size = 64 if args.model == "ViT-L-14" else 128
+    # args.batch_size = 64 if args.model == "ViT-L-14" else 128
     args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
     args.print_every = 10
 

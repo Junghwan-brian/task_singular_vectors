@@ -17,7 +17,8 @@ import torch
 from src.models.task_vectors import NonLinearTaskVector
 from src.eval.aggregation import get_all_checkpoints
 from torch.nn.utils.stateless import functional_call
-from atlas_src.utils import get_n_shots, IndexWrapper
+from atlas_src.utils import get_n_shots, IndexWrapper, TIPWrapper, LPPWrapper, _RepeatSampler
+import time
 
 import math
 import torch
@@ -118,7 +119,8 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
 
             # 버퍼를 '정수 차원'으로 명시해 생성
             sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
-            # sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype) # [수정] 더 이상 sum_s 필요 없음
+            sum_s = torch.zeros((chunks,), device=device,
+                                dtype=s0.dtype)  # [수정] 더 이상 sum_s 필요 없음
             sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
 
             # 각 태스크에서 상위 k개 축만 수집
@@ -134,7 +136,7 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
                 end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
 
                 sum_u[:, start:end] = u[:, :k_i]
-                # sum_s[start:end] = s[:k_i] # [수정] 더 이상 sum_s 필요 없음
+                sum_s[start:end] = s[:k_i]  # [수정] 더 이상 sum_s 필요 없음
                 sum_v[start:end, :] = vh[:k_i, :]
 
             # 직교화(각 집합에 대해 다시 SVD → U*Vh)
@@ -170,25 +172,151 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config):
                 all_sigma_diags.append(sigma_task_diag)
 
             # 2. 모든 태스크의 sigma_task_diag를 평균냅니다.
-            if not all_sigma_diags:
-                # 엣지 케이스 방어
-                Sigma = torch.zeros(
-                    (chunks, chunks), device=device, dtype=u0.dtype)
-            else:
-                # (num_tasks, chunks)
-                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
-                # (chunks,)
-                mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
+            # (num_tasks, chunks)
+            stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
+            # (chunks,)
+            mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
 
-                # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
-                Sigma = torch.diag(mean_sigma_diag)  # (chunks, chunks)
+            # 태스크별 에너지 분산
+            # task_energy = torch.linalg.norm(
+            #     stacked_sigmas, dim=1)  # (num_tasks,)
+            # cv = (task_energy.std() / (task_energy.mean()+1e-12)).item()
+            # cv가 0.5~1.0↑면 스케일 이질성 큼 → 단순 평균 부적합
+            # print(f"CV: {cv}")
 
-            # -------- [수정된 Sigma 계산 로직 끝] --------
-
+            # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
+            Sigma = torch.diag(mean_sigma_diag)  # (chunks, chunks)
+            # Sigma = torch.diag(sum_s)
             # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
             new_vector[key] = [U_orth, Sigma, V_orth]
 
     return new_vector
+
+
+def train_adapter(ddp_model, ddp_loader, cfg, train_dataset_name, val_dataset_name, logger):
+    try:
+        # Build caches (logits/features) over the (possibly k-shot) training loader
+        ddp_model = ddp_model.to(cfg.device)
+        all_features, all_labels, all_indexes, all_logits = [], [], [], []
+        ddp_model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(ddp_loader):
+                batch = maybe_dictionarize(batch)
+                inputs = batch["images"].to(cfg.device)
+                logits, features = ddp_model(inputs, return_features=True)
+                labels = batch["labels"]
+                all_features.append(features.detach().cpu())
+                all_labels.append(labels)
+                # batch may contain 'index' when using IndexWrapper
+                if "index" in batch:
+                    all_indexes.append(batch["index"])
+                else:
+                    # fallback: synthetic incremental index
+                    if len(all_indexes) == 0:
+                        all_indexes.append(torch.arange(len(inputs)))
+                    else:
+                        start = int(torch.cat(all_indexes).numel())
+                        all_indexes.append(torch.arange(
+                            start, start + len(inputs)))
+                all_logits.append(logits.detach().cpu())
+
+        logits_cache = torch.cat(all_logits)
+        features_cache = torch.cat(all_features)
+        labels = torch.cat(all_labels)
+        indexes = torch.cat(all_indexes)
+        indexes_to_i = {indexes[i].item(): i for i in range(len(indexes))}
+
+        # Wrap model with adapter
+        adapter_model = ddp_model
+        if cfg.adapter == 'lpp':
+            shots = int(cfg.k_shot) if int(cfg.k_shot) > 0 else 0
+            adapter_model = LPPWrapper(
+                adapter_model, features_cache, labels, shots)
+            epochs = 300
+            lr = adapter_model.lr_temp
+        elif cfg.adapter == 'tip':
+            adapter_model = TIPWrapper(adapter_model, features_cache, labels)
+            lr = 1e-3
+            epochs = 10
+        else:
+            raise NotImplementedError(f"Adapter {cfg.adapter} unknown")
+
+        adapter_model = adapter_model.to(cfg.device)
+        ddp_model = adapter_model
+
+        params = [p for p in ddp_model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=cfg.sigma_wd)
+        num_batches = len(ddp_loader)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, epochs * num_batches)
+        )
+
+        loss_fn = torch.nn.CrossEntropyLoss()
+        print_every = 100
+        # repeat sampler like atlas to simulate multiple epochs
+        try:
+            ddp_loader._DataLoader__initialized = False
+            ddp_loader.batch_sampler = _RepeatSampler(
+                ddp_loader.batch_sampler, epochs)
+            ddp_loader._DataLoader__initialized = True
+        except Exception:
+            pass
+
+        ddp_model.train()
+        for i, batch in enumerate(ddp_loader):
+            epoch = i // max(1, num_batches)
+            batch = maybe_dictionarize(batch)
+            inputs = batch["images"].to(cfg.device)
+
+            # map indexes to cache positions
+            if "index" in batch:
+                ids = [indexes_to_i[j.item()] for j in batch['index']]
+            else:
+                # fallback if index missing
+                start_id = (i % len(indexes))
+                ids = list(
+                    range(start_id, min(start_id + len(inputs), len(indexes))))
+
+            l_cache, f_cache = logits_cache[ids].to(
+                inputs), features_cache[ids].to(inputs)
+
+            logits = ddp_model(inputs, l_cache, f_cache)
+            labels_b = batch["labels"].to(logits.device)
+            loss = loss_fn(logits, labels_b)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            optimizer.step()
+
+            if (i + 1) % print_every == 0:
+                logger.info(
+                    f"[adapter:{cfg.adapter}] epoch {epoch} {i + 1}/{len(ddp_loader)} loss {loss.item():.6f} lr {optimizer.param_groups[0]['lr']:.6f}")
+
+        try:
+            scheduler.step()
+        except Exception:
+            pass
+
+        # Evaluate adapter-wrapped model on validation split
+        metrics = eval_single_dataset(
+            ddp_model.model.image_encoder, val_dataset_name, cfg, model=ddp_model)
+        logger.info(
+            f"Adapter '{cfg.adapter}' Acc on {val_dataset_name}: {metrics['top1']*100:.2f}%")
+
+        # Save adapter weights (only trainable params)
+        adapter_coefs = {k: v for k, v in ddp_model.state_dict(
+        ).items() if hasattr(v, 'requires_grad') and v.requires_grad}
+        save_dir = cfg.save_dir if hasattr(
+            cfg, 'save_dir') else os.path.join(cfg.model_location, cfg.model)
+        os.makedirs(save_dir, exist_ok=True)
+        adapter_path = os.path.join(
+            save_dir, f"adapter_{train_dataset_name}_{cfg.adapter}.pt")
+        torch.save(adapter_coefs, adapter_path)
+        logger.info(f"Saved adapter weights to {adapter_path}")
+
+    except Exception as e:
+        logger.exception(f"Adapter training failed: {e}")
 
 
 @hydra.main(config_path="config", config_name="config", version_base="1.3")
@@ -214,12 +342,14 @@ def my_app(cfg: DictConfig) -> None:
         cfg.sigma_lr_gamma = float(os.environ["ENERGY_SIGMA_LR_GAMMA"])
         cfg.batch_size = int(os.environ["ENERGY_BATCH_SIZE"])
         # atlas 기본과 동일하게 디바이스 자동 선택(고정 GPU 인덱스 제거)
-        cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
+        cfg.device = "cuda:2" if torch.cuda.is_available() else "cpu"
         # few-shot 옵션 (0이면 전체 사용)
         cfg.k_shot = int(os.environ.get("ENERGY_K_SHOT", "0"))
         cfg.sigma_epochs = int(os.environ.get("ENERGY_SIGMA_EPOCHS", "5"))
         cfg.svd_keep_topk = int(os.environ.get("ENERGY_SVD_KEEP_TOPK", "3"))
         cfg.seed = int(os.environ.get("ENERGY_SEED", "1"))
+        # adapter (optional)
+        cfg.adapter = os.environ.get("ENERGY_ADAPTER", "")
 
         # override from environment variables (set by argparse in __main__)
         if os.environ.get("ENERGY_TEST_DATASET", ""):
@@ -414,13 +544,17 @@ def my_app(cfg: DictConfig) -> None:
         # capture base parameters and buffers for functional_call
         base_params = dict(model.image_encoder.named_parameters())
         base_buffers = dict(model.image_encoder.named_buffers())
-
+        energy_train_start_time = time.time()
+        print(f"batch size: {cfg.batch_size}")
+        print(f"train_loader length: {len(train_loader)}")
         for epoch in range(int(cfg.sigma_epochs)):
             model.train()
+            start_time = time.time()
             for i, batch in enumerate(train_loader):
                 batch = maybe_dictionarize(batch)
                 inputs = batch["images"].to(cfg.device)
                 labels = batch["labels"].to(cfg.device)
+                print(f"inputs shape: {inputs.shape}")
 
                 # build delta map with autograd connectivity
                 delta_map = {}
@@ -468,6 +602,8 @@ def my_app(cfg: DictConfig) -> None:
                     except Exception:
                         logger.info(
                             f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
+            epoch_time = time.time() - start_time
+            print(f"Epoch time: {epoch_time:.3f} seconds")
 
             # step scheduler at end of epoch
             scheduler.step()
@@ -499,7 +635,9 @@ def my_app(cfg: DictConfig) -> None:
                 wrapped_encoder, val_dataset_name, cfg)
             logger.info(
                 f"Epoch: {epoch} test Acc on {val_dataset_name}: {metrics['top1']*100:.2f}%")
-
+        energy_train_end_time = time.time()
+        print(
+            f"Energy train time: {energy_train_end_time - energy_train_start_time:.2f} seconds")
         # Finalize weights and save: materialize the final deltas onto base params
         with torch.no_grad():
             materialized = {}
@@ -523,6 +661,16 @@ def my_app(cfg: DictConfig) -> None:
             model.image_encoder, val_dataset_name, cfg)
         logger.info(
             f"Test Acc on {val_dataset_name}: {metrics['top1']*100:.2f}%")
+
+        # Optional: Adapter training (TIP/LPP) similar to atlas.py
+        if isinstance(cfg.adapter, str) and cfg.adapter in ("lpp", "tip"):
+            try:
+                logger.info(
+                    f"Training adapter '{cfg.adapter}' on {train_dataset_name}")
+                train_adapter(model, train_loader, cfg,
+                              train_dataset_name, val_dataset_name, logger)
+            except Exception as e:
+                logger.exception(f"Adapter training failed: {e}")
 
 
 if __name__ == "__main__":
@@ -554,6 +702,13 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_lr_gamma", type=float, default=0.5)
     parser.add_argument("--svd_keep_topk", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--adapter",
+        type=str,
+        choices=["lpp", "tip", ""],
+        default="",
+        help="Adapter to train after sigma finetuning on held-out dataset (lpp/tip)",
+    )
     # parse_known_args: leave Hydra args intact
     args, unknown = parser.parse_known_args()
 
@@ -571,4 +726,5 @@ if __name__ == "__main__":
     os.environ["ENERGY_K_SHOT"] = str(args.k_shot)
     os.environ["ENERGY_SVD_KEEP_TOPK"] = str(args.svd_keep_topk)
     os.environ["ENERGY_SEED"] = str(args.seed)
+    os.environ["ENERGY_ADAPTER"] = args.adapter if args.adapter is not None else ""
     my_app()
