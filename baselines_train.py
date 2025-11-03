@@ -15,7 +15,7 @@ from src.utils.variables_and_paths import ALL_DATASETS, get_finetuned_path
 from src.datasets import get_dataloader, get_dataset, maybe_dictionarize
 from src.eval.eval import eval_single_dataset
 from src.models import ImageClassifier, ImageEncoder, get_classification_head
-from atlas_src.utils import get_n_shots, IndexWrapper, TIPWrapper, LPPWrapper, _RepeatSampler
+from atlas_src.utils import get_n_shots, IndexWrapper, TIPWrapper, LPPWrapper
 
 
 class LoRALinear(torch.nn.Module):
@@ -267,10 +267,15 @@ def train_tip_or_lpp(model, train_loader, cfg, train_dataset_name, logger, adapt
         epochs = 300
         # device로 먼저 이동한 후 optimizer 생성
         adapter_model = adapter_model.to(cfg.device)
-        # LPP는 adapter와 alpha_vec에 대해 서로 다른 learning rate 사용
+        # energy_train과 동일하게 alpha_vec은 고정, adapter만 학습
+        try:
+            if hasattr(adapter_model, 'alpha_vec') and getattr(adapter_model.alpha_vec, 'requires_grad', None) is not False:
+                adapter_model.alpha_vec.requires_grad = False
+        except Exception:
+            pass
+        # adapter 파라미터만 학습 (lr_temp 사용)
         param_groups = [
-            {'params': adapter_model.adapter.parameters(), 'lr': adapter_model.lr_temp},
-            {'params': [adapter_model.alpha_vec], 'lr': adapter_model.lr_alpha}
+            {'params': adapter_model.adapter.parameters(), 'lr': adapter_model.lr_temp}
         ]
     elif adapter == 'tip':
         adapter_model = TIPWrapper(adapter_model, features_cache, labels)
@@ -314,7 +319,11 @@ def train_tip_or_lpp(model, train_loader, cfg, train_dataset_name, logger, adapt
 
             l_cache, f_cache = logits_cache[ids].to(
                 inputs), features_cache[ids].to(inputs)
-            logits = adapter_model(inputs, l_cache, f_cache)
+            # LPP는 현재 배치의 피처로 학습하는 것이 안전함(캐시-라벨 불일치 방지)
+            if adapter == 'lpp':
+                logits = adapter_model(inputs)
+            else:
+                logits = adapter_model(inputs, l_cache, f_cache)
             labels_b = batch["labels"].to(logits.device)
             loss = loss_fn(logits, labels_b)
 
