@@ -215,6 +215,8 @@ class TIPWrapper(torch.nn.Module):
         self.adapter = torch.nn.Linear(
             features_cache.shape[0], features_cache.shape[1], bias=False)
         self.adapter.weight.data = features_cache.t()
+        # TIP에서는 캐시 어댑터 가중치를 고정하고 beta/alpha만 학습
+        self.adapter.weight.requires_grad_(False)
         self.beta_alpha = torch.nn.Parameter(torch.tensor([1., 2.]))
         self.labels = torch.nn.functional.one_hot(labels.long())
         print("Num classes", self.model.classification_head.weight.shape[0])

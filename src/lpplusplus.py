@@ -16,8 +16,12 @@ def calculate_init_alpha(features, labels, shots, clip_weights):
     # init_alpha
     alpha_tilde = compute_centroids_alpha(
         (features @ clip_weights.to(features)).unsqueeze(0), labels.unsqueeze(0))[0]
-    alpha_tilde = alpha_tilde.double() * shots
-    alpha_init = 250 / shots * alpha_tilde
+    alpha_tilde = alpha_tilde.double() * max(1, shots)  # shots가 0일 때를 위한 보호
+    # shots가 0이면 전체 데이터셋 사용, 작은 alpha 사용
+    if shots == 0:
+        alpha_init = alpha_tilde  # 전체 데이터셋이므로 스케일링 최소화
+    else:
+        alpha_init = 250 / shots * alpha_tilde
     final_init_alpha_mean = torch.mean(alpha_init)
     return final_init_alpha_mean
 
