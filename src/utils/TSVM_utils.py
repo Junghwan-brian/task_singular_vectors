@@ -586,8 +586,7 @@ def compute_and_sum_svd_mem_reduction_dummy(task_vectors, config):
                         ]
                     else:
                         # generate u vectors orthogonal to the previous ones
-                        # generate v vectors orthogonal to the previous ones
-                        print("dummy")
+
                         u = torch.nn.functional.normalize(
                             torch.randn_like(sum_u), p=2, dim=-2
                         )

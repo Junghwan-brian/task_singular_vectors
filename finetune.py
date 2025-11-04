@@ -27,8 +27,7 @@ def finetune(rank, args):
 
     train_dataset = args.train_dataset
 
-    ft_path = get_finetuned_path(
-        args.model_location, train_dataset, args.model)
+    ft_path = get_finetuned_path(args.model_location, train_dataset, args.model)
     zs_path = get_zeroshot_path(args.model_location, train_dataset, args.model)
 
     if os.path.exists(zs_path) and os.path.exists(ft_path):

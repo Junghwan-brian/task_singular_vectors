@@ -6,7 +6,6 @@ media/*
 *.log
 *.pyc
 *.pth
-*.yaml
 logs/*
 *.png
 *.jpg
@@ -14,3 +13,6 @@ logs/*
 *.npy
 datasets/*
 *.json
+*.pt
+*.txt
+*.csv

@@ -13,7 +13,7 @@ from src.datasets.dtd import DTD
 from src.datasets.emnist import EMNIST
 from src.datasets.eurosat import EuroSAT, EuroSATVal
 from src.datasets.fashionmnist import FashionMNIST
-from src.datasets.fer2013 import FER2013
+# from src.datasets.fer2013 import FER2013
 from src.datasets.flowers102 import Flowers102
 from src.datasets.food101 import Food101
 from src.datasets.gtsrb import GTSRB

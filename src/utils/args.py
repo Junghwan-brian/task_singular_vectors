@@ -42,6 +42,11 @@ def parse_arguments():
         default="ViT-B-32",
         help="The type of model (e.g. RN50, ViT-B-32).",
     )
+    parser.add_argument(
+        "--run-all",
+        action="store_true",
+        help="Fine-tune all supported remote sensing models sequentially.",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
         "--num-grad-accumulation",
