@@ -23,6 +23,13 @@ from tqdm.auto import tqdm
 # Disable problematic attention backends that cause "No execution plans support the graph" error
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_cudnn_sdp(False)
+# Additional cuDNN settings for H100 compatibility
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+# Set cuDNN benchmark to False for stability
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
