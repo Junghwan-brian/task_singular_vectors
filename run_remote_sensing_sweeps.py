@@ -197,18 +197,36 @@ REMOTE_SENSING_DATASETS = {
     "WHU-RS19": 150,
 }
 
+DATASETS_ALL = {
+    "DTD": 76,
+    "GTSRB": 11,
+    "MNIST": 5,
+    "SVHN": 4,
+    "CIFAR10": 6,
+    "CIFAR100": 6,
+    "STL10": 60,
+    "Food101": 4,
+    "Flowers102": 147,
+    "PCAM": 1,
+    "OxfordIIITPet": 82,
+    "RenderedSST2": 39,
+    "EMNIST": 2,
+    "FashionMNIST": 5,
+    "KMNIST": 5,
+}
+
 
 GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
-ENERGY_MODELS = ["ViT-B-16", "ViT-B-32", "ViT-L-14"]
-ENERGY_INITIALIZE_SIGMA = ["tsvm", "average"]
-ENERGY_ADAPTERS = ["none", "lp++", "tip"]
-ENERGY_K = [1, 2, 4, 8, 16]
-ENERGY_SVD_KEEP_TOPK = [5, 7]
+ENERGY_MODELS = ["ViT-B-16"]
+ENERGY_INITIALIZE_SIGMA = ["average"]
+ENERGY_ADAPTERS = ["none"]
+ENERGY_K = [16]
+ENERGY_SVD_KEEP_TOPK = [5]
 ENERGY_SIGMA_LR = [1e-3]
 
-ATLAS_MODELS = ["ViT-B-16", "ViT-B-32", "ViT-L-14"]
+ATLAS_MODELS = ["ViT-B-16"]
 ATLAS_ADAPTERS = ["none", "lp++", "tip"]
-ATLAS_K = [1, 2, 4, 8, 16]
+ATLAS_K = [16]
 
 def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
     commands: List[List[str]] = []
@@ -238,7 +256,7 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             continue
         cmd = [
             sys.executable,
-            "energy_train_remote_sensing.py",
+            "energy_train_reverse.py",
             "--model",
             model,
             "--initialize_sigma",
@@ -279,7 +297,7 @@ def build_atlas_commands(datasets: Sequence[str]) -> List[List[str]]:
             continue
         cmd = [
             sys.executable,
-            "atlas_remote_sensing.py",
+            "atlas_reverse.py",
             "--model",
             model,
             "--k",
@@ -384,12 +402,13 @@ def main() -> None:
     parser.add_argument(
         "--per-gpu",
         type=int,
-        default=4,
+        default=8,
         help="Number of commands to run concurrently on each GPU",
     )
     args = parser.parse_args()
 
-    datasets = sorted(REMOTE_SENSING_DATASETS.keys())
+    # datasets = sorted(REMOTE_SENSING_DATASETS.keys())
+    datasets = sorted(DATASETS_ALL.keys())
 
     commands: List[List[str]] = []
     if not args.skip_energy:

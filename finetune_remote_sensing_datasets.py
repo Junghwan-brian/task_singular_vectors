@@ -331,22 +331,22 @@ if __name__ == "__main__":
     # Single-Label Datasets (standard image classification)
     # ============================================================================
     train_datasets_single = [
-        "AID",              # ImageFolder
-        "CLRS",             # Parquet: single 'label' column
-        "EuroSAT_RGB",      # Parquet: single 'label' column
-        "MLRSNet",          # ImageFolder
-        "NWPU-RESISC45",    # Parquet: single 'label' column
-        "Optimal-31",       # Parquet: single 'label' column
-        "PatternNet",       # Parquet: single 'label' column
-        "RS_C11",           # Parquet: single 'label' column
-        "RSD46-WHU",        # Parquet: single 'label' column
+        # "AID",              # ImageFolder
+        # "CLRS",             # Parquet: single 'label' column
+        # "EuroSAT_RGB",      # Parquet: single 'label' column
+        # "MLRSNet",          # ImageFolder
+        # "NWPU-RESISC45",    # Parquet: single 'label' column
+        # "Optimal-31",       # Parquet: single 'label' column
+        # "PatternNet",       # Parquet: single 'label' column
+        # "RS_C11",           # Parquet: single 'label' column
+        # "RSD46-WHU",        # Parquet: single 'label' column
         "RSI-CB128",        # ImageFolder (45 classes)
-        "RSSCN7",           # ImageFolder
-        "SAT-4",            # Parquet: single 'label' column
-        "SAT-6",            # Parquet: single 'label' column
-        "SIRI-WHU",         # Parquet: single 'label' column
-        "UC_Merced",        # Parquet: single 'label' column
-        "WHU-RS19",         # Parquet: single 'label' column
+        # "RSSCN7",           # ImageFolder
+        # "SAT-4",            # Parquet: single 'label' column
+        # "SAT-6",            # Parquet: single 'label' column
+        # "SIRI-WHU",         # Parquet: single 'label' column
+        # "UC_Merced",        # Parquet: single 'label' column
+        # "WHU-RS19",         # Parquet: single 'label' column
     ]
     
     # ============================================================================
@@ -444,7 +444,7 @@ if __name__ == "__main__":
                 args.world_size = torch.cuda.device_count()
 
                 if not batch_size_overridden:
-                    args.batch_size = 128 if args.model == "ViT-L-14" else 512
+                    args.batch_size = 1024 if args.model == "ViT-L-14" else 2048
                 args.num_grad_accumulation = 2 if args.model == "ViT-L-14" else 1
 
                 print("\n" + "=" * 100)

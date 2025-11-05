@@ -92,27 +92,27 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     return logger
 
 # Dataset-specific epochs for Atlas training (general datasets)
-ATLAS_EPOCHS_PER_DATASET = {
-    "Cars": 10,
-    "CIFAR10": 5,
-    "CIFAR100": 10,
-    "DTD": 15,
-    "EMNIST": 5,
-    "EuroSAT": 15,
-    "FashionMNIST": 5,
-    "FER2013": 10,
-    "Flowers102": 15,
-    "Food101": 10,
-    "GTSRB": 10,
-    "KMNIST": 5,
+{
+    # "Cars": 35,
+    "DTD": 76,
+    # "EuroSAT": 12,
+    "GTSRB": 11,
     "MNIST": 5,
-    "OxfordIIITPet": 15,
-    "PCAM": 10,
-    "RenderedSST2": 10,
-    "RESISC45": 15,
-    "STL10": 10,
-    "SUN397": 10,
-    "SVHN": 5,
+    # "RESISC45": 15,
+    # "SUN397": 14,
+    "SVHN": 4,
+    "CIFAR10": 6,
+    "CIFAR100": 6,
+    "STL10": 60,
+    "Food101": 4,
+    "Flowers102": 147,
+    "FER2013": 10,
+    "PCAM": 1,
+    "OxfordIIITPet": 82,
+    "RenderedSST2": 39,
+    "EMNIST": 2,
+    "FashionMNIST": 5,
+    "KMNIST": 5,
 }
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:

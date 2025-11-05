@@ -40,7 +40,7 @@ def cleanup_dataset_name(dataset_name: str):
 
 
 def get_zeroshot_path(root, dataset, model):
-    return Path(root, model, cleanup_dataset_name(dataset), f"nonlinear_zeroshot.pt").as_posix()
+    return Path(root, model, f"nonlinear_zeroshot.pt").as_posix()
 
 
 def get_finetuned_path(root, dataset, model):
