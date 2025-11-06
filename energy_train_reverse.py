@@ -29,6 +29,7 @@ from src.utils.utils import cosine_lr
 from atlas_reverse import train_adapter
 
 from src.datasets.remote_sensing import sample_k_shot_indices
+from src.eval.eval_remote_sensing_comparison import visualize_sigma_matrices
 
 
 def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
@@ -861,6 +862,12 @@ def run_energy(cfg: DictConfig) -> None:
             eval_counter += 1
             return record
 
+        # Prepare visualization directory
+        visualization_dir = os.path.join(
+            energy_save_dir, f"sigma_visualization_{adapter_tag}"
+        )
+        os.makedirs(visualization_dir, exist_ok=True)
+
         # Log zeroshot accuracy before any sigma updates
         model.eval()
         with torch.no_grad():
@@ -886,6 +893,17 @@ def run_energy(cfg: DictConfig) -> None:
             record_validation("zeroshot", -1, zeroshot_acc)
             model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
+        sigma_records = []
+        records = visualize_sigma_matrices(
+            sigma_modules,
+            sigma_key_map,
+            epoch=-1,
+            save_path=os.path.join(visualization_dir, "sigma_epoch_-1.png"),
+            title=f"{test_ds} ({shot_folder})",
+            json_path=os.path.join(visualization_dir, "sigma_epoch_-1.json"),
+        )
+        if records:
+            sigma_records.extend(records)
         model.train()
         
         logger.info(f"Starting sigma fine-tuning for {cfg.sigma_epochs} epochs...")
@@ -983,6 +1001,16 @@ def run_energy(cfg: DictConfig) -> None:
 
                     model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
+                records = visualize_sigma_matrices(
+                    sigma_modules,
+                    sigma_key_map,
+                    epoch=epoch,
+                    save_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.png"),
+                    title=f"{test_ds} ({shot_folder})",
+                    json_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.json"),
+                )
+                if records:
+                    sigma_records.extend(records)
                 model.train()
 
         # Finalize weights and save: materialize the final deltas onto base params
@@ -1027,6 +1055,17 @@ def run_energy(cfg: DictConfig) -> None:
         if torch.cuda.is_available():
             gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
             logger.info(f"Peak GPU memory during training: {gpu_peak_mem_mb:.2f} MB")
+
+        records = visualize_sigma_matrices(
+            sigma_modules,
+            sigma_key_map,
+            epoch="final",
+            save_path=os.path.join(visualization_dir, "sigma_epoch_final.png"),
+            title=f"{test_ds} ({shot_folder})",
+            json_path=os.path.join(visualization_dir, "sigma_epoch_final.json"),
+        )
+        if records:
+            sigma_records.extend(records)
 
         # Optional adapter fine-tuning (TIP / LP++) after sigma training
         adapter_summary = None
