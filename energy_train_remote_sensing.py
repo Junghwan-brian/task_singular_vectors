@@ -154,6 +154,40 @@ def load_k_shot_indices(save_dir, k, seed):
     return None
 
 
+def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
+    """Subsample target_k indices per class from a larger k-shot set.
+    
+    This is much faster than re-sampling from the entire dataset.
+    Uses deterministic selection (first target_k samples per class).
+    """
+    import numpy as np
+    
+    # Extract labels for the larger indices
+    labels = []
+    for idx in larger_indices:
+        _, label = dataset[idx]
+        if torch.is_tensor(label):
+            label = label.item()
+        elif isinstance(label, np.ndarray):
+            label = int(label)
+        labels.append(int(label))
+    
+    # Group indices by class
+    class_to_indices = {}
+    for idx, label in zip(larger_indices, labels):
+        if label not in class_to_indices:
+            class_to_indices[label] = []
+        class_to_indices[label].append(idx)
+    
+    # Select first target_k from each class (deterministic)
+    selected_indices = []
+    for label in sorted(class_to_indices.keys()):
+        class_indices = class_to_indices[label][:target_k]
+        selected_indices.extend(class_indices)
+    
+    return selected_indices
+
+
 # Dataset-specific epochs for sigma training
 # These match the fine-tuning epochs from finetune_remote_sensing_datasets.py
 SIGMA_EPOCHS_PER_DATASET = {
@@ -186,7 +220,7 @@ def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
     return eval_epochs
 
 
-def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
+def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
     """
     여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
     각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
@@ -599,13 +633,13 @@ def run_energy(cfg: DictConfig) -> None:
 
     # create final task vector with timing
     svd_start = time.time()
-    init_mode = getattr(cfg, "initialize_sigma", "average").lower()
+    init_mode = getattr(cfg, "initialize_sigma", "sum").lower()
     if init_mode == "tsvm":
         logger.info("Using TSVM SVD initialization")
         svd_dict = compute_and_sum_svd_mem_reduction_tsvm(task_vectors, cfg)
-    elif init_mode == "average":
+    elif init_mode == "sum":
         logger.info("Using average SVD initialization")
-        svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
+        svd_dict = compute_and_sum_svd_mem_reduction_sum(task_vectors, cfg)
     else:
         logger.info("Using TIES SVD initialization")
         svd_dict = compute_and_sum_svd_mem_reduction_weighted(task_vectors, cfg)
@@ -720,24 +754,48 @@ def run_energy(cfg: DictConfig) -> None:
                 # Create directory for saving indices
                 indices_save_dir = os.path.join(cfg.model_location, cfg.model, val_dataset_name)
                 
-                # Try to load existing indices
+                # Try to load existing k-shot indices
                 selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
                 
                 if selected_indices is not None:
                     logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
                 else:
-                    # Sample new indices
-                    logger.info(f"Sampling new {k}-shot indices (seed={seed})")
-                    selected_indices = sample_k_shot_indices(
-                        dataset_train,
-                        k,
-                        seed=seed,
-                        verbose=True,
-                        progress_desc=f"{val_dataset_name} {k}-shot",
-                    )
-                    # Save the indices for future use
-                    indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
-                    logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                    # Try to subsample from larger k (e.g., 16-shot)
+                    larger_k = 16
+                    if k < larger_k:
+                        larger_indices = load_k_shot_indices(indices_save_dir, larger_k, seed)
+                        if larger_indices is not None:
+                            logger.info(f"✓ Subsampling from existing {larger_k}-shot indices to {k}-shot")
+                            selected_indices = subsample_from_larger_k(larger_indices, dataset_train, k, seed)
+                            # Save for future use
+                            indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                            logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                        else:
+                            # Sample new indices from scratch
+                            logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                            selected_indices = sample_k_shot_indices(
+                                dataset_train,
+                                k,
+                                seed=seed,
+                                verbose=True,
+                                progress_desc=f"{val_dataset_name} {k}-shot",
+                            )
+                            # Save the indices for future use
+                            indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                            logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                    else:
+                        # k >= larger_k, need to sample from scratch
+                        logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                        selected_indices = sample_k_shot_indices(
+                            dataset_train,
+                            k,
+                            seed=seed,
+                            verbose=True,
+                            progress_desc=f"{val_dataset_name} {k}-shot",
+                        )
+                        # Save the indices for future use
+                        indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
                 
                 # Get base dataset
                 base_dataset = getattr(dataset_train, "train_dataset", None)
@@ -1148,7 +1206,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initialize_sigma",
         type=str,
-        choices=["average", "tsvm", "weighted"],
+        choices=["sum", "tsvm", "weighted"],
         help="Initialization strategy for sigma basis"
     )
     

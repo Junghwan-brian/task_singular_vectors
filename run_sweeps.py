@@ -36,7 +36,7 @@ import time
 from typing import Iterable, List, Sequence
 
 
-def _load_remote_config() -> dict:
+def _load_config() -> dict:
     config_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
     try:
         import yaml  # type: ignore
@@ -50,12 +50,12 @@ def _load_remote_config() -> dict:
     return {}
 
 
-REMOTE_CFG = _load_remote_config()
+CFG = _load_config()
 
 
 def _resolve_model_root() -> str:
     default_root = os.path.join(".", "models", "checkpoints_remote_sensing")
-    raw_root = REMOTE_CFG.get("model_location", default_root) if isinstance(REMOTE_CFG, dict) else default_root
+    raw_root = CFG.get("model_location", default_root) if isinstance(CFG, dict) else default_root
     return os.path.expanduser(raw_root)
 
 
@@ -87,15 +87,15 @@ def _path_exists(path: str) -> bool:
 
 
 def _datasets_all_from_config() -> Sequence[str]:
-    candidates = REMOTE_CFG.get("DATASETS_ALL") if isinstance(REMOTE_CFG, dict) else None
+    candidates = CFG.get("DATASETS_ALL") if isinstance(CFG, dict) else None
     if isinstance(candidates, (list, tuple)):
         return list(candidates)
-    return list(REMOTE_SENSING_DATASETS.keys())
+    return list(DATASETS_ALL.keys())
 
 
 def _atlas_default_lr() -> float:
-    if isinstance(REMOTE_CFG, dict):
-        value = REMOTE_CFG.get("lr")
+    if isinstance(CFG, dict):
+        value = CFG.get("lr")
         if value is not None:
             try:
                 return float(value)
@@ -104,11 +104,11 @@ def _atlas_default_lr() -> float:
     return 1e-1
 
 
-def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int) -> str:
+def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int, warmup_ratio: float) -> str:
     datasets_all = _datasets_all_from_config()
     configured_tasks = None
-    if isinstance(REMOTE_CFG, dict):
-        configured_tasks = REMOTE_CFG.get("num_tasks")
+    if isinstance(CFG, dict):
+        configured_tasks = CFG.get("num_tasks")
     candidate = configured_tasks if configured_tasks is not None else len(datasets_all)
     try:
         candidate_int = int(candidate)
@@ -116,11 +116,12 @@ def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int) -> str:
         candidate_int = len(datasets_all)
     num_tasks_minus_one = max(candidate_int - 1, 0)
     init_value = (init_mode or "average").strip().lower()
-    return "energy_{}_{}_{}_{}".format(
+    return "energy_{}_{}_{}_{}_{}".format(
         _sanitize_value(num_tasks_minus_one),
         _sanitize_value(sigma_lr),
         _sanitize_value(topk),
         _sanitize_value(init_value),
+        _sanitize_value(warmup_ratio),
     )
 
 
@@ -145,11 +146,13 @@ def _expected_energy_paths(
     sigma_lr: float,
     topk: int,
     k: int,
+    warmup_ratio: float,
 ) -> tuple[str, str]:
     sigma_lr = float(sigma_lr)
     topk = int(topk)
     k = int(k)
-    config_tag = _energy_config_tag(init_mode, sigma_lr, topk)
+    warmup_ratio = float(warmup_ratio)
+    config_tag = _energy_config_tag(init_mode, sigma_lr, topk, warmup_ratio)
     adapter_tag = _adapter_tag(adapter)
     dataset_dir = f"{dataset}Val"
     base_dir = os.path.join(MODEL_ROOT, model, dataset_dir, config_tag, _shot_folder(k))
@@ -196,11 +199,12 @@ DATASETS_ALL = {
 
 GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
 ENERGY_MODELS = ["ViT-B-16"]
-ENERGY_INITIALIZE_SIGMA = ["average"]
+ENERGY_INITIALIZE_SIGMA = ["average", "sum"]
 ENERGY_ADAPTERS = ["none"]
 ENERGY_K = [16]
 ENERGY_SVD_KEEP_TOPK = [5]
 ENERGY_SIGMA_LR = [1e-3]
+ENERGY_WARMUP_RATIO = [0.1]
 
 ATLAS_MODELS = ["ViT-B-16"]
 ATLAS_ADAPTERS = ["none", "lp++", "tip"]
@@ -208,7 +212,7 @@ ATLAS_K = [16]
 
 def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
     commands: List[List[str]] = []
-    for model, init_mode, adapter, dataset, k, topk, sigma_lr in itertools.product(
+    for model, init_mode, adapter, dataset, k, topk, sigma_lr, warmup_ratio in itertools.product(
         ENERGY_MODELS,
         ENERGY_INITIALIZE_SIGMA,
         ENERGY_ADAPTERS,
@@ -216,6 +220,7 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
         ENERGY_K,
         ENERGY_SVD_KEEP_TOPK,
         ENERGY_SIGMA_LR,
+        ENERGY_WARMUP_RATIO,
     ):
         _, results_json = _expected_energy_paths(
             model=model,
@@ -225,10 +230,11 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             sigma_lr=sigma_lr,
             topk=topk,
             k=int(k),
+            warmup_ratio=warmup_ratio,
         )
         if _path_exists(results_json):
             print(
-                f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}) -> {results_json}",
+                f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, warmup={warmup_ratio}) -> {results_json}",
                 flush=True,
             )
             continue
@@ -247,6 +253,8 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             str(topk),
             "--sigma_lr",
             f"{sigma_lr:.6g}",
+            "--warmup_ratio",
+            f"{warmup_ratio:.6g}",
             "--adapter",
             adapter,
         ]
@@ -385,8 +393,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    datasets = sorted(REMOTE_SENSING_DATASETS.keys())
-    # datasets = sorted(DATASETS_ALL.keys())
+    # datasets = sorted(REMOTE_SENSING_DATASETS.keys())
+    datasets = sorted(DATASETS_ALL.keys())
 
     commands: List[List[str]] = []
     if not args.skip_energy:

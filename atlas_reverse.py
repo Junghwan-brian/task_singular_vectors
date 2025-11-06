@@ -76,6 +76,40 @@ def load_k_shot_indices(save_dir, k, seed):
     return None
 
 
+def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
+    """Subsample target_k indices per class from a larger k-shot set.
+    
+    This is much faster than re-sampling from the entire dataset.
+    Uses deterministic selection (first target_k samples per class).
+    """
+    import numpy as np
+    
+    # Extract labels for the larger indices
+    labels = []
+    for idx in larger_indices:
+        _, label = dataset[idx]
+        if torch.is_tensor(label):
+            label = label.item()
+        elif isinstance(label, np.ndarray):
+            label = int(label)
+        labels.append(int(label))
+    
+    # Group indices by class
+    class_to_indices = {}
+    for idx, label in zip(larger_indices, labels):
+        if label not in class_to_indices:
+            class_to_indices[label] = []
+        class_to_indices[label].append(idx)
+    
+    # Select first target_k from each class (deterministic)
+    selected_indices = []
+    for label in sorted(class_to_indices.keys()):
+        class_indices = class_to_indices[label][:target_k]
+        selected_indices.extend(class_indices)
+    
+    return selected_indices
+
+
 def _sanitize_value(val):
     if isinstance(val, float):
         val = f"{val:.6g}"
@@ -615,24 +649,48 @@ def train_single_task(args, comp_acc=None, logger=None):
             # Create directory for saving indices
             indices_save_dir = os.path.join(args.model_location, args.model, target_dataset)
             
-            # Try to load existing indices
+            # Try to load existing k-shot indices
             selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
             
             if selected_indices is not None:
                 logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
             else:
-                # Sample new indices
-                logger.info(f"Sampling new {k}-shot indices (seed={seed})")
-                selected_indices = sample_k_shot_indices(
-                    train_dataset,
-                    k,
-                    seed=seed,
-                    verbose=True,
-                    progress_desc=f"{target_dataset} {k}-shot",
-                )
-                # Save the indices for future use
-                indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
-                logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                # Try to subsample from larger k (e.g., 16-shot)
+                larger_k = 16
+                if k < larger_k:
+                    larger_indices = load_k_shot_indices(indices_save_dir, larger_k, seed)
+                    if larger_indices is not None:
+                        logger.info(f"✓ Subsampling from existing {larger_k}-shot indices to {k}-shot")
+                        selected_indices = subsample_from_larger_k(larger_indices, train_dataset, k, seed)
+                        # Save for future use
+                        indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                    else:
+                        # Sample new indices from scratch
+                        logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                        selected_indices = sample_k_shot_indices(
+                            train_dataset,
+                            k,
+                            seed=seed,
+                            verbose=True,
+                            progress_desc=f"{target_dataset} {k}-shot",
+                        )
+                        # Save the indices for future use
+                        indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                else:
+                    # k >= larger_k, need to sample from scratch
+                    logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                    selected_indices = sample_k_shot_indices(
+                        train_dataset,
+                        k,
+                        seed=seed,
+                        verbose=True,
+                        progress_desc=f"{target_dataset} {k}-shot",
+                    )
+                    # Save the indices for future use
+                    indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
+                    logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
             
             base_dataset = getattr(train_dataset, "train_dataset", None)
             if base_dataset is None:

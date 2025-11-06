@@ -50,6 +50,40 @@ def load_k_shot_indices(save_dir, k, seed):
     return None
 
 
+def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
+    """Subsample target_k indices per class from a larger k-shot set.
+    
+    This is much faster than re-sampling from the entire dataset.
+    Uses deterministic selection (first target_k samples per class).
+    """
+    import numpy as np
+    
+    # Extract labels for the larger indices
+    labels = []
+    for idx in larger_indices:
+        _, label = dataset[idx]
+        if torch.is_tensor(label):
+            label = label.item()
+        elif isinstance(label, np.ndarray):
+            label = int(label)
+        labels.append(int(label))
+    
+    # Group indices by class
+    class_to_indices = {}
+    for idx, label in zip(larger_indices, labels):
+        if label not in class_to_indices:
+            class_to_indices[label] = []
+        class_to_indices[label].append(idx)
+    
+    # Select first target_k from each class (deterministic)
+    selected_indices = []
+    for label in sorted(class_to_indices.keys()):
+        class_indices = class_to_indices[label][:target_k]
+        selected_indices.extend(class_indices)
+    
+    return selected_indices
+
+
 
 class AdapterCompatibleClassifier(torch.nn.Module):
     """Wrap an ImageClassifier to expose return_features inference for adapters."""
@@ -180,6 +214,119 @@ def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
     }
     return eval_epochs
 
+def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
+    """
+    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
+    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
+    '재계산된 평균' sigma(diag)로 재구성.
+    """
+    device = config.device
+    datasets = list(config.DATASETS)
+    num_tasks = int(len(datasets))
+    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
+    with torch.no_grad():
+        new_vector = {}
+        # 공통 필터 함수(임베딩류 제외)
+        def is_matrix_key(tv0, key):
+            return (
+                tv0.vector[key].ndim == 2 and
+                all(t not in key for t in ("text_projection",
+                    "positional", "token_embedding"))
+            )
+        # 키 순회
+        tv0 = task_vectors[0]
+        for key in tv0.vector:
+            # 2D 행렬이 아니거나 제외 키면: 단순 평균
+            if not is_matrix_key(tv0, key):
+                avg = None
+                for i, tv in enumerate(task_vectors):
+                    vec = tv.vector[key].to(device)
+                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
+                new_vector[key] = avg
+                continue
+            # -------- SVD 축 모으기 준비 --------
+            # 첫 태스크에서 모양/순위 파악
+            vec0 = task_vectors[0].vector[key].to(device)
+            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
+            m = int(u0.shape[0])
+            r = int(s0.shape[0])          # 유효 랭크 상한
+            n = int(vh0.shape[1])
+            if r == 0:
+                # 드물지만 0-rank 보호장치
+                new_vector[key] = torch.zeros_like(vec0)
+                continue
+            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
+            num_used = min(num_tasks, r)
+            # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
+            # k = max(1, r // num_used)
+            max_per_task = max(1, r // num_used)
+            k = min(desired_k, max_per_task)
+            if desired_k > max_per_task:
+                print(
+                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
+                    desired_k,
+                    max_per_task,
+                    key,
+                    k,
+                )
+            chunks = int(k * num_used)    # <= r 보장
+            # print(f"chunks: {chunks}")
+            # 버퍼를 '정수 차원'으로 명시해 생성
+            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
+            # sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype) # [수정] 더 이상 sum_s 필요 없음
+            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
+            # 각 태스크에서 상위 k개 축만 수집
+            for i, tv in enumerate(task_vectors[:num_used]):
+                vec = tv.vector[key].to(device)
+                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
+                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
+                r_i = int(s.shape[0])
+                k_i = min(k, r_i)  # 안전 클램프
+                start = i * k
+                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
+                sum_u[:, start:end] = u[:, :k_i]
+                # sum_s[start:end] = s[:k_i] # [수정] 더 이상 sum_s 필요 없음
+                sum_v[start:end, :] = vh[:k_i, :]
+            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
+            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
+            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
+            U_orth = u_u @ vh_u          # (m × chunks)
+            V_orth = u_v @ vh_v          # (chunks × n)
+            # -------- [수정된 Sigma 계산 로직 시작] --------
+            # 1. 각 태스크 벡터(M_i)를 공통 기저(U_orth, V_orth)로 투영하여
+            #    최적의 대각 행렬(sigma_task)을 찾습니다.
+            #    M_i ≈ U_orth @ Sigma_i @ V_orth 이므로,
+            #    Sigma_i' = U_orth.T @ M_i @ V_orth.T 를 계산합니다.
+            all_sigma_diags = []
+            # U_orth (m, chunks) -> U_orth.T (chunks, m)
+            # V_orth (chunks, n) -> V_orth.T (n, chunks)
+            U_orth_T = U_orth.T
+            V_orth_T = V_orth.T
+            # "모든" 태스크 벡터에 대해 반복 (num_used 뿐만 아니라)
+            for tv in task_vectors:
+                M_i = tv.vector[key].to(device)  # 원본 태스크 행렬 (m, n)
+                # Sigma_i_prime = (U_orth.T @ M_i) @ V_orth.T
+                # (chunks, m) @ (m, n) @ (n, chunks) -> (chunks, chunks)
+                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T
+                # "이를 diagonal로 만들도록 해야해" -> 대각 성분만 추출
+                sigma_task_diag = torch.diag(Sigma_i_prime)  # (chunks,)
+                all_sigma_diags.append(sigma_task_diag)
+            # 2. 모든 태스크의 sigma_task_diag를 평균냅니다.
+            if not all_sigma_diags:
+                # 엣지 케이스 방어
+                Sigma = torch.zeros(
+                    (chunks, chunks), device=device, dtype=u0.dtype)
+            else:
+                # (num_tasks, chunks)
+                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
+                # (chunks,)
+                mean_sigma_diag = torch.sum(stacked_sigmas, dim=0)
+                # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
+                Sigma = torch.diag(mean_sigma_diag)   # (chunks, chunks)
+            # -------- [수정된 Sigma 계산 로직 끝] --------
+            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
+            new_vector[key] = [U_orth, Sigma, V_orth]
+    return new_vector
 
 def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
     """
@@ -481,6 +628,9 @@ def run_energy(cfg: DictConfig) -> None:
     elif init_mode == "average":
         logger.info("Using average SVD initialization")
         svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
+    elif init_mode == "sum":
+        logger.info("Using sum SVD initialization")
+        svd_dict = compute_and_sum_svd_mem_reduction_sum(task_vectors, cfg)
     svd_time = time.time() - svd_start
     logger.info(f"Computed SVD bases in {svd_time:.2f}s")
 
@@ -591,24 +741,48 @@ def run_energy(cfg: DictConfig) -> None:
                 # Create directory for saving indices
                 indices_save_dir = os.path.join(cfg.model_location, cfg.model, val_dataset_name)
                 
-                # Try to load existing indices
+                # Try to load existing k-shot indices
                 selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
                 
                 if selected_indices is not None:
                     logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
                 else:
-                    # Sample new indices
-                    logger.info(f"Sampling new {k}-shot indices (seed={seed})")
-                    selected_indices = sample_k_shot_indices(
-                        dataset_train,
-                        k,
-                        seed=seed,
-                        verbose=True,
-                        progress_desc=f"{test_ds} {k}-shot",
-                    )
-                    # Save the indices for future use
-                    indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
-                    logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                    # Try to subsample from larger k (e.g., 16-shot)
+                    larger_k = 16
+                    if k < larger_k:
+                        larger_indices = load_k_shot_indices(indices_save_dir, larger_k, seed)
+                        if larger_indices is not None:
+                            logger.info(f"✓ Subsampling from existing {larger_k}-shot indices to {k}-shot")
+                            selected_indices = subsample_from_larger_k(larger_indices, dataset_train, k, seed)
+                            # Save for future use
+                            indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                            logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                        else:
+                            # Sample new indices from scratch
+                            logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                            selected_indices = sample_k_shot_indices(
+                                dataset_train,
+                                k,
+                                seed=seed,
+                                verbose=True,
+                                progress_desc=f"{test_ds} {k}-shot",
+                            )
+                            # Save the indices for future use
+                            indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                            logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                    else:
+                        # k >= larger_k, need to sample from scratch
+                        logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                        selected_indices = sample_k_shot_indices(
+                            dataset_train,
+                            k,
+                            seed=seed,
+                            verbose=True,
+                            progress_desc=f"{test_ds} {k}-shot",
+                        )
+                        # Save the indices for future use
+                        indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
                 
                 # Get base dataset
                 base_dataset = getattr(dataset_train, "train_dataset", None)
@@ -971,7 +1145,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initialize_sigma",
         type=str,
-        choices=["average", "tsvm"],
+        choices=["average", "sum", "tsvm"],
         help="Initialization strategy for sigma basis"
     )
 
