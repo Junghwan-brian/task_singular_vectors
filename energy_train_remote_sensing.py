@@ -76,7 +76,8 @@ def build_energy_config_tag(cfg) -> str:
     lr_part = _sanitize_value(cfg.sigma_lr)
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
-    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}"
+    warmup_ratio_part = _sanitize_value(getattr(cfg, "warmup_ratio", 0.1))
+    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}_{warmup_ratio_part}"
 
 
 def normalize_adapter_choice(value: str) -> str:
@@ -779,7 +780,7 @@ def run_energy(cfg: DictConfig) -> None:
         # Use cosine annealing scheduler (same as Atlas)
         num_batches = len(train_loader)
         total_steps = int(cfg.sigma_epochs) * num_batches
-        scheduler = cosine_lr(optimizer, cfg.sigma_lr, 0, total_steps)
+        scheduler = cosine_lr(optimizer, cfg.sigma_lr, int(cfg.warmup_ratio * total_steps), total_steps)
 
         # capture cloned base parameters and buffers for functional_call
         base_params = {
@@ -1135,6 +1136,8 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_wd", type=float, help="Weight decay for sigma optimization")
     parser.add_argument("--batch_size", type=int, help="Training batch size")
     parser.add_argument("--k", type=int, dest="train_k", help="K-shot samples per class (0=fullshot)")
+    parser.add_argument("--warmup_ratio", type=float, help="Warmup ratio for sigma learning rate")
+
     
     # SVD and initialization
     parser.add_argument(
