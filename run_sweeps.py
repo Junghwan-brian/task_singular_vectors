@@ -37,7 +37,7 @@ from typing import Iterable, List, Sequence
 
 
 def _load_remote_config() -> dict:
-    config_path = os.path.join(os.path.dirname(__file__), "config", "config_remote_sensing.yaml")
+    config_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
     try:
         import yaml  # type: ignore
 
@@ -175,27 +175,24 @@ def _expected_atlas_paths(
     results_json = os.path.join(base_dir, f"atlas_results_{adapter_tag}.json")
     return atlas_pt, results_json
 
-
-
-
-REMOTE_SENSING_DATASETS = {
-    "AID": 10,
-    "CLRS": 10,
-    "EuroSAT_RGB": 12,
-    "MLRSNet": 15,
-    "NWPU-RESISC45": 15,
-    "Optimal-31": 50,
-    "PatternNet": 20,
-    "RS_C11": 60,
-    "RSD46-WHU": 20,
-    "RSI-CB128": 15,
-    "RSSCN7": 80,
-    "SAT-4": 5,
-    "SAT-6": 10,
-    "SIRI-WHU": 100,
-    "UC_Merced": 100,
-    "WHU-RS19": 150,
+DATASETS_ALL = {
+    "DTD": 76,
+    "GTSRB": 11,
+    "MNIST": 5,
+    "SVHN": 4,
+    "CIFAR10": 6,
+    "CIFAR100": 6,
+    "STL10": 60,
+    "Food101": 4,
+    "Flowers102": 147,
+    "PCAM": 1,
+    "OxfordIIITPet": 82,
+    "RenderedSST2": 39,
+    "EMNIST": 2,
+    "FashionMNIST": 5,
+    "KMNIST": 5,
 }
+
 
 GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
 ENERGY_MODELS = ["ViT-B-16"]
@@ -237,7 +234,7 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             continue
         cmd = [
             sys.executable,
-            "energy_train_remote_sensing.py",
+            "energy_train_reverse.py",
             "--model",
             model,
             "--initialize_sigma",
@@ -278,7 +275,7 @@ def build_atlas_commands(datasets: Sequence[str]) -> List[List[str]]:
             continue
         cmd = [
             sys.executable,
-            "atlas_remote_sensing.py",
+            "atlas_reverse.py",
             "--model",
             model,
             "--k",
@@ -389,6 +386,7 @@ def main() -> None:
     args = parser.parse_args()
 
     datasets = sorted(REMOTE_SENSING_DATASETS.keys())
+    # datasets = sorted(DATASETS_ALL.keys())
 
     commands: List[List[str]] = []
     if not args.skip_energy:
