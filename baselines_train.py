@@ -214,7 +214,7 @@ def train_linear_probe(model, train_loader, cfg, train_dataset_name, logger):
     model.train()
 
     num_batches = len(train_loader)
-    print_every = 100
+    print_every = 1
     for epoch in range(int(cfg.lp_epochs)):
         for i, batch in enumerate(train_loader):
             batch = maybe_dictionarize(batch)
@@ -332,7 +332,7 @@ def train_tip_or_lpp(model, train_loader, cfg, train_dataset_name, logger, adapt
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
 
-            if (i + 1) % 100 == 0:
+            if (i + 1) % 1 == 0:
                 # LPP와 TIP 모두 여러 param_groups를 가지므로 각각의 lr 출력
                 lrs = [f"{pg['lr']:.6f}" for pg in optimizer.param_groups]
                 logger.info(
@@ -400,7 +400,7 @@ def train_lora(model, train_loader, cfg, train_dataset_name, logger):
     model.train()
 
     num_batches = len(train_loader)
-    print_every = 100
+    print_every = 1
     for epoch in range(int(cfg.lora_epochs)):
         for i, batch in enumerate(train_loader):
             batch = maybe_dictionarize(batch)
@@ -483,7 +483,7 @@ def my_app(cfg: DictConfig) -> None:
             base_root = getattr(cfg, "save", None)
             if base_root is None:
                 base_root = os.path.expanduser(
-                    "/disk3/junghwan/task_vector/models/checkpoints")
+                    "./models/checkpoints")
             cfg.model_location = base_root
         if not hasattr(cfg, "save_dir") or cfg.save_dir in (None, ""):
             cfg.save_dir = os.path.join(cfg.model_location, cfg.model)

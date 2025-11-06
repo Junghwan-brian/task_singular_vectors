@@ -26,6 +26,7 @@ import torch
 from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
 from torch.nn.utils.stateless import functional_call
 from atlas_remote_sensing import train_adapter_remote
+from src.utils.utils import cosine_lr
 
 
 class AdapterCompatibleClassifier(torch.nn.Module):
@@ -131,6 +132,25 @@ from src.eval.eval_remote_sensing_comparison import (
     evaluate_encoder_with_dataloader,
     visualize_sigma_matrices,
 )
+
+
+def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
+    """Save k-shot indices to a JSON file."""
+    os.makedirs(save_dir, exist_ok=True)
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    with open(indices_path, 'w') as f:
+        json.dump({"indices": indices, "dataset": dataset_name, "k": k, "seed": seed}, f)
+    return indices_path
+
+
+def load_k_shot_indices(save_dir, k, seed):
+    """Load k-shot indices from a JSON file if it exists."""
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    if os.path.exists(indices_path):
+        with open(indices_path, 'r') as f:
+            data = json.load(f)
+            return data["indices"]
+    return None
 
 
 # Dataset-specific epochs for sigma training
@@ -694,13 +714,29 @@ def run_energy(cfg: DictConfig) -> None:
         if k is not None and k > 0:
             logger.info(f"Applying k-shot sampling: {k} samples per class")
             try:
-                selected_indices = sample_k_shot_indices(
-                    dataset_train,
-                    k,
-                    seed=int(getattr(cfg, 'seed', 1)),
-                    verbose=True,
-                    progress_desc=f"{val_dataset_name} {k}-shot",
-                )
+                seed = int(getattr(cfg, 'seed', 1))
+                
+                # Create directory for saving indices
+                indices_save_dir = os.path.join(cfg.model_location, cfg.model, val_dataset_name)
+                
+                # Try to load existing indices
+                selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
+                
+                if selected_indices is not None:
+                    logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
+                else:
+                    # Sample new indices
+                    logger.info(f"Sampling new {k}-shot indices (seed={seed})")
+                    selected_indices = sample_k_shot_indices(
+                        dataset_train,
+                        k,
+                        seed=seed,
+                        verbose=True,
+                        progress_desc=f"{val_dataset_name} {k}-shot",
+                    )
+                    # Save the indices for future use
+                    indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                    logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
                 
                 # Get base dataset
                 base_dataset = getattr(dataset_train, "train_dataset", None)
@@ -739,9 +775,11 @@ def run_energy(cfg: DictConfig) -> None:
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             params, lr=cfg.sigma_lr, weight_decay=cfg.sigma_wd)
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=int(cfg.sigma_lr_step_size), gamma=float(cfg.sigma_lr_gamma)
-        )
+        
+        # Use cosine annealing scheduler (same as Atlas)
+        num_batches = len(train_loader)
+        total_steps = int(cfg.sigma_epochs) * num_batches
+        scheduler = cosine_lr(optimizer, cfg.sigma_lr, 0, total_steps)
 
         # capture cloned base parameters and buffers for functional_call
         base_params = {
@@ -862,6 +900,8 @@ def run_energy(cfg: DictConfig) -> None:
             epoch_start = time.time()
             model.train()
             for i, batch in enumerate(train_loader):
+                step = epoch * num_batches + i
+                
                 batch = maybe_dictionarize(batch)
                 inputs = batch["images"].cuda()
                 labels = batch["labels"].cuda()
@@ -896,6 +936,7 @@ def run_energy(cfg: DictConfig) -> None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()
+                scheduler(step)  # Update learning rate at each step
 
                 loss_history.append(
                     {
@@ -916,9 +957,6 @@ def run_energy(cfg: DictConfig) -> None:
                     except Exception:
                         logger.info(
                             f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
-
-            # step scheduler at end of epoch
-            scheduler.step()
 
             # Record training time for this epoch (before validation)
             epoch_train_time = time.time() - epoch_start
@@ -1095,8 +1133,6 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_epochs", type=int, help="Number of sigma training epochs")
     parser.add_argument("--sigma_lr", type=float, help="Learning rate for sigma optimization")
     parser.add_argument("--sigma_wd", type=float, help="Weight decay for sigma optimization")
-    parser.add_argument("--sigma_lr_step_size", type=int, help="LR scheduler step size")
-    parser.add_argument("--sigma_lr_gamma", type=float, help="LR scheduler gamma")
     parser.add_argument("--batch_size", type=int, help="Training batch size")
     parser.add_argument("--k", type=int, dest="train_k", help="K-shot samples per class (0=fullshot)")
     

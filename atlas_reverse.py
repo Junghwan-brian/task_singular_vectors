@@ -23,6 +23,13 @@ from tqdm.auto import tqdm
 # Disable problematic attention backends that cause "No execution plans support the graph" error
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_cudnn_sdp(False)
+# Additional cuDNN settings for H100 compatibility
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+# Set cuDNN benchmark to False for stability
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
@@ -48,6 +55,25 @@ from src.datasets.remote_sensing import sample_k_shot_indices
 
 # Evaluation function for general datasets
 from src.eval.eval import eval_single_dataset
+
+
+def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
+    """Save k-shot indices to a JSON file."""
+    os.makedirs(save_dir, exist_ok=True)
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    with open(indices_path, 'w') as f:
+        json.dump({"indices": indices, "dataset": dataset_name, "k": k, "seed": seed}, f)
+    return indices_path
+
+
+def load_k_shot_indices(save_dir, k, seed):
+    """Load k-shot indices from a JSON file if it exists."""
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    if os.path.exists(indices_path):
+        with open(indices_path, 'r') as f:
+            data = json.load(f)
+            return data["indices"]
+    return None
 
 
 def _sanitize_value(val):
@@ -92,7 +118,7 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     return logger
 
 # Dataset-specific epochs for Atlas training (general datasets)
-{
+ATLAS_EPOCHS_PER_DATASET = {
     # "Cars": 35,
     "DTD": 76,
     # "EuroSAT": 12,
@@ -106,7 +132,7 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     "STL10": 60,
     "Food101": 4,
     "Flowers102": 147,
-    "FER2013": 10,
+    # "FER2013": 10,
     "PCAM": 1,
     "OxfordIIITPet": 82,
     "RenderedSST2": 39,
@@ -584,13 +610,30 @@ def train_single_task(args, comp_acc=None, logger=None):
     if k > 0:
         logger.info(f"Applying k-shot sampling: {k} samples per class")
         try:
-            selected_indices = sample_k_shot_indices(
-                train_dataset,
-                k,
-                seed=int(getattr(args, 'seed', 1)),
-                verbose=True,
-                progress_desc=f"{target_dataset} {k}-shot",
-            )
+            seed = int(getattr(args, 'seed', 1))
+            
+            # Create directory for saving indices
+            indices_save_dir = os.path.join(args.model_location, args.model, target_dataset)
+            
+            # Try to load existing indices
+            selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
+            
+            if selected_indices is not None:
+                logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
+            else:
+                # Sample new indices
+                logger.info(f"Sampling new {k}-shot indices (seed={seed})")
+                selected_indices = sample_k_shot_indices(
+                    train_dataset,
+                    k,
+                    seed=seed,
+                    verbose=True,
+                    progress_desc=f"{target_dataset} {k}-shot",
+                )
+                # Save the indices for future use
+                indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
+                logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+            
             base_dataset = getattr(train_dataset, "train_dataset", None)
             if base_dataset is None:
                 base_dataset = getattr(train_loader, "dataset", None)
