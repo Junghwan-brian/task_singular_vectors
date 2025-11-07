@@ -24,7 +24,7 @@ initialize_sigma: average
 model: ViT-B-16
 model_location: ./models/checkpoints
 n_eval_points: 31
-num_tasks: 16
+num_tasks: 15
 sigma_epochs: null
 sigma_lr: 1.0e-03
 sigma_wd: 0.0

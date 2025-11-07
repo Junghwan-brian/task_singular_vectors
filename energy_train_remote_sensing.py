@@ -72,7 +72,7 @@ def _sanitize_value(val):
 
 
 def build_energy_config_tag(cfg) -> str:
-    num_tasks_minus_one = _sanitize_value(max(int(getattr(cfg, "num_tasks", 0)) - 1, 0))
+    num_tasks_minus_one = _sanitize_value(len(cfg.DATASETS_ALL), 0)
     lr_part = _sanitize_value(cfg.sigma_lr)
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
@@ -1070,14 +1070,6 @@ def run_energy(cfg: DictConfig) -> None:
                         materialized[orig_key] = materialized[orig_key] + delta
             # load back into encoder
             model.image_encoder.load_state_dict(materialized, strict=False)
-        
-        # Save with k-shot folder structure
-        # e.g., models/checkpoints_remote_sensing/ViT-B-32/MLRSNetVal/16shot/energy.pt
-
-        os.makedirs(energy_save_dir, exist_ok=True)
-        energy_path = os.path.join(energy_save_dir, "energy.pt")
-        model.image_encoder.save(energy_path)
-        logger.info(f"Saved energy-trained encoder to {energy_path}")
         
         # Final evaluation on validation set
         logger.info("\n" + "=" * 100)
