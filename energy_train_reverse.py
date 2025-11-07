@@ -61,16 +61,53 @@ def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
     Uses deterministic selection (first target_k samples per class).
     """
     import numpy as np
+    from torch.utils.data import Subset
     
-    # Extract labels for the larger indices
+    # Get base dataset if wrapped in Subset
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    
+    # Extract labels efficiently
     labels = []
-    for idx in larger_indices:
-        _, label = dataset[idx]
-        if torch.is_tensor(label):
-            label = label.item()
-        elif isinstance(label, np.ndarray):
-            label = int(label)
-        labels.append(int(label))
+    
+    # Try fast methods first
+    if hasattr(base_dataset, 'targets'):
+        # Direct targets attribute (CIFAR, MNIST, etc.)
+        all_targets = base_dataset.targets
+        if torch.is_tensor(all_targets):
+            all_targets = all_targets.cpu().numpy()
+        elif not isinstance(all_targets, np.ndarray):
+            all_targets = np.array(all_targets)
+        labels = [int(all_targets[idx]) for idx in larger_indices]
+    
+    elif hasattr(base_dataset, 'samples'):
+        # ImageFolder style: samples is list of (path, label)
+        all_samples = base_dataset.samples
+        labels = [int(all_samples[idx][1]) for idx in larger_indices]
+    
+    elif hasattr(base_dataset, '_labels'):
+        # Custom datasets with _labels attribute
+        all_labels = base_dataset._labels
+        if torch.is_tensor(all_labels):
+            all_labels = all_labels.cpu().numpy()
+        elif not isinstance(all_labels, np.ndarray):
+            all_labels = np.array(all_labels)
+        labels = [int(all_labels[idx]) for idx in larger_indices]
+    
+    else:
+        # Fallback: iterate through indices (slower but safe)
+        for idx in larger_indices:
+            try:
+                _, label = base_dataset[idx]
+                if torch.is_tensor(label):
+                    label = label.item()
+                elif isinstance(label, np.ndarray):
+                    label = int(label)
+                labels.append(int(label))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to extract label at index {idx} from dataset {type(base_dataset).__name__}. "
+                    f"Error: {e}"
+                )
     
     # Group indices by class
     class_to_indices = {}
