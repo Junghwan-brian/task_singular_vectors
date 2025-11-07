@@ -29,7 +29,10 @@ from src.utils.utils import cosine_lr
 from atlas_reverse import train_adapter
 
 from src.datasets.remote_sensing import sample_k_shot_indices
-from src.eval.eval_remote_sensing_comparison import visualize_sigma_matrices
+from src.eval.eval_remote_sensing_comparison import (
+    visualize_sigma_matrices,
+    evaluate_encoder_with_dataloader,
+)
 
 
 def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
@@ -129,7 +132,7 @@ def _sanitize_value(val):
 
 
 def build_energy_config_tag(cfg) -> str:
-    num_tasks_minus_one = _sanitize_value(len(cfg.DATASETS_ALL), 0)
+    num_tasks_minus_one = _sanitize_value(len(cfg.DATASETS_ALL))
     lr_part = _sanitize_value(cfg.sigma_lr)
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
@@ -809,6 +812,19 @@ def run_energy(cfg: DictConfig) -> None:
                 logger.error(f"Failed to apply k-shot sampling: {e}")
                 logger.warning("Falling back to full training set")
 
+        # Prepare validation dataset and loader (reuse across evaluations)
+        logger.info(f"Loading validation dataset: {val_dataset_name}")
+        val_dataset = get_dataset(
+            test_ds,
+            image_encoder.val_preprocess,
+            location=cfg.data_location,
+            batch_size=cfg.batch_size,
+        )
+        val_loader = get_dataloader(
+            val_dataset, is_train=False, args=cfg, image_encoder=None
+        )
+        logger.info(f"✓ Validation dataset loaded ({len(val_loader.dataset)} samples)")
+
         config_dir = os.path.join(
             cfg.model_location,
             cfg.model,
@@ -871,7 +887,9 @@ def run_energy(cfg: DictConfig) -> None:
         # Log zeroshot accuracy before any sigma updates
         model.eval()
         with torch.no_grad():
-            pretrained_metrics = eval_single_dataset(pretrained_encoder, val_dataset_name, cfg)
+            pretrained_metrics = evaluate_encoder_with_dataloader(
+                pretrained_encoder, classification_head, val_loader, cfg.device
+            )
             pretrained_acc = pretrained_metrics['top1']
             logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
             record_validation("pretrained", -2, pretrained_acc)
@@ -887,7 +905,9 @@ def run_energy(cfg: DictConfig) -> None:
                         eval_params[orig_key] = eval_params[orig_key] + delta
 
             model.image_encoder.load_state_dict(eval_params, strict=False)
-            zeroshot_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
+            zeroshot_metrics = evaluate_encoder_with_dataloader(
+                model.image_encoder, classification_head, val_loader, cfg.device
+            )
             zeroshot_acc = zeroshot_metrics['top1']
             logger.info(f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
             record_validation("zeroshot", -1, zeroshot_acc)
@@ -993,7 +1013,9 @@ def run_energy(cfg: DictConfig) -> None:
 
                     model.image_encoder.load_state_dict(eval_params, strict=False)
 
-                    val_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
+                    val_metrics = evaluate_encoder_with_dataloader(
+                        model.image_encoder, classification_head, val_loader, cfg.device
+                    )
                     val_acc = val_metrics['top1']
 
                     logger.info(f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
@@ -1034,7 +1056,9 @@ def run_energy(cfg: DictConfig) -> None:
         
         model.eval()
         with torch.no_grad():
-            final_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
+            final_metrics = evaluate_encoder_with_dataloader(
+                model.image_encoder, classification_head, val_loader, cfg.device
+            )
             final_acc = final_metrics['top1']
         
         logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
@@ -1073,17 +1097,7 @@ def run_energy(cfg: DictConfig) -> None:
                 lr=float(getattr(cfg, "adapter_lr", cfg.sigma_lr)),
                 k=int(getattr(cfg, "train_k", 0)),
             )
-            # Get validation loader for adapter training
-            val_dataset = get_dataset(
-                test_ds,
-                model.image_encoder.val_preprocess,
-                location=cfg.data_location,
-                batch_size=cfg.batch_size,
-            )
-            val_loader = get_dataloader(
-                val_dataset, is_train=False, args=cfg, image_encoder=None
-            )
-            
+            # Reuse val_loader that was already created
             adapter_ready_model = AdapterCompatibleClassifier(model)
             adapter_summary = train_adapter(
                 adapter_ready_model, train_loader, val_loader, adapter_args, logger, energy_save_dir

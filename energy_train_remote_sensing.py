@@ -72,7 +72,7 @@ def _sanitize_value(val):
 
 
 def build_energy_config_tag(cfg) -> str:
-    num_tasks_minus_one = _sanitize_value(len(cfg.DATASETS_ALL), 0)
+    num_tasks_minus_one = _sanitize_value(len(cfg.DATASETS_ALL))
     lr_part = _sanitize_value(cfg.sigma_lr)
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))

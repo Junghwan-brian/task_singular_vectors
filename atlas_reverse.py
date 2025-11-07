@@ -55,6 +55,7 @@ from src.datasets.remote_sensing import sample_k_shot_indices
 
 # Evaluation function for general datasets
 from src.eval.eval import eval_single_dataset
+from src.eval.eval_remote_sensing_comparison import evaluate_encoder_with_dataloader
 
 
 def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
@@ -620,9 +621,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     model.freeze_head()
     model = model.cuda()
 
-    # Prepare validation dataset
-    eval_dataset = None
-    val_loader = None
+    # Prepare validation dataset (reuse across evaluations)
     logger.info(f"Loading validation dataset: {target_dataset}")
     eval_dataset = get_dataset(
         orig_dataset,
@@ -633,6 +632,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     val_loader = get_dataloader(
         eval_dataset, is_train=False, args=args, image_encoder=None
     )
+    logger.info(f"✓ Validation dataset loaded ({len(val_loader.dataset)} samples)")
 
     # Few-shot sampling using unified k-shot function
     k = getattr(args, 'k', 0)
@@ -753,19 +753,13 @@ def train_single_task(args, comp_acc=None, logger=None):
     val_history = []
     record_validation = ValidationRecorder(overall_start, val_history)
 
-    # Evaluate zeroshot accuracy using unified evaluation function
+    # Evaluate zeroshot accuracy using pre-loaded dataloader
     image_encoder.eval()
     classification_head.eval()
     
-    # Create a temporary config-like object for eval_single_dataset
-    from types import SimpleNamespace
-    # eval_cfg = SimpleNamespace(
-    #     data_location=args.data_location,
-    #     batch_size=args.batch_size,
-    #     device='cuda'
-    # )
-    # print(eval_cfg)
-    pretrained_metrics = eval_single_dataset(image_encoder, target_dataset, args)
+    pretrained_metrics = evaluate_encoder_with_dataloader(
+        image_encoder, classification_head, val_loader, args.device
+    )
     pretrained_acc = pretrained_metrics['top1']
     comp_acc[f"{target_dataset}_zeroshot"] = pretrained_acc
     args.zs_acc[f"{target_dataset}"] = pretrained_acc
@@ -842,7 +836,7 @@ def train_single_task(args, comp_acc=None, logger=None):
         epoch_times.append(epoch_train_time)
         logger.info(f"Epoch {epoch} training time: {epoch_train_time:.2f}s")
 
-        # Evaluate after selected epochs using unified evaluation function
+        # Evaluate after selected epochs using pre-loaded dataloader
         if epoch in eval_epochs:
             image_encoder = model.image_encoder
             coef = model.image_encoder.coef
@@ -850,8 +844,10 @@ def train_single_task(args, comp_acc=None, logger=None):
             image_encoder.eval()
             classification_head.eval()
             
-            # Use unified evaluation function
-            metrics = eval_single_dataset(image_encoder, target_dataset, args)
+            # Use pre-loaded dataloader
+            metrics = evaluate_encoder_with_dataloader(
+                image_encoder, classification_head, val_loader, args.device
+            )
             acc = metrics['top1']
             
             # Set back to train mode
@@ -871,11 +867,13 @@ def train_single_task(args, comp_acc=None, logger=None):
     image_encoder = model.image_encoder
     image_encoder.coef = torch.nn.Parameter(best_coef)
 
-    # Final evaluation using unified evaluation function
+    # Final evaluation using pre-loaded dataloader
     image_encoder.eval()
     classification_head.eval()
 
-    final_metrics = eval_single_dataset(image_encoder, target_dataset, args)
+    final_metrics = evaluate_encoder_with_dataloader(
+        image_encoder, classification_head, val_loader, args.device
+    )
     final_acc = final_metrics['top1']
 
     comp_acc[target_dataset_clean] = final_acc
