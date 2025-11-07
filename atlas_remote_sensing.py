@@ -707,7 +707,9 @@ def train_single_task(args, comp_acc=None, logger=None):
                     larger_indices = load_k_shot_indices(indices_save_dir, larger_k, seed)
                     if larger_indices is not None:
                         logger.info(f"✓ Subsampling from existing {larger_k}-shot indices to {k}-shot")
-                        selected_indices = subsample_from_larger_k(larger_indices, train_dataset, k, seed)
+                        # Get base dataset for label extraction
+                        base_ds = getattr(train_dataset, "train_dataset", train_dataset)
+                        selected_indices = subsample_from_larger_k(larger_indices, base_ds, k, seed)
                         # Save for future use
                         indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
                         logger.info(f"✓ Saved {k}-shot indices to {indices_path}")

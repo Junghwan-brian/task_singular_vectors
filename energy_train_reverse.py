@@ -794,7 +794,9 @@ def run_energy(cfg: DictConfig) -> None:
                         larger_indices = load_k_shot_indices(indices_save_dir, larger_k, seed)
                         if larger_indices is not None:
                             logger.info(f"✓ Subsampling from existing {larger_k}-shot indices to {k}-shot")
-                            selected_indices = subsample_from_larger_k(larger_indices, dataset_train, k, seed)
+                            # Get base dataset for label extraction
+                            base_ds = getattr(dataset_train, "train_dataset", dataset_train)
+                            selected_indices = subsample_from_larger_k(larger_indices, base_ds, k, seed)
                             # Save for future use
                             indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
                             logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
