@@ -9,7 +9,6 @@ DATASETS_ALL:
 - Flowers102
 - CIFAR100
 - PCAM
-- FER2013
 - CIFAR10
 - Food101
 - FashionMNIST
@@ -25,12 +24,12 @@ initialize_sigma: average
 model: ViT-B-16
 model_location: ./models/checkpoints
 n_eval_points: 31
-num_tasks: 16
+num_tasks: 15
 sigma_epochs: null
 sigma_lr: 1.0e-03
 sigma_wd: 0.0
 sigma_lr_step_size: 1
-sigma_lr_gamma: 1.0
+sigma_lr_gamma: 0.5
 train_k: 0
 num_grad_accumulation: 1
 adapter: none
@@ -43,4 +42,6 @@ svd_keep_topk: 5
 world_size: 1
 blockwise_coef: true
 seed: 1
+warmup_ratio: 0.1
+
 

@@ -36,8 +36,8 @@ import time
 from typing import Iterable, List, Sequence
 
 
-def _load_remote_config() -> dict:
-    config_path = os.path.join(os.path.dirname(__file__), "config", "config_remote_sensing.yaml")
+def _load_config() -> dict:
+    config_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
     try:
         import yaml  # type: ignore
 
@@ -50,12 +50,12 @@ def _load_remote_config() -> dict:
     return {}
 
 
-REMOTE_CFG = _load_remote_config()
+CFG = _load_config()
 
 
 def _resolve_model_root() -> str:
     default_root = os.path.join(".", "models", "checkpoints_remote_sensing")
-    raw_root = REMOTE_CFG.get("model_location", default_root) if isinstance(REMOTE_CFG, dict) else default_root
+    raw_root = CFG.get("model_location", default_root) if isinstance(CFG, dict) else default_root
     return os.path.expanduser(raw_root)
 
 
@@ -87,15 +87,15 @@ def _path_exists(path: str) -> bool:
 
 
 def _datasets_all_from_config() -> Sequence[str]:
-    candidates = REMOTE_CFG.get("DATASETS_ALL") if isinstance(REMOTE_CFG, dict) else None
+    candidates = CFG.get("DATASETS_ALL") if isinstance(CFG, dict) else None
     if isinstance(candidates, (list, tuple)):
         return list(candidates)
-    return list(REMOTE_SENSING_DATASETS.keys())
+    return list(DATASETS_ALL.keys())
 
 
 def _atlas_default_lr() -> float:
-    if isinstance(REMOTE_CFG, dict):
-        value = REMOTE_CFG.get("lr")
+    if isinstance(CFG, dict):
+        value = CFG.get("lr")
         if value is not None:
             try:
                 return float(value)
@@ -171,31 +171,28 @@ def _expected_atlas_paths(
     results_json = os.path.join(base_dir, f"atlas_results_{adapter_tag}.json")
     return atlas_pt, results_json
 
-
-
-
-REMOTE_SENSING_DATASETS = {
-    "AID": 10,
-    "CLRS": 10,
-    "EuroSAT_RGB": 12,
-    "MLRSNet": 15,
-    "NWPU-RESISC45": 15,
-    "Optimal-31": 50,
-    "PatternNet": 20,
-    "RS_C11": 60,
-    "RSD46-WHU": 20,
-    "RSI-CB128": 15,
-    "RSSCN7": 80,
-    "SAT-4": 5,
-    "SAT-6": 10,
-    "SIRI-WHU": 100,
-    "UC_Merced": 100,
-    "WHU-RS19": 150,
+DATASETS_ALL = {
+    "DTD": 76,
+    "GTSRB": 11,
+    "MNIST": 5,
+    "SVHN": 4,
+    "CIFAR10": 6,
+    "CIFAR100": 6,
+    "STL10": 60,
+    "Food101": 4,
+    "Flowers102": 147,
+    "PCAM": 1,
+    "OxfordIIITPet": 82,
+    "RenderedSST2": 39,
+    "EMNIST": 2,
+    "FashionMNIST": 5,
+    "KMNIST": 5,
 }
+
 
 GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
 ENERGY_MODELS = ["ViT-B-16"]
-ENERGY_INITIALIZE_SIGMA = ["sum"]
+ENERGY_INITIALIZE_SIGMA = ["average", "sum"]
 ENERGY_ADAPTERS = ["none"]
 ENERGY_K = [16]
 ENERGY_SVD_KEEP_TOPK = [5]
@@ -236,7 +233,7 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             continue
         cmd = [
             sys.executable,
-            "energy_train_remote_sensing.py",
+            "energy_train_reverse.py",
             "--model",
             model,
             "--initialize_sigma",
@@ -279,7 +276,7 @@ def build_atlas_commands(datasets: Sequence[str]) -> List[List[str]]:
             continue
         cmd = [
             sys.executable,
-            "atlas_remote_sensing.py",
+            "atlas_reverse.py",
             "--model",
             model,
             "--k",
@@ -389,7 +386,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    datasets = sorted(REMOTE_SENSING_DATASETS.keys())
+    # datasets = sorted(REMOTE_SENSING_DATASETS.keys())
+    datasets = sorted(DATASETS_ALL.keys())
 
     commands: List[List[str]] = []
     if not args.skip_energy:

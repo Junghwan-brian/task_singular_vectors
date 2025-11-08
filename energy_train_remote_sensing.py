@@ -26,6 +26,7 @@ import torch
 from src.models.task_vectors import ImageEncoder, NonLinearTaskVector
 from torch.nn.utils.stateless import functional_call
 from atlas_remote_sensing import train_adapter_remote
+from src.utils.utils import cosine_lr
 
 
 class AdapterCompatibleClassifier(torch.nn.Module):
@@ -71,11 +72,12 @@ def _sanitize_value(val):
 
 
 def build_energy_config_tag(cfg) -> str:
-    num_tasks_minus_one = _sanitize_value(max(int(getattr(cfg, "num_tasks", 0)) - 1, 0))
+    num_tasks_minus_one = _sanitize_value(len(cfg.DATASETS_ALL) - 1)
     lr_part = _sanitize_value(cfg.sigma_lr)
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
-    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}"
+    warmup_ratio_part = _sanitize_value(getattr(cfg, "warmup_ratio", 0.1))
+    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}_{warmup_ratio_part}"
 
 
 def normalize_adapter_choice(value: str) -> str:
@@ -133,6 +135,96 @@ from src.eval.eval_remote_sensing_comparison import (
 )
 
 
+def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
+    """Save k-shot indices to a JSON file."""
+    os.makedirs(save_dir, exist_ok=True)
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    with open(indices_path, 'w') as f:
+        json.dump({"indices": indices, "dataset": dataset_name, "k": k, "seed": seed}, f)
+    return indices_path
+
+
+def load_k_shot_indices(save_dir, k, seed):
+    """Load k-shot indices from a JSON file if it exists."""
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    if os.path.exists(indices_path):
+        with open(indices_path, 'r') as f:
+            data = json.load(f)
+            return data["indices"]
+    return None
+
+
+def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
+    """Subsample target_k indices per class from a larger k-shot set.
+    
+    This is much faster than re-sampling from the entire dataset.
+    Uses deterministic selection (first target_k samples per class).
+    """
+    import numpy as np
+    from torch.utils.data import Subset
+    
+    # Get base dataset if wrapped in Subset
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    
+    # Extract labels efficiently
+    labels = []
+    
+    # Try fast methods first
+    if hasattr(base_dataset, 'targets'):
+        # Direct targets attribute (CIFAR, MNIST, etc.)
+        all_targets = base_dataset.targets
+        if torch.is_tensor(all_targets):
+            all_targets = all_targets.cpu().numpy()
+        elif not isinstance(all_targets, np.ndarray):
+            all_targets = np.array(all_targets)
+        labels = [int(all_targets[idx]) for idx in larger_indices]
+    
+    elif hasattr(base_dataset, 'samples'):
+        # ImageFolder style: samples is list of (path, label)
+        all_samples = base_dataset.samples
+        labels = [int(all_samples[idx][1]) for idx in larger_indices]
+    
+    elif hasattr(base_dataset, '_labels'):
+        # Custom datasets with _labels attribute
+        all_labels = base_dataset._labels
+        if torch.is_tensor(all_labels):
+            all_labels = all_labels.cpu().numpy()
+        elif not isinstance(all_labels, np.ndarray):
+            all_labels = np.array(all_labels)
+        labels = [int(all_labels[idx]) for idx in larger_indices]
+    
+    else:
+        # Fallback: iterate through indices (slower but safe)
+        for idx in larger_indices:
+            try:
+                _, label = base_dataset[idx]
+                if torch.is_tensor(label):
+                    label = label.item()
+                elif isinstance(label, np.ndarray):
+                    label = int(label)
+                labels.append(int(label))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to extract label at index {idx} from dataset {type(base_dataset).__name__}. "
+                    f"Error: {e}"
+                )
+    
+    # Group indices by class
+    class_to_indices = {}
+    for idx, label in zip(larger_indices, labels):
+        if label not in class_to_indices:
+            class_to_indices[label] = []
+        class_to_indices[label].append(idx)
+    
+    # Select first target_k from each class (deterministic)
+    selected_indices = []
+    for label in sorted(class_to_indices.keys()):
+        class_indices = class_to_indices[label][:target_k]
+        selected_indices.extend(class_indices)
+    
+    return selected_indices
+
+
 # Dataset-specific epochs for sigma training
 # These match the fine-tuning epochs from finetune_remote_sensing_datasets.py
 SIGMA_EPOCHS_PER_DATASET = {
@@ -165,7 +257,7 @@ def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
     return eval_epochs
 
 
-def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
+def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
     """
     여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
     각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
@@ -578,13 +670,13 @@ def run_energy(cfg: DictConfig) -> None:
 
     # create final task vector with timing
     svd_start = time.time()
-    init_mode = getattr(cfg, "initialize_sigma", "average").lower()
+    init_mode = getattr(cfg, "initialize_sigma", "sum").lower()
     if init_mode == "tsvm":
         logger.info("Using TSVM SVD initialization")
         svd_dict = compute_and_sum_svd_mem_reduction_tsvm(task_vectors, cfg)
-    elif init_mode == "average":
+    elif init_mode == "sum":
         logger.info("Using average SVD initialization")
-        svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
+        svd_dict = compute_and_sum_svd_mem_reduction_sum(task_vectors, cfg)
     else:
         logger.info("Using TIES SVD initialization")
         svd_dict = compute_and_sum_svd_mem_reduction_weighted(task_vectors, cfg)
@@ -694,13 +786,55 @@ def run_energy(cfg: DictConfig) -> None:
         if k is not None and k > 0:
             logger.info(f"Applying k-shot sampling: {k} samples per class")
             try:
-                selected_indices = sample_k_shot_indices(
-                    dataset_train,
-                    k,
-                    seed=int(getattr(cfg, 'seed', 1)),
-                    verbose=True,
-                    progress_desc=f"{val_dataset_name} {k}-shot",
-                )
+                seed = int(getattr(cfg, 'seed', 1))
+                
+                # Create directory for saving indices
+                indices_save_dir = os.path.join(cfg.model_location, cfg.model, val_dataset_name)
+                
+                # Try to load existing k-shot indices
+                selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
+                
+                if selected_indices is not None:
+                    logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
+                else:
+                    # Try to subsample from larger k (e.g., 16-shot)
+                    larger_k = 16
+                    if k < larger_k:
+                        larger_indices = load_k_shot_indices(indices_save_dir, larger_k, seed)
+                        if larger_indices is not None:
+                            logger.info(f"✓ Subsampling from existing {larger_k}-shot indices to {k}-shot")
+                            # Get base dataset for label extraction
+                            base_ds = getattr(dataset_train, "train_dataset", dataset_train)
+                            selected_indices = subsample_from_larger_k(larger_indices, base_ds, k, seed)
+                            # Save for future use
+                            indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                            logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                        else:
+                            # Sample new indices from scratch
+                            logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                            selected_indices = sample_k_shot_indices(
+                                dataset_train,
+                                k,
+                                seed=seed,
+                                verbose=True,
+                                progress_desc=f"{val_dataset_name} {k}-shot",
+                            )
+                            # Save the indices for future use
+                            indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                            logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                    else:
+                        # k >= larger_k, need to sample from scratch
+                        logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                        selected_indices = sample_k_shot_indices(
+                            dataset_train,
+                            k,
+                            seed=seed,
+                            verbose=True,
+                            progress_desc=f"{val_dataset_name} {k}-shot",
+                        )
+                        # Save the indices for future use
+                        indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
                 
                 # Get base dataset
                 base_dataset = getattr(dataset_train, "train_dataset", None)
@@ -739,9 +873,11 @@ def run_energy(cfg: DictConfig) -> None:
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             params, lr=cfg.sigma_lr, weight_decay=cfg.sigma_wd)
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=int(cfg.sigma_lr_step_size), gamma=float(cfg.sigma_lr_gamma)
-        )
+        
+        # Use cosine annealing scheduler (same as Atlas)
+        num_batches = len(train_loader)
+        total_steps = int(cfg.sigma_epochs) * num_batches
+        scheduler = cosine_lr(optimizer, cfg.sigma_lr, int(cfg.warmup_ratio * total_steps), total_steps)
 
         # capture cloned base parameters and buffers for functional_call
         base_params = {
@@ -862,6 +998,8 @@ def run_energy(cfg: DictConfig) -> None:
             epoch_start = time.time()
             model.train()
             for i, batch in enumerate(train_loader):
+                step = epoch * num_batches + i
+                
                 batch = maybe_dictionarize(batch)
                 inputs = batch["images"].cuda()
                 labels = batch["labels"].cuda()
@@ -896,6 +1034,7 @@ def run_energy(cfg: DictConfig) -> None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()
+                scheduler(step)  # Update learning rate at each step
 
                 loss_history.append(
                     {
@@ -916,9 +1055,6 @@ def run_energy(cfg: DictConfig) -> None:
                     except Exception:
                         logger.info(
                             f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
-
-            # step scheduler at end of epoch
-            scheduler.step()
 
             # Record training time for this epoch (before validation)
             epoch_train_time = time.time() - epoch_start
@@ -973,14 +1109,6 @@ def run_energy(cfg: DictConfig) -> None:
                         materialized[orig_key] = materialized[orig_key] + delta
             # load back into encoder
             model.image_encoder.load_state_dict(materialized, strict=False)
-        
-        # Save with k-shot folder structure
-        # e.g., models/checkpoints_remote_sensing/ViT-B-32/MLRSNetVal/16shot/energy.pt
-
-        os.makedirs(energy_save_dir, exist_ok=True)
-        energy_path = os.path.join(energy_save_dir, "energy.pt")
-        model.image_encoder.save(energy_path)
-        logger.info(f"Saved energy-trained encoder to {energy_path}")
         
         # Final evaluation on validation set
         logger.info("\n" + "=" * 100)
@@ -1095,10 +1223,10 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_epochs", type=int, help="Number of sigma training epochs")
     parser.add_argument("--sigma_lr", type=float, help="Learning rate for sigma optimization")
     parser.add_argument("--sigma_wd", type=float, help="Weight decay for sigma optimization")
-    parser.add_argument("--sigma_lr_step_size", type=int, help="LR scheduler step size")
-    parser.add_argument("--sigma_lr_gamma", type=float, help="LR scheduler gamma")
     parser.add_argument("--batch_size", type=int, help="Training batch size")
     parser.add_argument("--k", type=int, dest="train_k", help="K-shot samples per class (0=fullshot)")
+    parser.add_argument("--warmup_ratio", type=float, help="Warmup ratio for sigma learning rate")
+
     
     # SVD and initialization
     parser.add_argument(
@@ -1109,7 +1237,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initialize_sigma",
         type=str,
-        choices=["average", "tsvm", "weighted"],
+        choices=["sum", "tsvm", "weighted"],
         help="Initialization strategy for sigma basis"
     )
     
