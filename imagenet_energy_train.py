@@ -1,0 +1,608 @@
+import os
+import time
+import json
+import logging
+import argparse
+from typing import Optional, cast, Sized
+
+import torch
+import torchvision
+from torch.nn.utils.stateless import functional_call
+
+from omegaconf import OmegaConf, open_dict
+
+from src.models import ImageClassifier, ImageEncoder, get_classification_head
+from src.eval.eval import eval_single_dataset
+from src.models.task_vectors import NonLinearTaskVector
+from src.utils.sigma_param import SigmaParametrization
+from src.datasets.registry import get_dataset
+from src.datasets.common import get_dataloader, maybe_dictionarize
+from src.utils.variables_and_paths import (
+    ALL_DATASETS,
+    get_finetuned_path,
+    get_zeroshot_path,
+)
+from src.datasets.remote_sensing import sample_k_shot_indices
+
+
+def setup_logger(name: str = __name__) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(h)
+    logger.propagate = False
+    return logger
+
+
+def _sanitize_value(val):
+    if isinstance(val, float):
+        val = f"{val:.6g}"
+    elif isinstance(val, bool):
+        val = int(val)
+    return ''.join(ch if ch.isalnum() or ch in ['-', '_'] else '_' for ch in str(val).replace('.', 'p'))
+
+
+def build_config_tag(cfg) -> str:
+    lr_part = _sanitize_value(cfg.sigma_lr)
+    svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
+    init_mode_part = _sanitize_value(
+        getattr(cfg, "initialize_sigma", "average"))
+    k_part = _sanitize_value(getattr(cfg, "train_k", 0))
+    return f"imagenet_energy_{lr_part}_{svd_part}_{init_mode_part}_{k_part}shot"
+
+
+def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
+    device = config.device
+    datasets = list(config.DATASETS)
+    num_tasks = int(len(datasets))
+    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
+    with torch.no_grad():
+        new_vector = {}
+
+        def is_matrix_key(tv0, key):
+            return (
+                tv0.vector[key].ndim == 2 and
+                all(t not in key for t in ("text_projection",
+                    "positional", "token_embedding"))
+            )
+        tv0 = task_vectors[0]
+        for key in tv0.vector:
+            if not is_matrix_key(tv0, key):
+                avg = None
+                for i, tv in enumerate(task_vectors):
+                    vec = tv.vector[key].to(device)
+                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
+                new_vector[key] = avg
+                continue
+            vec0 = task_vectors[0].vector[key].to(device)
+            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
+            m = int(u0.shape[0])
+            r = int(s0.shape[0])
+            n = int(vh0.shape[1])
+            if r == 0:
+                new_vector[key] = torch.zeros_like(vec0)
+                continue
+            num_used = min(num_tasks, r)
+            max_per_task = max(1, r // num_used)
+            k = min(desired_k, max_per_task)
+            chunks = int(k * num_used)
+            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
+            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
+            for i, tv in enumerate(task_vectors[:num_used]):
+                vec = tv.vector[key].to(device)
+                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
+                r_i = int(s.shape[0])
+                k_i = min(k, r_i)
+                start = i * k
+                end = start + k_i
+                sum_u[:, start:end] = u[:, :k_i]
+                sum_v[start:end, :] = vh[:k_i, :]
+            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
+            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
+            U_orth = u_u @ vh_u
+            V_orth = u_v @ vh_v
+            U_orth_T = U_orth.T
+            V_orth_T = V_orth.T
+            all_sigma_diags = []
+            for tv in task_vectors:
+                M_i = tv.vector[key].to(device)
+                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T
+                sigma_task_diag = torch.diag(Sigma_i_prime)
+                all_sigma_diags.append(sigma_task_diag)
+            if not all_sigma_diags:
+                Sigma = torch.zeros(
+                    (chunks, chunks), device=device, dtype=u0.dtype)
+            else:
+                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
+                mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
+                Sigma = torch.diag(mean_sigma_diag)
+            new_vector[key] = [U_orth, Sigma, V_orth]
+    return new_vector
+
+
+def run_imagenet_energy(cfg) -> None:
+    logger = setup_logger(__name__)
+
+    with open_dict(cfg):
+        if cfg.sigma_epochs is None:
+            cfg.sigma_epochs = 10
+        if not cfg.get("config_tag"):
+            cfg.config_tag = build_config_tag(cfg)
+        if cfg.get("adapter_lr") is None:
+            cfg.adapter_lr = cfg.sigma_lr
+        if cfg.get("adapter_wd") is None:
+            cfg.adapter_wd = cfg.sigma_wd
+
+    test_ds = cfg.test_dataset  # e.g., "ImageNetILSVRC"
+
+    # Basis datasets (exclude ImageNet)
+    base_list = ALL_DATASETS[:cfg.num_tasks]
+    cfg.DATASETS = base_list
+    cfg.num_tasks = len(base_list)
+    cfg.DATASETS_VAL = [dataset + "Val" for dataset in base_list]
+    cfg.data_location = os.path.expanduser(cfg.data_location)
+
+    logger.info(f"Using config tag: {cfg.config_tag}")
+    logger.info("Loading fine-tuned checkpoints for basis tasks:")
+    logger.info(f"datasets: {cfg.DATASETS_VAL}")
+    logger.info(f"model: {cfg.model}")
+
+    ft_checks = []
+    for dataset in cfg.DATASETS_VAL:
+        path = get_finetuned_path(cfg.model_location, dataset, model=cfg.model)
+        if os.path.exists(path):
+            logger.info(f"✓ {path} exists")
+            ft_checks.append(torch.load(path, map_location="cpu"))
+        else:
+            logger.error(f"✗ {path} does not exist")
+            raise FileNotFoundError(f"Fine-tuned checkpoint not found: {path}")
+
+    # Zeroshot checkpoint
+    first_dataset = cfg.DATASETS_VAL[0] if cfg.DATASETS_VAL else "dummy"
+    zeroshot_path = get_zeroshot_path(
+        cfg.model_location, first_dataset, model=cfg.model)
+    logger.info(f"Loading zeroshot model from: {zeroshot_path}")
+    ptm_check = torch.load(zeroshot_path, map_location="cpu")
+
+    overall_start = time.time()
+    task_vectors = [NonLinearTaskVector(
+        cfg.model, ptm_check, check) for check in ft_checks]
+
+    # Build SVD bases
+    svd_start = time.time()
+    svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
+    svd_time = time.time() - svd_start
+    logger.info(f"Computed SVD bases in {svd_time:.2f}s")
+
+    # Export basis
+    basis = {}
+    for key, value in svd_dict.items():
+        if isinstance(value, list) and len(value) == 3:
+            U_orth, diag_s, V_orth = value
+            sigma_vec = torch.diagonal(diag_s).clone().detach().cpu()
+            basis[key] = {
+                "U": U_orth.clone().detach().cpu(),
+                "V": V_orth.clone().detach().cpu(),
+                "sigma": sigma_vec,
+            }
+
+    # Sigma modules
+    sigma_modules = torch.nn.ModuleDict()
+    sigma_key_map = {}
+    for key, fv in basis.items():
+        if all(k in fv for k in ("U", "V", "sigma")):
+            U, V, sigma = fv["U"], fv["V"], fv["sigma"]
+            if U.ndim == 2 and V.ndim == 2 and sigma.ndim == 1:
+                safe_key = key.replace(".", "_")
+                if safe_key in sigma_key_map:
+                    suffix = 1
+                    candidate = f"{safe_key}_{suffix}"
+                    while candidate in sigma_key_map:
+                        suffix += 1
+                        candidate = f"{safe_key}_{suffix}"
+                    safe_key = candidate
+                sigma_key_map[safe_key] = key
+                sigma_modules[safe_key] = SigmaParametrization(U, V, sigma)
+    sigma_modules = sigma_modules.cuda()
+
+    # Count params
+    trainable_params = sum(p.numel()
+                           for p in sigma_modules.parameters() if p.requires_grad)
+    logger.info("=" * 80)
+    logger.info(f"Number of trainable sigma parameters: {trainable_params:,}")
+    logger.info(f"Number of sigma modules: {len(sigma_modules)}")
+    logger.info("=" * 80)
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # Dataset objects
+    val_dataset_name = test_ds + "Val"
+    k = int(cfg.train_k)
+    shot_folder = f"{k}shots" if k > 0 else "fullshots"
+
+    with open_dict(cfg):
+        if "save_dir" not in cfg:
+            cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
+
+    pretrained_encoder = ImageEncoder(cfg.model).cuda()
+    image_encoder = ImageEncoder(cfg.model).cuda()
+
+    # Train dataset (ImageNet ILSVRC train)
+    logger.info(f"Loading dataset for training: {val_dataset_name}")
+    train_preprocess = torchvision.transforms.Compose([
+        torchvision.transforms.RandomResizedCrop(size=224, scale=(
+            0.5, 1.0), interpolation=torchvision.transforms.InterpolationMode.BICUBIC),
+        torchvision.transforms.RandomHorizontalFlip(p=0.5),
+    ] + image_encoder.train_preprocess.transforms[-3:])
+
+    dataset_train = get_dataset(
+        test_ds,
+        train_preprocess,
+        location=cfg.data_location,
+        batch_size=cfg.batch_size,
+    )
+
+    classification_head = get_classification_head(cfg, test_ds)
+    model = ImageClassifier(image_encoder, classification_head).cuda()
+    model.freeze_head()
+
+    train_loader = get_dataloader(
+        dataset_train, is_train=True, args=cfg, image_encoder=None)
+
+    # k-shot sampling
+    if k is not None and k > 0:
+        logger.info(f"Applying k-shot sampling: {k} samples per class")
+        try:
+            selected_indices = sample_k_shot_indices(
+                dataset_train,
+                k,
+                seed=int(getattr(cfg, 'seed', 1)),
+                verbose=True,
+                progress_desc=f"{test_ds} {k}-shot",
+            )
+            base_dataset = getattr(dataset_train, "train_dataset", None)
+            if base_dataset is None:
+                base_dataset = getattr(train_loader, "dataset", None)
+            if base_dataset is not None:
+                num_workers = getattr(train_loader, "num_workers", 8)
+                collate_fn = getattr(train_loader, "collate_fn", None)
+                train_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.Subset(base_dataset, selected_indices),
+                    batch_size=cfg.batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    collate_fn=collate_fn,
+                )
+                logger.info(
+                    f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples")
+            else:
+                logger.warning(
+                    "Could not locate base train_dataset for k-shot subsetting; using full loader instead.")
+        except Exception as e:
+            logger.error(f"Failed to apply k-shot sampling: {e}")
+            logger.warning("Falling back to full training set")
+
+    # Save dirs
+    config_dir = os.path.join(
+        cfg.model_location, cfg.model, val_dataset_name, cfg.config_tag)
+    os.makedirs(config_dir, exist_ok=True)
+    energy_save_dir = os.path.join(config_dir, shot_folder)
+    os.makedirs(energy_save_dir, exist_ok=True)
+
+    # Optimizer
+    params = [p for p in sigma_modules.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        params, lr=cfg.sigma_lr, weight_decay=cfg.sigma_wd)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(
+        cfg.sigma_lr_step_size), gamma=float(cfg.sigma_lr_gamma))
+
+    # Base params/buffers snapshot
+    base_params = {name: p.detach().clone()
+                   for name, p in model.image_encoder.named_parameters()}
+    base_buffers = {name: b.detach().clone()
+                    for name, b in model.image_encoder.named_buffers()}
+    base_state_dict = {name: t.detach().clone()
+                       for name, t in model.image_encoder.state_dict().items()}
+
+    # History
+    loss_history = []
+    val_history = []
+    eval_epochs = set(range(int(cfg.sigma_epochs))) if int(cfg.sigma_epochs) <= 5 else {
+        min(int(cfg.sigma_epochs) - 1, int(round(i * (int(cfg.sigma_epochs) - 1) / 4))) for i in range(5)
+    }
+    eval_counter = 0
+
+    def record_validation(stage: str, epoch_value, accuracy_value):
+        nonlocal eval_counter
+        record = {
+            "stage": stage,
+            "epoch": int(epoch_value),
+            "accuracy": float(accuracy_value),
+            "elapsed_seconds": float(time.time() - overall_start),
+            "evaluation_index": int(eval_counter),
+        }
+        val_history.append(record)
+        eval_counter += 1
+        return record
+
+    # Pretrained/zeroshot evals
+    model.eval()
+    with torch.no_grad():
+        pretrained_metrics = eval_single_dataset(
+            pretrained_encoder, val_dataset_name, cfg)
+        pretrained_acc = pretrained_metrics['top1']
+        logger.info(
+            f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
+        record_validation("pretrained", -2, pretrained_acc)
+
+        eval_params = {name: p.clone() for name, p in base_params.items()}
+        for safe_key, module in sigma_modules.items():
+            orig_key = sigma_key_map.get(safe_key, safe_key)
+            if orig_key in eval_params and module.sigma.numel() > 0:
+                sigma_mod = cast(SigmaParametrization, module)
+                delta = sigma_mod.forward().to(eval_params[orig_key].device)
+                if eval_params[orig_key].shape == delta.shape:
+                    eval_params[orig_key] = eval_params[orig_key] + delta
+        model.image_encoder.load_state_dict(eval_params, strict=False)
+        zeroshot_metrics = eval_single_dataset(
+            model.image_encoder, val_dataset_name, cfg)
+        zeroshot_acc = zeroshot_metrics['top1']
+        logger.info(
+            f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
+        record_validation("zeroshot", -1, zeroshot_acc)
+        model.image_encoder.load_state_dict(base_state_dict, strict=False)
+
+    # Train
+    model.train()
+    epoch_times = []
+    logger.info(f"Starting sigma fine-tuning for {cfg.sigma_epochs} epochs...")
+    steps_per_epoch = len(cast(Sized, train_loader))
+    logger.info(
+        f"Train dataset size: {len(cast(Sized, train_loader.dataset))}, Batch size: {cfg.batch_size}, Steps per epoch: {steps_per_epoch}")
+
+    for epoch in range(int(cfg.sigma_epochs)):
+        epoch_start = time.time()
+        model.train()
+        for i, batch in enumerate(train_loader):
+            batch = maybe_dictionarize(batch)
+            inputs = batch["images"].cuda()
+            labels = batch["labels"].cuda()
+
+            delta_map = {}
+            for safe_key, module in sigma_modules.items():
+                orig_key = sigma_key_map.get(safe_key, safe_key)
+                if orig_key in base_params and module.sigma.numel() > 0:
+                    sigma_mod = cast(SigmaParametrization, module)
+                    delta = sigma_mod.forward()
+                    if delta.shape == base_params[orig_key].shape:
+                        delta_map[orig_key] = delta
+
+            params_map = {}
+            for name, p in base_params.items():
+                if name in delta_map:
+                    params_map[name] = p.detach() + delta_map[name]
+                else:
+                    params_map[name] = p.detach()
+
+            def encoder_forward(mod, x):
+                merged = {}
+                merged.update(base_buffers)
+                merged.update(params_map)
+                return functional_call(mod, merged, (x,))
+
+            features = encoder_forward(model.image_encoder, inputs)
+            logits = model.classification_head(features)
+            loss = torch.nn.functional.cross_entropy(logits, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            optimizer.step()
+
+            loss_history.append(
+                {"epoch": int(epoch), "iteration": int(i), "loss": float(loss.item())})
+
+            if i == 0:
+                try:
+                    grad_sum = 0.0
+                    for p in params:
+                        if p.grad is not None:
+                            grad_sum += float(p.grad.detach().abs().sum().item())
+                    logger.info(
+                        f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} grad_sum {grad_sum:.4e} lr {optimizer.param_groups[0]['lr']:.6f}")
+                except Exception:
+                    logger.info(
+                        f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
+
+        scheduler.step()
+        epoch_train_time = time.time() - epoch_start
+        epoch_times.append(epoch_train_time)
+
+        if epoch in eval_epochs:
+            model.eval()
+            with torch.no_grad():
+                eval_params = {name: p.clone()
+                               for name, p in base_params.items()}
+                for safe_key, module in sigma_modules.items():
+                    orig_key = sigma_key_map.get(safe_key, safe_key)
+                    if orig_key in eval_params and module.sigma.numel() > 0:
+                        sigma_mod = cast(SigmaParametrization, module)
+                        delta = sigma_mod.forward().to(
+                            eval_params[orig_key].device)
+                        if eval_params[orig_key].shape == delta.shape:
+                            eval_params[orig_key] = eval_params[orig_key] + delta
+                model.image_encoder.load_state_dict(eval_params, strict=False)
+                val_metrics = eval_single_dataset(
+                    model.image_encoder, val_dataset_name, cfg)
+                val_acc = val_metrics['top1']
+                logger.info(
+                    f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
+                record_validation("epoch", epoch, val_acc)
+                model.image_encoder.load_state_dict(
+                    base_state_dict, strict=False)
+            model.train()
+
+    # Materialize deltas and save
+    with torch.no_grad():
+        materialized = {name: p.clone() for name, p in base_params.items()}
+        for safe_key, module in sigma_modules.items():
+            orig_key = sigma_key_map.get(safe_key, safe_key)
+            if orig_key in materialized and module.sigma.numel() > 0:
+                sigma_mod = cast(SigmaParametrization, module)
+                delta = sigma_mod.forward().to(materialized[orig_key].device)
+                if materialized[orig_key].shape == delta.shape:
+                    materialized[orig_key] = materialized[orig_key] + delta
+        model.image_encoder.load_state_dict(materialized, strict=False)
+
+    os.makedirs(energy_save_dir, exist_ok=True)
+    energy_path = os.path.join(energy_save_dir, "energy.pt")
+    model.image_encoder.save(energy_path)
+    logger.info(f"Saved energy-trained encoder to {energy_path}")
+
+    # Final eval on ImageNet val
+    model.eval()
+    with torch.no_grad():
+        final_metrics = eval_single_dataset(
+            model.image_encoder, val_dataset_name, cfg)
+        final_acc = final_metrics['top1']
+    logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
+    record_validation("final", int(cfg.sigma_epochs), final_acc)
+
+    # OOD evals + include ImageNet val in a single combined dict
+    ood_results = {}
+    ood_list = ["ImageNetA", "ImageNetR", "ImageNetSketch", "ImageNetV2MFVal"]
+    logger.info("\n" + "=" * 100)
+    logger.info("Evaluating on OOD datasets...")
+    logger.info("=" * 100 + "\n")
+    model.eval()
+    with torch.no_grad():
+        for ood_name in ood_list:
+            try:
+                m = eval_single_dataset(model.image_encoder, ood_name, cfg)
+                ood_results[ood_name] = float(m.get("top1", 0.0))
+                logger.info(
+                    f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
+                record_validation(f"ood:{ood_name}", int(
+                    cfg.sigma_epochs), ood_results[ood_name])
+            except Exception as e:
+                logger.error(f"Failed OOD eval on {ood_name}: {e}")
+                ood_results[ood_name] = None
+
+    # Compose unified evaluation results
+    all_eval_accuracies = {val_dataset_name: float(final_acc)}
+    for k_name, v_acc in ood_results.items():
+        all_eval_accuracies[k_name] = float(
+            'nan') if v_acc is None else float(v_acc)
+
+    # Timings
+    min_epoch_time = min(epoch_times) if epoch_times else 0.0
+    avg_epoch_time = sum(epoch_times) / \
+        len(epoch_times) if epoch_times else 0.0
+    logger.info(
+        f"Training time per epoch - Min: {min_epoch_time:.2f}s, Avg: {avg_epoch_time:.2f}s")
+    gpu_peak_mem_mb = None
+    if torch.cuda.is_available():
+        gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        logger.info(
+            f"Peak GPU memory during training: {gpu_peak_mem_mb:.2f} MB")
+
+    # Save results JSON
+    results_path = os.path.join(
+        energy_save_dir, f"energy_results_imagenet.json")
+    results = {
+        "target_dataset": test_ds,
+        "final_accuracy": float(final_acc),
+        "k_shot": k,
+        "model": cfg.model,
+        "sigma_epochs": cfg.sigma_epochs,
+        "sigma_lr": cfg.sigma_lr,
+        "svd_keep_topk": getattr(cfg, "svd_keep_topk", 2),
+        "initialize_sigma": getattr(cfg, "initialize_sigma", None),
+        "adapter_choice": getattr(cfg, "adapter", "none"),
+        "training_time": min_epoch_time,
+        "avg_epoch_time": avg_epoch_time,
+        "all_epoch_times": epoch_times,
+        "trainable_params": trainable_params,
+        "batch_size": cfg.batch_size,
+        "gpu_peak_mem_mb": gpu_peak_mem_mb,
+        "loss_history": loss_history,
+        "validation_history": val_history,
+        "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
+        "pretrained_accuracy": float(pretrained_acc),
+        "zeroshot_accuracy": float(zeroshot_acc),
+        "config_tag": cfg.config_tag,
+        "ood_accuracies": ood_results,
+        "all_eval_accuracies": all_eval_accuracies,
+    }
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=4)
+    logger.info(f"✓ Saved results to {results_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ImageNet Energy-based few-shot training with OOD evaluation",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Required
+    parser.add_argument("--test_dataset", type=str, default="ImageNetILSVRC",
+                        help="Held-out dataset to train (ImageNetILSVRC)")
+
+    # Config/model
+    parser.add_argument("--config_file", type=str,
+                        default="config/config_reverse.yaml", help="Path to configuration YAML file")
+    parser.add_argument("--model", type=str,
+                        help="Vision backbone (e.g., ViT-B-32, ViT-B-16)")
+
+    # Training hyperparameters
+    parser.add_argument("--sigma_epochs", type=int,
+                        help="Number of sigma training epochs")
+    parser.add_argument("--sigma_lr", type=float,
+                        help="Learning rate for sigma optimization")
+    parser.add_argument("--sigma_wd", type=float,
+                        help="Weight decay for sigma optimization")
+    parser.add_argument("--sigma_lr_step_size", type=int,
+                        help="LR scheduler step size")
+    parser.add_argument("--sigma_lr_gamma", type=float,
+                        help="LR scheduler gamma")
+    parser.add_argument("--batch_size", type=int, help="Training batch size")
+    parser.add_argument("--k", type=int, dest="train_k",
+                        help="K-shot samples per class (0=fullshot)")
+
+    # SVD
+    parser.add_argument("--svd_keep_topk", type=int,
+                        help="Number of singular vectors to keep per task")
+    parser.add_argument("--initialize_sigma", type=str, default="average",
+                        choices=["average"], help="Initialization strategy for sigma basis")
+
+    # Other
+    parser.add_argument("--config_tag", type=str,
+                        help="Custom tag for output directory")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="Random seed for k-shot sampling")
+    parser.add_argument("--data_location", type=str, default="./datasets",
+                        help="Root dir containing 'imagenet' and OOD datasets")
+    parser.add_argument("--model_location", type=str,
+                        default="./models/checkpoints", help="Where checkpoints/heads are stored")
+    parser.add_argument("--num_tasks", type=int, default=15,
+                        help="How many basis tasks to use from ALL_DATASETS")
+    parser.add_argument("--device", type=str, default="cuda", help="Device")
+
+    args = parser.parse_args()
+
+    cfg = OmegaConf.load(args.config_file)
+    OmegaConf.set_struct(cfg, False)
+    cli_overrides = {k: v for k, v in vars(
+        args).items() if v is not None and k != "config_file"}
+    if cli_overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.create(cli_overrides))
+    OmegaConf.set_struct(cfg, True)
+
+    run_imagenet_energy(cfg)
+
+
+if __name__ == "__main__":
+    main()
