@@ -42,3 +42,4 @@ svd_keep_topk: 5
 world_size: 1
 blockwise_coef: true
 seed: 1
+warmup_ratio: 0.1

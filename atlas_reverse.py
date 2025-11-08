@@ -23,6 +23,13 @@ from tqdm.auto import tqdm
 # Disable problematic attention backends that cause "No execution plans support the graph" error
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
+# torch.backends.cuda.enable_cudnn_sdp(False)
+# # Additional cuDNN settings for H100 compatibility
+# torch.backends.cudnn.allow_tf32 = False
+# torch.backends.cuda.matmul.allow_tf32 = False
+# # Set cuDNN benchmark to False for stability
+# torch.backends.cudnn.benchmark = False
+# torch.backends.cudnn.deterministic = True
 
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
@@ -48,6 +55,97 @@ from src.datasets.remote_sensing import sample_k_shot_indices
 
 # Evaluation function for general datasets
 from src.eval.eval import eval_single_dataset
+from src.eval.eval_remote_sensing_comparison import evaluate_encoder_with_dataloader
+
+
+def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
+    """Save k-shot indices to a JSON file."""
+    os.makedirs(save_dir, exist_ok=True)
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    with open(indices_path, 'w') as f:
+        json.dump({"indices": indices, "dataset": dataset_name, "k": k, "seed": seed}, f)
+    return indices_path
+
+
+def load_k_shot_indices(save_dir, k, seed):
+    """Load k-shot indices from a JSON file if it exists."""
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    if os.path.exists(indices_path):
+        with open(indices_path, 'r') as f:
+            data = json.load(f)
+            return data["indices"]
+    return None
+
+
+def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
+    """Subsample target_k indices per class from a larger k-shot set.
+    
+    This is much faster than re-sampling from the entire dataset.
+    Uses deterministic selection (first target_k samples per class).
+    """
+    import numpy as np
+    from torch.utils.data import Subset
+    
+    # Get base dataset if wrapped in Subset
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    
+    # Extract labels efficiently
+    labels = []
+    
+    # Try fast methods first
+    if hasattr(base_dataset, 'targets'):
+        # Direct targets attribute (CIFAR, MNIST, etc.)
+        all_targets = base_dataset.targets
+        if torch.is_tensor(all_targets):
+            all_targets = all_targets.cpu().numpy()
+        elif not isinstance(all_targets, np.ndarray):
+            all_targets = np.array(all_targets)
+        labels = [int(all_targets[idx]) for idx in larger_indices]
+    
+    elif hasattr(base_dataset, 'samples'):
+        # ImageFolder style: samples is list of (path, label)
+        all_samples = base_dataset.samples
+        labels = [int(all_samples[idx][1]) for idx in larger_indices]
+    
+    elif hasattr(base_dataset, '_labels'):
+        # Custom datasets with _labels attribute
+        all_labels = base_dataset._labels
+        if torch.is_tensor(all_labels):
+            all_labels = all_labels.cpu().numpy()
+        elif not isinstance(all_labels, np.ndarray):
+            all_labels = np.array(all_labels)
+        labels = [int(all_labels[idx]) for idx in larger_indices]
+    
+    else:
+        # Fallback: iterate through indices (slower but safe)
+        for idx in larger_indices:
+            try:
+                _, label = base_dataset[idx]
+                if torch.is_tensor(label):
+                    label = label.item()
+                elif isinstance(label, np.ndarray):
+                    label = int(label)
+                labels.append(int(label))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to extract label at index {idx} from dataset {type(base_dataset).__name__}. "
+                    f"Error: {e}"
+                )
+    
+    # Group indices by class
+    class_to_indices = {}
+    for idx, label in zip(larger_indices, labels):
+        if label not in class_to_indices:
+            class_to_indices[label] = []
+        class_to_indices[label].append(idx)
+    
+    # Select first target_k from each class (deterministic)
+    selected_indices = []
+    for label in sorted(class_to_indices.keys()):
+        class_indices = class_to_indices[label][:target_k]
+        selected_indices.extend(class_indices)
+    
+    return selected_indices
 
 
 def _sanitize_value(val):
@@ -92,7 +190,7 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     return logger
 
 # Dataset-specific epochs for Atlas training (general datasets)
-{
+ATLAS_EPOCHS_PER_DATASET = {
     # "Cars": 35,
     "DTD": 76,
     # "EuroSAT": 12,
@@ -106,7 +204,7 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     "STL10": 60,
     "Food101": 4,
     "Flowers102": 147,
-    "FER2013": 10,
+    # "FER2013": 10,
     "PCAM": 1,
     "OxfordIIITPet": 82,
     "RenderedSST2": 39,
@@ -560,9 +658,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     model.freeze_head()
     model = model.cuda()
 
-    # Prepare validation dataset
-    eval_dataset = None
-    val_loader = None
+    # Prepare validation dataset (reuse across evaluations)
     logger.info(f"Loading validation dataset: {target_dataset}")
     eval_dataset = get_dataset(
         orig_dataset,
@@ -573,6 +669,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     val_loader = get_dataloader(
         eval_dataset, is_train=False, args=args, image_encoder=None
     )
+    logger.info(f"✓ Validation dataset loaded ({len(val_loader.dataset)} samples)")
 
     # Few-shot sampling using unified k-shot function
     k = getattr(args, 'k', 0)
@@ -584,13 +681,56 @@ def train_single_task(args, comp_acc=None, logger=None):
     if k > 0:
         logger.info(f"Applying k-shot sampling: {k} samples per class")
         try:
-            selected_indices = sample_k_shot_indices(
-                train_dataset,
-                k,
-                seed=int(getattr(args, 'seed', 1)),
-                verbose=True,
-                progress_desc=f"{target_dataset} {k}-shot",
-            )
+            seed = int(getattr(args, 'seed', 1))
+            
+            # Create directory for saving indices
+            indices_save_dir = os.path.join(args.model_location, args.model, target_dataset)
+            
+            # Try to load existing k-shot indices
+            selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
+            
+            if selected_indices is not None:
+                logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
+            else:
+                # Try to subsample from larger k (e.g., 16-shot)
+                larger_k = 16
+                if k < larger_k:
+                    larger_indices = load_k_shot_indices(indices_save_dir, larger_k, seed)
+                    if larger_indices is not None:
+                        logger.info(f"✓ Subsampling from existing {larger_k}-shot indices to {k}-shot")
+                        # Get base dataset for label extraction
+                        base_ds = getattr(train_dataset, "train_dataset", train_dataset)
+                        selected_indices = subsample_from_larger_k(larger_indices, base_ds, k, seed)
+                        # Save for future use
+                        indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                    else:
+                        # Sample new indices from scratch
+                        logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                        selected_indices = sample_k_shot_indices(
+                            train_dataset,
+                            k,
+                            seed=seed,
+                            verbose=True,
+                            progress_desc=f"{target_dataset} {k}-shot",
+                        )
+                        # Save the indices for future use
+                        indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                else:
+                    # k >= larger_k, need to sample from scratch
+                    logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                    selected_indices = sample_k_shot_indices(
+                        train_dataset,
+                        k,
+                        seed=seed,
+                        verbose=True,
+                        progress_desc=f"{target_dataset} {k}-shot",
+                    )
+                    # Save the indices for future use
+                    indices_path = save_k_shot_indices(selected_indices, indices_save_dir, target_dataset, k, seed)
+                    logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+            
             base_dataset = getattr(train_dataset, "train_dataset", None)
             if base_dataset is None:
                 base_dataset = getattr(train_loader, "dataset", None)
@@ -652,19 +792,13 @@ def train_single_task(args, comp_acc=None, logger=None):
     val_history = []
     record_validation = ValidationRecorder(overall_start, val_history)
 
-    # Evaluate zeroshot accuracy using unified evaluation function
+    # Evaluate zeroshot accuracy using pre-loaded dataloader
     image_encoder.eval()
     classification_head.eval()
     
-    # Create a temporary config-like object for eval_single_dataset
-    from types import SimpleNamespace
-    # eval_cfg = SimpleNamespace(
-    #     data_location=args.data_location,
-    #     batch_size=args.batch_size,
-    #     device='cuda'
-    # )
-    # print(eval_cfg)
-    pretrained_metrics = eval_single_dataset(image_encoder, target_dataset, args)
+    pretrained_metrics = evaluate_encoder_with_dataloader(
+        image_encoder, classification_head, val_loader, args.device
+    )
     pretrained_acc = pretrained_metrics['top1']
     comp_acc[f"{target_dataset}_zeroshot"] = pretrained_acc
     args.zs_acc[f"{target_dataset}"] = pretrained_acc
@@ -741,7 +875,7 @@ def train_single_task(args, comp_acc=None, logger=None):
         epoch_times.append(epoch_train_time)
         logger.info(f"Epoch {epoch} training time: {epoch_train_time:.2f}s")
 
-        # Evaluate after selected epochs using unified evaluation function
+        # Evaluate after selected epochs using pre-loaded dataloader
         if epoch in eval_epochs:
             image_encoder = model.image_encoder
             coef = model.image_encoder.coef
@@ -749,8 +883,10 @@ def train_single_task(args, comp_acc=None, logger=None):
             image_encoder.eval()
             classification_head.eval()
             
-            # Use unified evaluation function
-            metrics = eval_single_dataset(image_encoder, target_dataset, args)
+            # Use pre-loaded dataloader
+            metrics = evaluate_encoder_with_dataloader(
+                image_encoder, classification_head, val_loader, args.device
+            )
             acc = metrics['top1']
             
             # Set back to train mode
@@ -770,11 +906,13 @@ def train_single_task(args, comp_acc=None, logger=None):
     image_encoder = model.image_encoder
     image_encoder.coef = torch.nn.Parameter(best_coef)
 
-    # Final evaluation using unified evaluation function
+    # Final evaluation using pre-loaded dataloader
     image_encoder.eval()
     classification_head.eval()
 
-    final_metrics = eval_single_dataset(image_encoder, target_dataset, args)
+    final_metrics = evaluate_encoder_with_dataloader(
+        image_encoder, classification_head, val_loader, args.device
+    )
     final_acc = final_metrics['top1']
 
     comp_acc[target_dataset_clean] = final_acc

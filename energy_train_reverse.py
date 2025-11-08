@@ -25,9 +25,104 @@ from src.eval.eval import eval_single_dataset
 import torch
 from src.models.task_vectors import NonLinearTaskVector
 from torch.nn.utils.stateless import functional_call
-
+from src.utils.utils import cosine_lr
+from atlas_reverse import train_adapter
 
 from src.datasets.remote_sensing import sample_k_shot_indices
+from src.eval.eval_remote_sensing_comparison import (
+    visualize_sigma_matrices,
+    evaluate_encoder_with_dataloader,
+)
+
+
+def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
+    """Save k-shot indices to a JSON file."""
+    os.makedirs(save_dir, exist_ok=True)
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    with open(indices_path, 'w') as f:
+        json.dump({"indices": indices, "dataset": dataset_name, "k": k, "seed": seed}, f)
+    return indices_path
+
+
+def load_k_shot_indices(save_dir, k, seed):
+    """Load k-shot indices from a JSON file if it exists."""
+    indices_path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+    if os.path.exists(indices_path):
+        with open(indices_path, 'r') as f:
+            data = json.load(f)
+            return data["indices"]
+    return None
+
+
+def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
+    """Subsample target_k indices per class from a larger k-shot set.
+    
+    This is much faster than re-sampling from the entire dataset.
+    Uses deterministic selection (first target_k samples per class).
+    """
+    import numpy as np
+    from torch.utils.data import Subset
+    
+    # Get base dataset if wrapped in Subset
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    
+    # Extract labels efficiently
+    labels = []
+    
+    # Try fast methods first
+    if hasattr(base_dataset, 'targets'):
+        # Direct targets attribute (CIFAR, MNIST, etc.)
+        all_targets = base_dataset.targets
+        if torch.is_tensor(all_targets):
+            all_targets = all_targets.cpu().numpy()
+        elif not isinstance(all_targets, np.ndarray):
+            all_targets = np.array(all_targets)
+        labels = [int(all_targets[idx]) for idx in larger_indices]
+    
+    elif hasattr(base_dataset, 'samples'):
+        # ImageFolder style: samples is list of (path, label)
+        all_samples = base_dataset.samples
+        labels = [int(all_samples[idx][1]) for idx in larger_indices]
+    
+    elif hasattr(base_dataset, '_labels'):
+        # Custom datasets with _labels attribute
+        all_labels = base_dataset._labels
+        if torch.is_tensor(all_labels):
+            all_labels = all_labels.cpu().numpy()
+        elif not isinstance(all_labels, np.ndarray):
+            all_labels = np.array(all_labels)
+        labels = [int(all_labels[idx]) for idx in larger_indices]
+    
+    else:
+        # Fallback: iterate through indices (slower but safe)
+        for idx in larger_indices:
+            try:
+                _, label = base_dataset[idx]
+                if torch.is_tensor(label):
+                    label = label.item()
+                elif isinstance(label, np.ndarray):
+                    label = int(label)
+                labels.append(int(label))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to extract label at index {idx} from dataset {type(base_dataset).__name__}. "
+                    f"Error: {e}"
+                )
+    
+    # Group indices by class
+    class_to_indices = {}
+    for idx, label in zip(larger_indices, labels):
+        if label not in class_to_indices:
+            class_to_indices[label] = []
+        class_to_indices[label].append(idx)
+    
+    # Select first target_k from each class (deterministic)
+    selected_indices = []
+    for label in sorted(class_to_indices.keys()):
+        class_indices = class_to_indices[label][:target_k]
+        selected_indices.extend(class_indices)
+    
+    return selected_indices
 
 
 
@@ -74,11 +169,12 @@ def _sanitize_value(val):
 
 
 def build_energy_config_tag(cfg) -> str:
-    num_tasks_minus_one = _sanitize_value(max(int(getattr(cfg, "num_tasks", 0)) - 1, 0))
+    num_tasks_minus_one = _sanitize_value(len(cfg.DATASETS_ALL) - 1)
     lr_part = _sanitize_value(cfg.sigma_lr)
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
-    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}"
+    warmup_ratio_part = _sanitize_value(getattr(cfg, "warmup_ratio", 0.1))
+    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}_{warmup_ratio_part}"
 
 
 def normalize_adapter_choice(value: str) -> str:
@@ -139,7 +235,7 @@ SIGMA_EPOCHS_PER_DATASET = {
     "STL10": 60,
     "Food101": 4,
     "Flowers102": 147,
-    "FER2013": 10,
+    # "FER2013": 10,
     "PCAM": 1,
     "OxfordIIITPet": 82,
     "RenderedSST2": 39,
@@ -159,6 +255,119 @@ def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
     }
     return eval_epochs
 
+def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
+    """
+    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
+    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
+    '재계산된 평균' sigma(diag)로 재구성.
+    """
+    device = config.device
+    datasets = list(config.DATASETS)
+    num_tasks = int(len(datasets))
+    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
+    with torch.no_grad():
+        new_vector = {}
+        # 공통 필터 함수(임베딩류 제외)
+        def is_matrix_key(tv0, key):
+            return (
+                tv0.vector[key].ndim == 2 and
+                all(t not in key for t in ("text_projection",
+                    "positional", "token_embedding"))
+            )
+        # 키 순회
+        tv0 = task_vectors[0]
+        for key in tv0.vector:
+            # 2D 행렬이 아니거나 제외 키면: 단순 평균
+            if not is_matrix_key(tv0, key):
+                avg = None
+                for i, tv in enumerate(task_vectors):
+                    vec = tv.vector[key].to(device)
+                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
+                new_vector[key] = avg
+                continue
+            # -------- SVD 축 모으기 준비 --------
+            # 첫 태스크에서 모양/순위 파악
+            vec0 = task_vectors[0].vector[key].to(device)
+            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
+            m = int(u0.shape[0])
+            r = int(s0.shape[0])          # 유효 랭크 상한
+            n = int(vh0.shape[1])
+            if r == 0:
+                # 드물지만 0-rank 보호장치
+                new_vector[key] = torch.zeros_like(vec0)
+                continue
+            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
+            num_used = min(num_tasks, r)
+            # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
+            # k = max(1, r // num_used)
+            max_per_task = max(1, r // num_used)
+            k = min(desired_k, max_per_task)
+            if desired_k > max_per_task:
+                print(
+                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
+                    desired_k,
+                    max_per_task,
+                    key,
+                    k,
+                )
+            chunks = int(k * num_used)    # <= r 보장
+            # print(f"chunks: {chunks}")
+            # 버퍼를 '정수 차원'으로 명시해 생성
+            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
+            # sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype) # [수정] 더 이상 sum_s 필요 없음
+            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
+            # 각 태스크에서 상위 k개 축만 수집
+            for i, tv in enumerate(task_vectors[:num_used]):
+                vec = tv.vector[key].to(device)
+                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
+                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
+                r_i = int(s.shape[0])
+                k_i = min(k, r_i)  # 안전 클램프
+                start = i * k
+                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
+                sum_u[:, start:end] = u[:, :k_i]
+                # sum_s[start:end] = s[:k_i] # [수정] 더 이상 sum_s 필요 없음
+                sum_v[start:end, :] = vh[:k_i, :]
+            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
+            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
+            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
+            U_orth = u_u @ vh_u          # (m × chunks)
+            V_orth = u_v @ vh_v          # (chunks × n)
+            # -------- [수정된 Sigma 계산 로직 시작] --------
+            # 1. 각 태스크 벡터(M_i)를 공통 기저(U_orth, V_orth)로 투영하여
+            #    최적의 대각 행렬(sigma_task)을 찾습니다.
+            #    M_i ≈ U_orth @ Sigma_i @ V_orth 이므로,
+            #    Sigma_i' = U_orth.T @ M_i @ V_orth.T 를 계산합니다.
+            all_sigma_diags = []
+            # U_orth (m, chunks) -> U_orth.T (chunks, m)
+            # V_orth (chunks, n) -> V_orth.T (n, chunks)
+            U_orth_T = U_orth.T
+            V_orth_T = V_orth.T
+            # "모든" 태스크 벡터에 대해 반복 (num_used 뿐만 아니라)
+            for tv in task_vectors:
+                M_i = tv.vector[key].to(device)  # 원본 태스크 행렬 (m, n)
+                # Sigma_i_prime = (U_orth.T @ M_i) @ V_orth.T
+                # (chunks, m) @ (m, n) @ (n, chunks) -> (chunks, chunks)
+                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T
+                # "이를 diagonal로 만들도록 해야해" -> 대각 성분만 추출
+                sigma_task_diag = torch.diag(Sigma_i_prime)  # (chunks,)
+                all_sigma_diags.append(sigma_task_diag)
+            # 2. 모든 태스크의 sigma_task_diag를 평균냅니다.
+            if not all_sigma_diags:
+                # 엣지 케이스 방어
+                Sigma = torch.zeros(
+                    (chunks, chunks), device=device, dtype=u0.dtype)
+            else:
+                # (num_tasks, chunks)
+                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
+                # (chunks,)
+                mean_sigma_diag = torch.sum(stacked_sigmas, dim=0)
+                # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
+                Sigma = torch.diag(mean_sigma_diag)   # (chunks, chunks)
+            # -------- [수정된 Sigma 계산 로직 끝] --------
+            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
+            new_vector[key] = [U_orth, Sigma, V_orth]
+    return new_vector
 
 def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
     """
@@ -460,6 +669,9 @@ def run_energy(cfg: DictConfig) -> None:
     elif init_mode == "average":
         logger.info("Using average SVD initialization")
         svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
+    elif init_mode == "sum":
+        logger.info("Using sum SVD initialization")
+        svd_dict = compute_and_sum_svd_mem_reduction_sum(task_vectors, cfg)
     svd_time = time.time() - svd_start
     logger.info(f"Computed SVD bases in {svd_time:.2f}s")
 
@@ -565,13 +777,55 @@ def run_energy(cfg: DictConfig) -> None:
         if k is not None and k > 0:
             logger.info(f"Applying k-shot sampling: {k} samples per class")
             try:
-                selected_indices = sample_k_shot_indices(
-                    dataset_train,
-                    k,
-                    seed=int(getattr(cfg, 'seed', 1)),
-                    verbose=True,
-                    progress_desc=f"{test_ds} {k}-shot",
-                )
+                seed = int(getattr(cfg, 'seed', 1))
+                
+                # Create directory for saving indices
+                indices_save_dir = os.path.join(cfg.model_location, cfg.model, val_dataset_name)
+                
+                # Try to load existing k-shot indices
+                selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
+                
+                if selected_indices is not None:
+                    logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
+                else:
+                    # Try to subsample from larger k (e.g., 16-shot)
+                    larger_k = 16
+                    if k < larger_k:
+                        larger_indices = load_k_shot_indices(indices_save_dir, larger_k, seed)
+                        if larger_indices is not None:
+                            logger.info(f"✓ Subsampling from existing {larger_k}-shot indices to {k}-shot")
+                            # Get base dataset for label extraction
+                            base_ds = getattr(dataset_train, "train_dataset", dataset_train)
+                            selected_indices = subsample_from_larger_k(larger_indices, base_ds, k, seed)
+                            # Save for future use
+                            indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                            logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                        else:
+                            # Sample new indices from scratch
+                            logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                            selected_indices = sample_k_shot_indices(
+                                dataset_train,
+                                k,
+                                seed=seed,
+                                verbose=True,
+                                progress_desc=f"{test_ds} {k}-shot",
+                            )
+                            # Save the indices for future use
+                            indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                            logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+                    else:
+                        # k >= larger_k, need to sample from scratch
+                        logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                        selected_indices = sample_k_shot_indices(
+                            dataset_train,
+                            k,
+                            seed=seed,
+                            verbose=True,
+                            progress_desc=f"{test_ds} {k}-shot",
+                        )
+                        # Save the indices for future use
+                        indices_path = save_k_shot_indices(selected_indices, indices_save_dir, val_dataset_name, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
                 
                 # Get base dataset
                 base_dataset = getattr(dataset_train, "train_dataset", None)
@@ -597,6 +851,19 @@ def run_energy(cfg: DictConfig) -> None:
                 logger.error(f"Failed to apply k-shot sampling: {e}")
                 logger.warning("Falling back to full training set")
 
+        # Prepare validation dataset and loader (reuse across evaluations)
+        logger.info(f"Loading validation dataset: {val_dataset_name}")
+        val_dataset = get_dataset(
+            test_ds,
+            image_encoder.val_preprocess,
+            location=cfg.data_location,
+            batch_size=cfg.batch_size,
+        )
+        val_loader = get_dataloader(
+            val_dataset, is_train=False, args=cfg, image_encoder=None
+        )
+        logger.info(f"✓ Validation dataset loaded ({len(val_loader.dataset)} samples)")
+
         config_dir = os.path.join(
             cfg.model_location,
             cfg.model,
@@ -610,9 +877,11 @@ def run_energy(cfg: DictConfig) -> None:
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             params, lr=cfg.sigma_lr, weight_decay=cfg.sigma_wd)
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=int(cfg.sigma_lr_step_size), gamma=float(cfg.sigma_lr_gamma)
-        )
+        
+        # Use cosine annealing scheduler (same as Atlas)
+        num_batches = len(train_loader)
+        total_steps = int(cfg.sigma_epochs) * num_batches
+        scheduler = cosine_lr(optimizer, cfg.sigma_lr, int(cfg.warmup_ratio * total_steps), total_steps)
 
         # capture cloned base parameters and buffers for functional_call
         base_params = {
@@ -648,10 +917,18 @@ def run_energy(cfg: DictConfig) -> None:
             eval_counter += 1
             return record
 
+        # Prepare visualization directory
+        visualization_dir = os.path.join(
+            energy_save_dir, f"sigma_visualization_{adapter_tag}"
+        )
+        os.makedirs(visualization_dir, exist_ok=True)
+
         # Log zeroshot accuracy before any sigma updates
         model.eval()
         with torch.no_grad():
-            pretrained_metrics = eval_single_dataset(pretrained_encoder, val_dataset_name, cfg)
+            pretrained_metrics = evaluate_encoder_with_dataloader(
+                pretrained_encoder, classification_head, val_loader, cfg.device
+            )
             pretrained_acc = pretrained_metrics['top1']
             logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
             record_validation("pretrained", -2, pretrained_acc)
@@ -667,12 +944,25 @@ def run_energy(cfg: DictConfig) -> None:
                         eval_params[orig_key] = eval_params[orig_key] + delta
 
             model.image_encoder.load_state_dict(eval_params, strict=False)
-            zeroshot_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
+            zeroshot_metrics = evaluate_encoder_with_dataloader(
+                model.image_encoder, classification_head, val_loader, cfg.device
+            )
             zeroshot_acc = zeroshot_metrics['top1']
             logger.info(f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
             record_validation("zeroshot", -1, zeroshot_acc)
             model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
+        sigma_records = []
+        records = visualize_sigma_matrices(
+            sigma_modules,
+            sigma_key_map,
+            epoch=-1,
+            save_path=os.path.join(visualization_dir, "sigma_epoch_-1.png"),
+            title=f"{test_ds} ({shot_folder})",
+            json_path=os.path.join(visualization_dir, "sigma_epoch_-1.json"),
+        )
+        if records:
+            sigma_records.extend(records)
         model.train()
         
         logger.info(f"Starting sigma fine-tuning for {cfg.sigma_epochs} epochs...")
@@ -684,6 +974,8 @@ def run_energy(cfg: DictConfig) -> None:
             epoch_start = time.time()
             model.train()
             for i, batch in enumerate(train_loader):
+                step = epoch * num_batches + i
+                
                 batch = maybe_dictionarize(batch)
                 inputs = batch["images"].cuda()
                 labels = batch["labels"].cuda()
@@ -719,6 +1011,7 @@ def run_energy(cfg: DictConfig) -> None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()
+                scheduler(step)  # Update learning rate at each step
 
                 loss_history.append(
                     {
@@ -740,9 +1033,6 @@ def run_energy(cfg: DictConfig) -> None:
                         logger.info(
                             f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
 
-            # step scheduler at end of epoch
-            scheduler.step()
-
             # Record training time for this epoch (before validation)
             epoch_train_time = time.time() - epoch_start
             epoch_times.append(epoch_train_time)
@@ -762,7 +1052,9 @@ def run_energy(cfg: DictConfig) -> None:
 
                     model.image_encoder.load_state_dict(eval_params, strict=False)
 
-                    val_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
+                    val_metrics = evaluate_encoder_with_dataloader(
+                        model.image_encoder, classification_head, val_loader, cfg.device
+                    )
                     val_acc = val_metrics['top1']
 
                     logger.info(f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
@@ -770,6 +1062,16 @@ def run_energy(cfg: DictConfig) -> None:
 
                     model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
+                records = visualize_sigma_matrices(
+                    sigma_modules,
+                    sigma_key_map,
+                    epoch=epoch,
+                    save_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.png"),
+                    title=f"{test_ds} ({shot_folder})",
+                    json_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.json"),
+                )
+                if records:
+                    sigma_records.extend(records)
                 model.train()
 
         # Finalize weights and save: materialize the final deltas onto base params
@@ -786,12 +1088,6 @@ def run_energy(cfg: DictConfig) -> None:
             # load back into encoder
             model.image_encoder.load_state_dict(materialized, strict=False)
         
-        # Save with k-shot folder structure
-        os.makedirs(energy_save_dir, exist_ok=True)
-        energy_path = os.path.join(energy_save_dir, "energy.pt")
-        model.image_encoder.save(energy_path)
-        logger.info(f"Saved energy-trained encoder to {energy_path}")
-        
         # Final evaluation on validation set
         logger.info("\n" + "=" * 100)
         logger.info("Final evaluation on validation set...")
@@ -799,7 +1095,9 @@ def run_energy(cfg: DictConfig) -> None:
         
         model.eval()
         with torch.no_grad():
-            final_metrics = eval_single_dataset(model.image_encoder, val_dataset_name, cfg)
+            final_metrics = evaluate_encoder_with_dataloader(
+                model.image_encoder, classification_head, val_loader, cfg.device
+            )
             final_acc = final_metrics['top1']
         
         logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
@@ -815,8 +1113,39 @@ def run_energy(cfg: DictConfig) -> None:
             gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
             logger.info(f"Peak GPU memory during training: {gpu_peak_mem_mb:.2f} MB")
 
+        records = visualize_sigma_matrices(
+            sigma_modules,
+            sigma_key_map,
+            epoch="final",
+            save_path=os.path.join(visualization_dir, "sigma_epoch_final.png"),
+            title=f"{test_ds} ({shot_folder})",
+            json_path=os.path.join(visualization_dir, "sigma_epoch_final.json"),
+        )
+        if records:
+            sigma_records.extend(records)
+
+        # Optional adapter fine-tuning (TIP / LP++) after sigma training
+        adapter_summary = None
+        adapter_result_tag = adapter_path_tag(adapter_display)
+        if cfg.adapter != "none":
+            adapter_args = SimpleNamespace(
+                adapter=cfg.adapter,
+                batch_size=int(cfg.batch_size),
+                num_grad_accumulation=int(getattr(cfg, "num_grad_accumulation", 1)),
+                wd=float(getattr(cfg, "adapter_wd", cfg.sigma_wd)),
+                lr=float(getattr(cfg, "adapter_lr", cfg.sigma_lr)),
+                k=int(getattr(cfg, "train_k", 0)),
+            )
+            # Reuse val_loader that was already created
+            adapter_ready_model = AdapterCompatibleClassifier(model)
+            adapter_summary = train_adapter(
+                adapter_ready_model, train_loader, val_loader, adapter_args, logger, energy_save_dir
+            )
+            if adapter_summary:
+                adapter_result_tag = adapter_path_tag(adapter_summary["adapter_type"])
+
         # Save results to JSON
-        results_path = os.path.join(energy_save_dir, f"energy_results_none.json")
+        results_path = os.path.join(energy_save_dir, f"energy_results_{adapter_result_tag}.json")
         results = {
             "target_dataset": test_ds,
             "final_accuracy": float(final_acc),
@@ -839,6 +1168,7 @@ def run_energy(cfg: DictConfig) -> None:
             "pretrained_accuracy": float(pretrained_acc),
             "zeroshot_accuracy": float(zeroshot_acc),
             "config_tag": cfg.config_tag,
+            "adapter_results": adapter_summary,
         }
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=4)
@@ -883,8 +1213,6 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_epochs", type=int, help="Number of sigma training epochs")
     parser.add_argument("--sigma_lr", type=float, help="Learning rate for sigma optimization")
     parser.add_argument("--sigma_wd", type=float, help="Weight decay for sigma optimization")
-    parser.add_argument("--sigma_lr_step_size", type=int, help="LR scheduler step size")
-    parser.add_argument("--sigma_lr_gamma", type=float, help="LR scheduler gamma")
     parser.add_argument("--batch_size", type=int, help="Training batch size")
     parser.add_argument(
         "--k",
@@ -892,6 +1220,7 @@ if __name__ == "__main__":
         dest="train_k",
         help="K-shot samples per class (0=fullshot)"
     )
+    parser.add_argument("--warmup_ratio", type=float, help="Warmup ratio for sigma learning rate")
     
     # SVD and initialization
     parser.add_argument(
@@ -902,7 +1231,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initialize_sigma",
         type=str,
-        choices=["average", "tsvm"],
+        choices=["average", "sum", "tsvm"],
         help="Initialization strategy for sigma basis"
     )
 

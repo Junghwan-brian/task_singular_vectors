@@ -18,7 +18,7 @@ n_eval_points: 31
 device: "cuda"
 batch_size: 32
 data_location: "datasets"
-model_location: "/disk3/junghwan/task_vector/models/checkpoints"
+model_location: "./models/checkpoints"
 save_subfolder: ""
 
 hydra:
