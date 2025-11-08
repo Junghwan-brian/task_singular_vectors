@@ -190,20 +190,19 @@ REMOTE_SENSING_DATASETS = {
     "RSI-CB128": 15,
     "RSSCN7": 80,
     "SAT-4": 5,
-    "SAT-6": 10,
     "SIRI-WHU": 100,
     "UC_Merced": 100,
     "WHU-RS19": 150,
 }
 
-GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
-ENERGY_MODELS = ["ViT-B-16"]
+GPU_IDS = [1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
+ENERGY_MODELS = ["ViT-B-32"]
 ENERGY_INITIALIZE_SIGMA = ["average", "sum"]
 ENERGY_ADAPTERS = ["none"]
 ENERGY_K = [1,2,4,8,16]
-ENERGY_SVD_KEEP_TOPK = [10, 12]
-ENERGY_SIGMA_LR = [1e-3]
-ENERGY_SIGMA_WD = [0.05, 0.1]
+ENERGY_SVD_KEEP_TOPK = [12]
+ENERGY_SIGMA_LR = [1e-3, 1e-4]
+ENERGY_SIGMA_WD = [0.001, 0.01, 0.1]
 ENERGY_WARMUP_RATIO = [0.1]
 
 ATLAS_MODELS = ["ViT-B-16"]
