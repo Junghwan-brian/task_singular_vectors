@@ -258,6 +258,122 @@ def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
     return eval_epochs
 
 
+def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
+    """
+    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
+    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
+    '재계산된 평균' sigma(diag)로 재구성.
+    """
+    device = config.device
+    datasets = list(config.DATASETS)
+    num_tasks = int(len(datasets))
+    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
+    with torch.no_grad():
+        new_vector = {}
+        # 공통 필터 함수(임베딩류 제외)
+        def is_matrix_key(tv0, key):
+            return (
+                tv0.vector[key].ndim == 2 and
+                all(t not in key for t in ("text_projection",
+                    "positional", "token_embedding"))
+            )
+        # 키 순회
+        tv0 = task_vectors[0]
+        for key in tv0.vector:
+            # 2D 행렬이 아니거나 제외 키면: 단순 평균
+            if not is_matrix_key(tv0, key):
+                avg = None
+                for i, tv in enumerate(task_vectors):
+                    vec = tv.vector[key].to(device)
+                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
+                new_vector[key] = avg
+                continue
+            # -------- SVD 축 모으기 준비 --------
+            # 첫 태스크에서 모양/순위 파악
+            vec0 = task_vectors[0].vector[key].to(device)
+            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
+            m = int(u0.shape[0])
+            r = int(s0.shape[0])          # 유효 랭크 상한
+            n = int(vh0.shape[1])
+            if r == 0:
+                # 드물지만 0-rank 보호장치
+                new_vector[key] = torch.zeros_like(vec0)
+                continue
+            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
+            num_used = min(num_tasks, r)
+            # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
+            # k = max(1, r // num_used)
+            max_per_task = max(1, r // num_used)
+            k = min(desired_k, max_per_task)
+            if desired_k > max_per_task:
+                print(
+                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
+                    desired_k,
+                    max_per_task,
+                    key,
+                    k,
+                )
+            chunks = int(k * num_used)    # <= r 보장
+            # print(f"chunks: {chunks}")
+            # 버퍼를 '정수 차원'으로 명시해 생성
+            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
+            # sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype) # [수정] 더 이상 sum_s 필요 없음
+            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
+            # 각 태스크에서 상위 k개 축만 수집
+            for i, tv in enumerate(task_vectors[:num_used]):
+                vec = tv.vector[key].to(device)
+                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
+                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
+                r_i = int(s.shape[0])
+                k_i = min(k, r_i)  # 안전 클램프
+                start = i * k
+                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
+                sum_u[:, start:end] = u[:, :k_i]
+                # sum_s[start:end] = s[:k_i] # [수정] 더 이상 sum_s 필요 없음
+                sum_v[start:end, :] = vh[:k_i, :]
+            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
+            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
+            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
+            U_orth = u_u @ vh_u          # (m × chunks)
+            V_orth = u_v @ vh_v          # (chunks × n)
+            # -------- [수정된 Sigma 계산 로직 시작] --------
+            # 1. 각 태스크 벡터(M_i)를 공통 기저(U_orth, V_orth)로 투영하여
+            #    최적의 대각 행렬(sigma_task)을 찾습니다.
+            #    M_i ≈ U_orth @ Sigma_i @ V_orth 이므로,
+            #    Sigma_i' = U_orth.T @ M_i @ V_orth.T 를 계산합니다.
+            all_sigma_diags = []
+            # U_orth (m, chunks) -> U_orth.T (chunks, m)
+            # V_orth (chunks, n) -> V_orth.T (n, chunks)
+            U_orth_T = U_orth.T
+            V_orth_T = V_orth.T
+            # "모든" 태스크 벡터에 대해 반복 (num_used 뿐만 아니라)
+            for tv in task_vectors:
+                M_i = tv.vector[key].to(device)  # 원본 태스크 행렬 (m, n)
+                # Sigma_i_prime = (U_orth.T @ M_i) @ V_orth.T
+                # (chunks, m) @ (m, n) @ (n, chunks) -> (chunks, chunks)
+                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T
+                # "이를 diagonal로 만들도록 해야해" -> 대각 성분만 추출
+                sigma_task_diag = torch.diag(Sigma_i_prime)  # (chunks,)
+                all_sigma_diags.append(sigma_task_diag)
+            # 2. 모든 태스크의 sigma_task_diag를 평균냅니다.
+            if not all_sigma_diags:
+                # 엣지 케이스 방어
+                Sigma = torch.zeros(
+                    (chunks, chunks), device=device, dtype=u0.dtype)
+            else:
+                # (num_tasks, chunks)
+                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
+                # (chunks,)
+                # task_energy = torch.linalg.norm(stacked_sigmas, dim=1)  # (num_tasks,)
+                # cv = (task_energy.std() / (task_energy.mean()+1e-12)).item()
+
+                mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
+                # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
+                Sigma = torch.diag(mean_sigma_diag)   # (chunks, chunks)
+            # -------- [수정된 Sigma 계산 로직 끝] --------
+            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
+            new_vector[key] = [U_orth, Sigma, V_orth]
+    return new_vector
 def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
     """
     여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
@@ -461,125 +577,6 @@ def compute_and_sum_svd_mem_reduction_tsvm(task_vectors, config):
             new_vector[key] = [U_orth, Sigma, V_orth]
     return new_vector
 
-def compute_and_sum_svd_mem_reduction_weighted(task_vectors, config):
-    """
-    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
-    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
-    '부호 정렬 + 에너지 역가중 평균'(A+B)으로 재계산한 sigma(diag)로 재구성.
-    """
-    device = config.device
-    datasets = list(config.DATASETS)
-    num_tasks = int(len(datasets))
-    print(f"DATSETS: {datasets}")
-    print("Computing SVD...")
-    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
-    with torch.no_grad():
-        new_vector = {}
-        # 공통 필터 함수(임베딩류 제외)
-        def is_matrix_key(tv0, key):
-            return (
-                tv0.vector[key].ndim == 2 and
-                all(t not in key for t in ("text_projection",
-                                           "positional", "token_embedding"))
-            )
-        # 키 순회
-        tv0 = task_vectors[0]
-        for key in tv0.vector:
-            # 2D 행렬이 아니거나 제외 키면: 단순 평균
-            if not is_matrix_key(tv0, key):
-                avg = None
-                for i, tv in enumerate(task_vectors):
-                    vec = tv.vector[key].to(device)
-                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
-                new_vector[key] = avg
-                continue
-            # -------- SVD 축 모으기 준비 --------
-            # 첫 태스크에서 모양/순위 파악
-            vec0 = task_vectors[0].vector[key].to(device)
-            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
-            m = int(u0.shape[0])
-            r = int(s0.shape[0])          # 유효 랭크 상한
-            n = int(vh0.shape[1])
-            if r == 0:
-                # 드물지만 0-rank 보호장치
-                new_vector[key] = torch.zeros_like(vec0)
-                continue
-            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
-            num_used = min(num_tasks, r)
-            # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
-            max_per_task = max(1, r // num_used)
-            k = min(desired_k, max_per_task)
-            if desired_k > max_per_task:
-                print(
-                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
-                    desired_k,
-                    max_per_task,
-                    key,
-                    k,
-                )
-            chunks = int(k * num_used)    # <= r 보장
-            # 버퍼 생성
-            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
-            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
-            # 각 태스크에서 상위 k개 축만 수집
-            for i, tv in enumerate(task_vectors[:num_used]):
-                vec = tv.vector[key].to(device)
-                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
-                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
-                r_i = int(s.shape[0])
-                k_i = min(k, r_i)  # 안전 클램프
-                start = i * k
-                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
-                sum_u[:, start:end] = u[:, :k_i]
-                sum_v[start:end, :] = vh[:k_i, :]
-            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
-            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
-            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
-            U_orth = u_u @ vh_u          # (m × chunks)
-            V_orth = u_v @ vh_v          # (chunks × n)
-            # -------- 투영 및 sigma 집계 --------
-            # 1) 각 태스크 M_i를 공통 기저로 투영: P_i = U^T M_i V^T
-            # 2) 대각만 추출해서 쌓기: stacked_sigmas ∈ R^{num_tasks × chunks}
-            U_orth_T = U_orth.T
-            V_orth_T = V_orth.T
-            all_sigma_diags = []
-            for tv in task_vectors:
-                M_i = tv.vector[key].to(device)
-                P_i = (U_orth_T @ M_i) @ V_orth_T     # (chunks, chunks)
-                all_sigma_diags.append(torch.diag(P_i))
-            stacked_sigmas = torch.stack(all_sigma_diags, dim=0)  # (T, C)
-            # ===========================
-            # (A) 부호 정렬 평균 (sign-consistent mean)
-            # 각 컴포넌트 j에 대해 다수(sign of median) 부호로 정렬
-            # ===========================
-            median_vals = stacked_sigmas.median(dim=0).values        # (C,)
-            median_sign = torch.sign(median_vals)                    # {-1,0,1}
-            sum_sign = torch.sign(stacked_sigmas.sum(dim=0))         # 보완용
-            ones = torch.ones_like(median_sign)
-            # median=0이면 sum 기준, 그것도 0이면 +1로
-            sign_vec = torch.where(median_sign != 0, median_sign,
-                                   torch.where(sum_sign != 0, sum_sign, ones))  # (C,)
-            aligned = stacked_sigmas * sign_vec  # (T, C)  ← 부호 정렬 완료
-            # ===========================
-            # (B) 에너지 역가중 평균 (energy-balanced mean)
-            # 태스크별 에너지 e_i = ||aligned[i]||_2,  w_i ∝ 1/e_i
-            # ===========================
-            eps = 1e-12
-            task_energy = torch.linalg.norm(aligned, dim=1).clamp_min(eps)  # (T,)
-            inv_e = 1.0 / task_energy
-            w = inv_e / inv_e.sum()                                         # 정규화 가중치 (T,)
-            mean_sigma_diag = (aligned * w[:, None]).sum(dim=0)             # (C,)
-            # 부호 보정: 평균이 음수가 되면 U 또는 V 컬럼에 부호를 흡수
-            neg_mask = mean_sigma_diag < 0
-            if torch.any(neg_mask):
-                U_orth[:, neg_mask] *= -1
-                mean_sigma_diag[neg_mask] = -mean_sigma_diag[neg_mask]
-            # 최종 Sigma
-            Sigma = torch.diag(mean_sigma_diag)  # (chunks, chunks)
-            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
-            new_vector[key] = [U_orth, Sigma, V_orth]
-    return new_vector
-
 def run_energy(cfg: DictConfig) -> None:
     """
     Run energy-based training on held-out test dataset.
@@ -680,7 +677,7 @@ def run_energy(cfg: DictConfig) -> None:
         svd_dict = compute_and_sum_svd_mem_reduction_sum(task_vectors, cfg)
     else:
         logger.info("Using TIES SVD initialization")
-        svd_dict = compute_and_sum_svd_mem_reduction_weighted(task_vectors, cfg)
+        svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
     svd_time = time.time() - svd_start
     logger.info(f"Computed SVD bases in {svd_time:.2f}s")
 
@@ -1243,7 +1240,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initialize_sigma",
         type=str,
-        choices=["sum", "tsvm", "weighted"],
+        choices=["sum", "tsvm", "average"],
         help="Initialization strategy for sigma basis"
     )
     
