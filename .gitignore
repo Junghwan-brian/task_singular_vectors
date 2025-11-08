@@ -16,3 +16,4 @@ datasets/*
 *.pt
 *.txt
 *.csv
+models/*

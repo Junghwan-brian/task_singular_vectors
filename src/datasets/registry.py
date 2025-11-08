@@ -18,6 +18,14 @@ from src.datasets.flowers102 import Flowers102
 from src.datasets.food101 import Food101
 from src.datasets.gtsrb import GTSRB
 from src.datasets.imagenet import ImageNet
+from src.datasets.imagenet_ood import (
+    ImageNetILSVRC,
+    ImageNetILSVRCVal,
+    ImageNetA,
+    ImageNetR,
+    ImageNetSketch,
+    ImageNetV2MFVal,
+)
 from src.datasets.kmnist import KMNIST
 from src.datasets.mnist import MNIST
 from src.datasets.oxfordpets import OxfordIIITPet

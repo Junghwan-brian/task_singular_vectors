@@ -21,7 +21,7 @@ ALL_DATASETS = [
     "Flowers102",
     "CIFAR100",
     "PCAM",
-    "FER2013",
+    # "FER2013",
     "CIFAR10",
     "Food101",
     "FashionMNIST",

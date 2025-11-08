@@ -25,20 +25,30 @@ logger = logging.getLogger(__name__)
 def parse_energy_config_tag(config_tag: str) -> Dict[str, str]:
     """
     Parse energy config tag to extract hyperparameters.
-    Format: energy_{num_tasks}_{lr}_{topk}_{init_mode}_{warmup_ratio}
-    Example: energy_14_0p001_4_average_0p1
+    Format: energy_{num_tasks}_{lr}_{topk}_{init_mode}_{warmup_ratio}_{sigma_wd}
+    Example: energy_14_0p001_4_average_0p1_0p0
+    
+    Note: Old format (without sigma_wd) is also supported for backward compatibility.
     """
     parts = config_tag.split('_')
     if len(parts) < 6 or parts[0] != 'energy':
         return {}
     
-    return {
+    result = {
         'num_tasks': parts[1],
         'lr': parts[2].replace('p', '.'),
         'svd_keep_topk': parts[3],
         'initialize_sigma': parts[4],
         'warmup_ratio': parts[5].replace('p', '.'),
     }
+    
+    # Add sigma_wd if present (new format)
+    if len(parts) >= 7:
+        result['sigma_wd'] = parts[6].replace('p', '.')
+    else:
+        result['sigma_wd'] = '0.0'  # Default for backward compatibility
+    
+    return result
 
 
 def parse_adapter_from_filename(filename: str) -> str:
@@ -218,6 +228,7 @@ def process_shot_directory(
                 'svd_keep_topk': hyperparams.get('svd_keep_topk', 'unknown'),
                 'initialize_sigma': hyperparams.get('initialize_sigma', 'unknown'),
                 'warmup_ratio': hyperparams.get('warmup_ratio', 'unknown'),
+                'sigma_wd': hyperparams.get('sigma_wd', '0.0'),
                 'adapter': adapter,
                 'accuracy': accuracy,
                 'config_tag': config_tag or '',
@@ -250,8 +261,9 @@ def format_baseline_label(baseline: Dict[str, Any]) -> str:
         topk = baseline.get('svd_keep_topk', '?')
         init = baseline.get('initialize_sigma', '?')
         warmup = baseline.get('warmup_ratio', '?')
+        wd = baseline.get('sigma_wd', '0.0')
         
-        label = f"Energy(lr={lr}, k={topk}, init={init}, w={warmup})"
+        label = f"Energy(lr={lr}, k={topk}, init={init}, w={warmup}, wd={wd})"
         if adapter != 'none':
             label += f" + {adapter.upper()}"
     elif method == 'Atlas':
