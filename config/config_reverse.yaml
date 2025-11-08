@@ -14,7 +14,15 @@ DATASETS_ALL:
 - FashionMNIST
 - RenderedSST2
 - EMNIST
-- KMNIST
+# - KMNIST
+# ------------------------
+# - Caltech101
+# - Caltech256
+- FGVCAircraft
+- CUB200
+# - PascalVOC
+- Country211
+# - UCF101
 DATASETS_VAL: ''
 batch_size: 32
 cache_dir: null
@@ -29,7 +37,7 @@ sigma_epochs: null
 sigma_lr: 1.0e-03
 sigma_wd: 0.0
 sigma_lr_step_size: 1
-sigma_lr_gamma: 0.5
+sigma_lr_gamma: 1.0
 train_k: 0
 num_grad_accumulation: 1
 adapter: none

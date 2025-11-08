@@ -23,13 +23,13 @@ from tqdm.auto import tqdm
 # Disable problematic attention backends that cause "No execution plans support the graph" error
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_cudnn_sdp(False)
-# Additional cuDNN settings for H100 compatibility
-torch.backends.cudnn.allow_tf32 = False
-torch.backends.cuda.matmul.allow_tf32 = False
-# Set cuDNN benchmark to False for stability
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
+# torch.backends.cuda.enable_cudnn_sdp(False)
+# # Additional cuDNN settings for H100 compatibility
+# torch.backends.cudnn.allow_tf32 = False
+# torch.backends.cuda.matmul.allow_tf32 = False
+# # Set cuDNN benchmark to False for stability
+# torch.backends.cudnn.benchmark = False
+# torch.backends.cudnn.deterministic = True
 
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
@@ -45,7 +45,7 @@ from src.utils.variables_and_paths import (
 )
 
 # Utils
-from src.utils.utils import cosine_lr
+from src.utils.utils import cosine_lr, load_checkpoint_safe
 from src.datasets.common import get_dataloader, maybe_dictionarize
 
 # General dataset imports
@@ -191,26 +191,29 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for Atlas training (general datasets)
 ATLAS_EPOCHS_PER_DATASET = {
-    # "Cars": 35,
-    "DTD": 76,
-    # "EuroSAT": 12,
-    "GTSRB": 11,
-    "MNIST": 5,
-    # "RESISC45": 15,
-    # "SUN397": 14,
-    "SVHN": 4,
-    "CIFAR10": 6,
-    "CIFAR100": 6,
-    "STL10": 60,
-    "Food101": 4,
-    "Flowers102": 147,
-    # "FER2013": 10,
-    "PCAM": 1,
-    "OxfordIIITPet": 82,
-    "RenderedSST2": 39,
-    "EMNIST": 2,
-    "FashionMNIST": 5,
-    "KMNIST": 5,
+    # "Cars": 20,
+    "DTD": 20,
+    # "EuroSAT": 20,
+    "GTSRB": 20,
+    "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
+    "SVHN": 20,
+    "CIFAR10": 20,
+    "CIFAR100": 20,
+    "STL10": 20,
+    "Food101":20,
+    "Flowers102": 20,
+    # "FER2013": 20,
+    "PCAM":20,
+    "OxfordIIITPet": 20,
+    "RenderedSST2": 20,
+    "EMNIST":20,
+    "FashionMNIST":20,
+    # "KMNIST":20,
+    "FGVCAircraft": 20,
+    "CUB200": 20,
+    "Country211": 20,
 }
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
@@ -580,7 +583,7 @@ def train_single_task(args, comp_acc=None, logger=None):
             args.model_location, dataset_val, args.model)
         
         if os.path.exists(finetuned_checkpoint_path):
-            ft_checks[dataset] = torch.load(finetuned_checkpoint_path, map_location="cpu")
+            ft_checks[dataset] = load_checkpoint_safe(finetuned_checkpoint_path, map_location="cpu")
             logger.info(f"✓ Loaded fine-tuned checkpoint for {dataset}")
         else:
             logger.warning(f"✗ Missing fine-tuned checkpoint for {dataset}")
@@ -591,7 +594,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     zeroshot_path = get_zeroshot_path(args.model_location, first_dataset_val, args.model)
     
     logger.info(f"Loading shared zeroshot model from: {zeroshot_path}")
-    ptm_check = torch.load(zeroshot_path, map_location="cpu")
+    ptm_check = load_checkpoint_safe(zeroshot_path, map_location="cpu")
 
     # Create task vectors using shared zeroshot checkpoint
     task_vectors = {}

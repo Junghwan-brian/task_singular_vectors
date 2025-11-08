@@ -310,6 +310,7 @@ def run_commands_in_parallel(
     if dry_run:
         for cmd in commands:
             print(" ".join(cmd))
+        print(f"Total commands: {len(commands)}")
         return
 
     queue_lock = threading.Lock()

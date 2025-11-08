@@ -25,7 +25,7 @@ from src.eval.eval import eval_single_dataset
 import torch
 from src.models.task_vectors import NonLinearTaskVector
 from torch.nn.utils.stateless import functional_call
-from src.utils.utils import cosine_lr
+from src.utils.utils import cosine_lr, load_checkpoint_safe
 from atlas_reverse import train_adapter
 
 from src.datasets.remote_sensing import sample_k_shot_indices
@@ -223,26 +223,29 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for sigma training (general datasets)
 SIGMA_EPOCHS_PER_DATASET = {
-    # "Cars": 35,
-    "DTD": 76,
-    # "EuroSAT": 12,
-    "GTSRB": 11,
-    "MNIST": 5,
-    # "RESISC45": 15,
-    # "SUN397": 14,
-    "SVHN": 4,
-    "CIFAR10": 6,
-    "CIFAR100": 6,
-    "STL10": 60,
-    "Food101": 4,
-    "Flowers102": 147,
-    # "FER2013": 10,
-    "PCAM": 1,
-    "OxfordIIITPet": 82,
-    "RenderedSST2": 39,
-    "EMNIST": 2,
-    "FashionMNIST": 5,
-    "KMNIST": 5,
+    # "Cars": 20,
+    "DTD": 20,
+    # "EuroSAT": 20,
+    "GTSRB": 20,
+    "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
+    "SVHN": 20,
+    "CIFAR10": 20,
+    "CIFAR100": 20,
+    "STL10": 20,
+    "Food101":20,
+    "Flowers102": 20,
+    # "FER2013": 20,
+    "PCAM":20,
+    "OxfordIIITPet": 20,
+    "RenderedSST2": 20,
+    "EMNIST":20,
+    "FashionMNIST":20,
+    # "KMNIST":20,
+    "FGVCAircraft": 20,
+    "CUB200": 20,
+    "Country211": 20,
 }
 
 
@@ -641,7 +644,7 @@ def run_energy(cfg: DictConfig) -> None:
         path = get_finetuned_path(cfg.model_location, dataset, model=cfg.model)
         if os.path.exists(path):
             logger.info(f"✓ {path} exists")
-            ft_checks.append(torch.load(path, map_location="cpu"))
+            ft_checks.append(load_checkpoint_safe(path, map_location="cpu"))
         else:
             logger.error(f"✗ {path} does not exist")
             raise FileNotFoundError(f"Fine-tuned checkpoint not found: {path}")
@@ -652,7 +655,7 @@ def run_energy(cfg: DictConfig) -> None:
     zeroshot_path = get_zeroshot_path(cfg.model_location, first_dataset, model=cfg.model)
     
     logger.info(f"Loading zeroshot model from: {zeroshot_path}")
-    ptm_check = torch.load(zeroshot_path, map_location="cpu")
+    ptm_check = load_checkpoint_safe(zeroshot_path, map_location="cpu")
 
     overall_start = time.time()
 
@@ -1197,7 +1200,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test_dataset",
         type=str,
-        required=True,
+        # required=True,
+        default="Country211",
         # choices=allowed_test_datasets,
         help="Held-out dataset to train on (sigma epochs auto-set by dataset size)",
     )

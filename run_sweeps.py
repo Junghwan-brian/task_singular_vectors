@@ -175,21 +175,29 @@ def _expected_atlas_paths(
     return atlas_pt, results_json
 
 DATASETS_ALL = {
-    "DTD": 76,
-    "GTSRB": 11,
-    "MNIST": 5,
-    "SVHN": 4,
-    "CIFAR10": 6,
-    "CIFAR100": 6,
-    "STL10": 60,
-    "Food101": 4,
-    "Flowers102": 147,
-    "PCAM": 1,
-    "OxfordIIITPet": 82,
-    "RenderedSST2": 39,
-    "EMNIST": 2,
-    "FashionMNIST": 5,
-    "KMNIST": 5,
+    # "Cars": 20,
+    "DTD": 20,
+    # "EuroSAT": 20,
+    "GTSRB": 20,
+    "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
+    "SVHN": 20,
+    "CIFAR10": 20,
+    "CIFAR100": 20,
+    "STL10": 20,
+    "Food101":20,
+    "Flowers102": 20,
+    # "FER2013": 20,
+    "PCAM":20,
+    "OxfordIIITPet": 20,
+    "RenderedSST2": 20,
+    "EMNIST":20,
+    "FashionMNIST":20,
+    # "KMNIST":20,
+    "FGVCAircraft": 20,
+    "CUB200": 20,
+    "Country211": 20,
 }
 
 
@@ -307,6 +315,7 @@ def run_commands_in_parallel(
     if dry_run:
         for cmd in commands:
             print(" ".join(cmd))
+        print(f"Total commands: {len(commands)}")
         return
 
     queue_lock = threading.Lock()

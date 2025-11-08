@@ -35,6 +35,12 @@ from src.datasets.sst2 import RenderedSST2
 from src.datasets.stl10 import STL10
 from src.datasets.sun397 import SUN397
 from src.datasets.svhn import SVHN
+from src.datasets.country211 import Country211
+from src.datasets.cub2011 import CUB200
+from src.datasets.ucf101 import UCF101
+from src.datasets.voc2007 import PascalVOC
+from src.datasets.fgvc_aircraft import FGVCAircraft
+from src.datasets.caltech import Caltech256, Caltech101
 
 registry = {
     name: obj

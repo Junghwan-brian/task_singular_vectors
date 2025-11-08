@@ -1,12 +1,61 @@
 import copy
 import os
 import pickle
+import sys
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+def load_checkpoint_safe(path, map_location='cpu'):
+    """
+    Load checkpoint and automatically convert to state_dict format.
+    
+    Handles two checkpoint formats:
+    1. State dict only (e.g., CIFAR10): torch.save(model.state_dict(), path)
+    2. Full model object (e.g., Caltech): torch.save(model, path)
+    
+    Returns state_dict in both cases.
+    
+    Args:
+        path: Path to checkpoint file
+        map_location: Device to map tensors to (default: 'cpu')
+        
+    Returns:
+        state_dict: Model state dictionary
+    """
+    # First, add module redirect to handle old module paths if needed
+    if 'src.modeling' not in sys.modules:
+        try:
+            import src.models.modeling
+            sys.modules['src.modeling'] = src.models.modeling
+        except ImportError:
+            pass  # If import fails, continue without redirect
+    
+    try:
+        checkpoint = torch.load(path, map_location=map_location)
+        
+        # Check if checkpoint is a full model object or state_dict
+        if isinstance(checkpoint, dict):
+            # It's already a state_dict (CIFAR10 style)
+            return checkpoint
+        else:
+            # It's a full model object (Caltech style)
+            # Extract state_dict from the model
+            if hasattr(checkpoint, 'state_dict'):
+                return checkpoint.state_dict()
+            else:
+                # Fallback: assume it's already in the right format
+                return checkpoint
+    except Exception as e:
+        # If loading fails, provide helpful error message
+        raise RuntimeError(
+            f"Failed to load checkpoint from {path}. "
+            f"Error: {e}"
+        )
 
 
 def compute_l1_norm(
