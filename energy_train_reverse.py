@@ -79,10 +79,24 @@ def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
             all_targets = np.array(all_targets)
         labels = [int(all_targets[idx]) for idx in larger_indices]
     
-    elif hasattr(base_dataset, 'samples'):
+    elif hasattr(base_dataset, 'data') and hasattr(base_dataset.data, 'iloc'):
+        # CUB2011 style: pandas DataFrame with 'target' column
+        try:
+            all_targets = base_dataset.data['target'].values
+            # CUB2011 targets are 1-indexed but __getitem__ subtracts 1, so we do the same
+            labels = [int(all_targets[idx]) - 1 for idx in larger_indices]
+        except Exception as e:
+            # If DataFrame access fails, fall through to other methods
+            labels = []
+    
+    elif hasattr(base_dataset, 'samples') and base_dataset.samples is not None:
         # ImageFolder style: samples is list of (path, label)
-        all_samples = base_dataset.samples
-        labels = [int(all_samples[idx][1]) for idx in larger_indices]
+        try:
+            all_samples = base_dataset.samples
+            labels = [int(all_samples[idx][1]) for idx in larger_indices]
+        except (TypeError, IndexError, ValueError):
+            # samples exists but not in expected format, fall through
+            labels = []
     
     elif hasattr(base_dataset, '_labels'):
         # Custom datasets with _labels attribute
@@ -93,7 +107,7 @@ def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
             all_labels = np.array(all_labels)
         labels = [int(all_labels[idx]) for idx in larger_indices]
     
-    else:
+    if not labels:
         # Fallback: iterate through indices (slower but safe)
         for idx in larger_indices:
             try:

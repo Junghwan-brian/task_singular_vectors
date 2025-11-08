@@ -80,6 +80,14 @@ def sample_k_shot_indices(dataset, k, seed=0, verbose=True, progress_desc=None):
             return np.array(ds.labels)
         if hasattr(ds, 'y') and ds.y is not None:
             return np.array(ds.y)
+        # CUB2011 style: pandas DataFrame with 'target' column
+        if hasattr(ds, 'data') and hasattr(ds.data, 'iloc'):
+            try:
+                # CUB2011 targets are 1-indexed but __getitem__ subtracts 1
+                # So we need to subtract 1 here to match
+                return ds.data['target'].values - 1
+            except Exception:
+                pass
         if hasattr(ds, 'samples') and ds.samples is not None:
             try:
                 return np.array([item[1] for item in ds.samples])
@@ -124,8 +132,9 @@ def sample_k_shot_indices(dataset, k, seed=0, verbose=True, progress_desc=None):
     if labels is None and isinstance(base_dataset, Subset):
         labels = _resolve_subset_targets(base_dataset)
 
-    if labels is None and hasattr(base_dataset, 'data'):
+    if labels is None and hasattr(base_dataset, 'data') and not hasattr(base_dataset.data, 'iloc'):
         # Some datasets store (data, labels) tuples
+        # Skip pandas DataFrames (already handled in _extract_targets)
         try:
             labels = np.array([item[1] for item in base_dataset.data])
         except Exception:
