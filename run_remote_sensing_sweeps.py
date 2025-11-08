@@ -104,17 +104,18 @@ def _atlas_default_lr() -> float:
     return 1e-1
 
 
-def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int, warmup_ratio: float) -> str:
+def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int, sigma_wd: float, warmup_ratio: float) -> str:
     datasets_all = _datasets_all_from_config()
     candidate_int = len(datasets_all)
     num_tasks_minus_one = max(candidate_int - 1, 0)
     init_value = (init_mode or "average").strip().lower()
-    return "energy_{}_{}_{}_{}_{}".format(
+    return "energy_{}_{}_{}_{}_{}_{}".format(
         _sanitize_value(num_tasks_minus_one),
         _sanitize_value(sigma_lr),
         _sanitize_value(topk),
         _sanitize_value(init_value),
         _sanitize_value(warmup_ratio),
+        _sanitize_value(sigma_wd),
     )
 
 
@@ -138,14 +139,16 @@ def _expected_energy_paths(
     adapter: str,
     sigma_lr: float,
     topk: int,
+    sigma_wd: float,
     k: int,
     warmup_ratio: float,
 ) -> tuple[str, str]:
     sigma_lr = float(sigma_lr)
     topk = int(topk)
+    sigma_wd = float(sigma_wd)
     k = int(k)
     warmup_ratio = float(warmup_ratio)
-    config_tag = _energy_config_tag(init_mode, sigma_lr, topk, warmup_ratio)
+    config_tag = _energy_config_tag(init_mode, sigma_lr, topk, sigma_wd, warmup_ratio)
     adapter_tag = _adapter_tag(adapter)
     dataset_dir = f"{dataset}Val"
     base_dir = os.path.join(MODEL_ROOT, model, dataset_dir, config_tag, _shot_folder(k))
@@ -187,28 +190,28 @@ REMOTE_SENSING_DATASETS = {
     "RSI-CB128": 15,
     "RSSCN7": 80,
     "SAT-4": 5,
-    "SAT-6": 10,
     "SIRI-WHU": 100,
     "UC_Merced": 100,
     "WHU-RS19": 150,
 }
 
-GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
-ENERGY_MODELS = ["ViT-B-16"]
-ENERGY_INITIALIZE_SIGMA = ["sum"]
+GPU_IDS = [1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
+ENERGY_MODELS = ["ViT-B-32"]
+ENERGY_INITIALIZE_SIGMA = ["average", "sum"]
 ENERGY_ADAPTERS = ["none"]
-ENERGY_K = [16]
-ENERGY_SVD_KEEP_TOPK = [5]
-ENERGY_SIGMA_LR = [1e-3]
+ENERGY_K = [1,2,4,8,16]
+ENERGY_SVD_KEEP_TOPK = [12]
+ENERGY_SIGMA_LR = [1e-3, 1e-4]
+ENERGY_SIGMA_WD = [0.001, 0.01, 0.1]
 ENERGY_WARMUP_RATIO = [0.1]
 
 ATLAS_MODELS = ["ViT-B-16"]
 ATLAS_ADAPTERS = ["none", "lp++", "tip"]
-ATLAS_K = [16]
+ATLAS_K = [1,2,4,8,16]
 
 def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
     commands: List[List[str]] = []
-    for model, init_mode, adapter, dataset, k, topk, sigma_lr, warmup_ratio in itertools.product(
+    for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio in itertools.product(
         ENERGY_MODELS,
         ENERGY_INITIALIZE_SIGMA,
         ENERGY_ADAPTERS,
@@ -216,6 +219,7 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
         ENERGY_K,
         ENERGY_SVD_KEEP_TOPK,
         ENERGY_SIGMA_LR,
+        ENERGY_SIGMA_WD,
         ENERGY_WARMUP_RATIO,
     ):
         _, results_json = _expected_energy_paths(
@@ -225,12 +229,13 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             adapter=adapter,
             sigma_lr=sigma_lr,
             topk=topk,
+            sigma_wd=sigma_wd,
             k=int(k),
             warmup_ratio=warmup_ratio,
         )
         if _path_exists(results_json):
             print(
-                f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, warmup={warmup_ratio}) -> {results_json}",
+                f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}, warmup={warmup_ratio}) -> {results_json}",
                 flush=True,
             )
             continue
@@ -249,6 +254,8 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             str(topk),
             "--sigma_lr",
             f"{sigma_lr:.6g}",
+            "--sigma_wd",
+            f"{sigma_wd:.6g}",
             "--warmup_ratio",
             f"{warmup_ratio:.6g}",
             "--adapter",
@@ -302,6 +309,7 @@ def run_commands_in_parallel(
     if dry_run:
         for cmd in commands:
             print(" ".join(cmd))
+        print(f"Total commands: {len(commands)}")
         return
 
     queue_lock = threading.Lock()

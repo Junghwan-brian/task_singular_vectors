@@ -25,7 +25,7 @@ from src.eval.eval import eval_single_dataset
 import torch
 from src.models.task_vectors import NonLinearTaskVector
 from torch.nn.utils.stateless import functional_call
-from src.utils.utils import cosine_lr
+from src.utils.utils import cosine_lr, load_checkpoint_safe
 from atlas_reverse import train_adapter
 
 from src.datasets.remote_sensing import sample_k_shot_indices
@@ -79,10 +79,24 @@ def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
             all_targets = np.array(all_targets)
         labels = [int(all_targets[idx]) for idx in larger_indices]
     
-    elif hasattr(base_dataset, 'samples'):
+    elif hasattr(base_dataset, 'data') and hasattr(base_dataset.data, 'iloc'):
+        # CUB2011 style: pandas DataFrame with 'target' column
+        try:
+            all_targets = base_dataset.data['target'].values
+            # CUB2011 targets are 1-indexed but __getitem__ subtracts 1, so we do the same
+            labels = [int(all_targets[idx]) - 1 for idx in larger_indices]
+        except Exception as e:
+            # If DataFrame access fails, fall through to other methods
+            labels = []
+    
+    elif hasattr(base_dataset, 'samples') and base_dataset.samples is not None:
         # ImageFolder style: samples is list of (path, label)
-        all_samples = base_dataset.samples
-        labels = [int(all_samples[idx][1]) for idx in larger_indices]
+        try:
+            all_samples = base_dataset.samples
+            labels = [int(all_samples[idx][1]) for idx in larger_indices]
+        except (TypeError, IndexError, ValueError):
+            # samples exists but not in expected format, fall through
+            labels = []
     
     elif hasattr(base_dataset, '_labels'):
         # Custom datasets with _labels attribute
@@ -93,7 +107,7 @@ def subsample_from_larger_k(larger_indices, dataset, target_k, seed):
             all_labels = np.array(all_labels)
         labels = [int(all_labels[idx]) for idx in larger_indices]
     
-    else:
+    if not labels:
         # Fallback: iterate through indices (slower but safe)
         for idx in larger_indices:
             try:
@@ -174,7 +188,8 @@ def build_energy_config_tag(cfg) -> str:
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
     warmup_ratio_part = _sanitize_value(getattr(cfg, "warmup_ratio", 0.1))
-    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}_{warmup_ratio_part}"
+    wd_part = _sanitize_value(getattr(cfg, "sigma_wd", 0.0))
+    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}_{warmup_ratio_part}_{wd_part}"
 
 
 def normalize_adapter_choice(value: str) -> str:
@@ -222,26 +237,29 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for sigma training (general datasets)
 SIGMA_EPOCHS_PER_DATASET = {
-    # "Cars": 35,
-    "DTD": 76,
-    # "EuroSAT": 12,
-    "GTSRB": 11,
-    "MNIST": 5,
-    # "RESISC45": 15,
-    # "SUN397": 14,
-    "SVHN": 4,
-    "CIFAR10": 6,
-    "CIFAR100": 6,
-    "STL10": 60,
-    "Food101": 4,
-    "Flowers102": 147,
-    # "FER2013": 10,
-    "PCAM": 1,
-    "OxfordIIITPet": 82,
-    "RenderedSST2": 39,
-    "EMNIST": 2,
-    "FashionMNIST": 5,
-    "KMNIST": 5,
+    # "Cars": 20,
+    "DTD": 20,
+    # "EuroSAT": 20,
+    "GTSRB": 20,
+    "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
+    "SVHN": 20,
+    "CIFAR10": 20,
+    "CIFAR100": 20,
+    "STL10": 20,
+    "Food101":20,
+    "Flowers102": 20,
+    # "FER2013": 20,
+    "PCAM":20,
+    "OxfordIIITPet": 20,
+    "RenderedSST2": 20,
+    "EMNIST":20,
+    "FashionMNIST":20,
+    # "KMNIST":20,
+    "FGVCAircraft": 20,
+    "CUB200": 20,
+    "Country211": 20,
 }
 
 
@@ -640,7 +658,7 @@ def run_energy(cfg: DictConfig) -> None:
         path = get_finetuned_path(cfg.model_location, dataset, model=cfg.model)
         if os.path.exists(path):
             logger.info(f"✓ {path} exists")
-            ft_checks.append(torch.load(path, map_location="cpu"))
+            ft_checks.append(load_checkpoint_safe(path, map_location="cpu"))
         else:
             logger.error(f"✗ {path} does not exist")
             raise FileNotFoundError(f"Fine-tuned checkpoint not found: {path}")
@@ -651,7 +669,7 @@ def run_energy(cfg: DictConfig) -> None:
     zeroshot_path = get_zeroshot_path(cfg.model_location, first_dataset, model=cfg.model)
     
     logger.info(f"Loading zeroshot model from: {zeroshot_path}")
-    ptm_check = torch.load(zeroshot_path, map_location="cpu")
+    ptm_check = load_checkpoint_safe(zeroshot_path, map_location="cpu")
 
     overall_start = time.time()
 
@@ -833,7 +851,7 @@ def run_energy(cfg: DictConfig) -> None:
                     base_dataset = getattr(train_loader, "dataset", None)
                 
                 if base_dataset is not None:
-                    num_workers = getattr(train_loader, "num_workers", 8)
+                    num_workers = 2  # Fixed num_workers
                     collate_fn = getattr(train_loader, "collate_fn", None)
                     train_loader = torch.utils.data.DataLoader(
                         torch.utils.data.Subset(base_dataset, selected_indices),
@@ -923,34 +941,37 @@ def run_energy(cfg: DictConfig) -> None:
         )
         os.makedirs(visualization_dir, exist_ok=True)
 
-        # Log zeroshot accuracy before any sigma updates
-        model.eval()
-        with torch.no_grad():
-            pretrained_metrics = evaluate_encoder_with_dataloader(
-                pretrained_encoder, classification_head, val_loader, cfg.device
-            )
-            pretrained_acc = pretrained_metrics['top1']
-            logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
-            record_validation("pretrained", -2, pretrained_acc)
+        # # Log zeroshot accuracy before any sigma updates
+        # model.eval()
+        # with torch.no_grad():
+        #     pretrained_metrics = evaluate_encoder_with_dataloader(
+        #         pretrained_encoder, classification_head, val_loader, cfg.device
+        #     )
+        #     pretrained_acc = pretrained_metrics['top1']
+        #     logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
+        #     record_validation("pretrained", -2, pretrained_acc)
 
-            eval_params = {}
-            for name, p in base_params.items():
-                eval_params[name] = p.clone()
-            for safe_key, module in sigma_modules.items():
-                orig_key = sigma_key_map.get(safe_key, safe_key)
-                if orig_key in eval_params and module.sigma.numel() > 0:
-                    delta = module().to(eval_params[orig_key].device)
-                    if eval_params[orig_key].shape == delta.shape:
-                        eval_params[orig_key] = eval_params[orig_key] + delta
+        #     eval_params = {}
+        #     for name, p in base_params.items():
+        #         eval_params[name] = p.clone()
+        #     for safe_key, module in sigma_modules.items():
+        #         orig_key = sigma_key_map.get(safe_key, safe_key)
+        #         if orig_key in eval_params and module.sigma.numel() > 0:
+        #             delta = module().to(eval_params[orig_key].device)
+        #             if eval_params[orig_key].shape == delta.shape:
+        #                 eval_params[orig_key] = eval_params[orig_key] + delta
 
-            model.image_encoder.load_state_dict(eval_params, strict=False)
-            zeroshot_metrics = evaluate_encoder_with_dataloader(
-                model.image_encoder, classification_head, val_loader, cfg.device
-            )
-            zeroshot_acc = zeroshot_metrics['top1']
-            logger.info(f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
-            record_validation("zeroshot", -1, zeroshot_acc)
-            model.image_encoder.load_state_dict(base_state_dict, strict=False)
+        #     model.image_encoder.load_state_dict(eval_params, strict=False)
+        #     zeroshot_metrics = evaluate_encoder_with_dataloader(
+        #         model.image_encoder, classification_head, val_loader, cfg.device
+        #     )
+        #     zeroshot_acc = zeroshot_metrics['top1']
+        #     logger.info(f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
+        #     record_validation("zeroshot", -1, zeroshot_acc)
+        #     model.image_encoder.load_state_dict(base_state_dict, strict=False)
+        
+        pretrained_acc = 0.0  # Placeholder when evaluation is disabled
+        zeroshot_acc = 0.0  # Placeholder when evaluation is disabled
 
         sigma_records = []
         records = visualize_sigma_matrices(
@@ -1037,42 +1058,43 @@ def run_energy(cfg: DictConfig) -> None:
             epoch_train_time = time.time() - epoch_start
             epoch_times.append(epoch_train_time)
 
-            if epoch in eval_epochs:
-                model.eval()
-                with torch.no_grad():
-                    eval_params = {}
-                    for name, p in base_params.items():
-                        eval_params[name] = p.clone()
-                    for safe_key, module in sigma_modules.items():
-                        orig_key = sigma_key_map.get(safe_key, safe_key)
-                        if orig_key in eval_params and module.sigma.numel() > 0:
-                            delta = module().to(eval_params[orig_key].device)
-                            if eval_params[orig_key].shape == delta.shape:
-                                eval_params[orig_key] = eval_params[orig_key] + delta
+            # if epoch in eval_epochs:
+            #     model.eval()
+            #     with torch.no_grad():
+            #         eval_params = {}
+            #         for name, p in base_params.items():
+            #             eval_params[name] = p.clone()
+            #         for safe_key, module in sigma_modules.items():
+            #             orig_key = sigma_key_map.get(safe_key, safe_key)
+            #             if orig_key in eval_params and module.sigma.numel() > 0:
+            #                 delta = module().to(eval_params[orig_key].device)
+            #                 if eval_params[orig_key].shape == delta.shape:
+            #                     eval_params[orig_key] = eval_params[orig_key] + delta
 
-                    model.image_encoder.load_state_dict(eval_params, strict=False)
+            #         model.image_encoder.load_state_dict(eval_params, strict=False)
 
-                    val_metrics = evaluate_encoder_with_dataloader(
-                        model.image_encoder, classification_head, val_loader, cfg.device
-                    )
-                    val_acc = val_metrics['top1']
+            #         val_metrics = evaluate_encoder_with_dataloader(
+            #             model.image_encoder, classification_head, val_loader, cfg.device
+            #         )
+            #         val_acc = val_metrics['top1']
 
-                    logger.info(f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
-                    record_validation("epoch", epoch, val_acc)
+            #         logger.info(f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
+            #         record_validation("epoch", epoch, val_acc)
 
-                    model.image_encoder.load_state_dict(base_state_dict, strict=False)
+            #         model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
-                records = visualize_sigma_matrices(
-                    sigma_modules,
-                    sigma_key_map,
-                    epoch=epoch,
-                    save_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.png"),
-                    title=f"{test_ds} ({shot_folder})",
-                    json_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.json"),
-                )
-                if records:
-                    sigma_records.extend(records)
-                model.train()
+            #     records = visualize_sigma_matrices(
+            #         sigma_modules,
+            #         sigma_key_map,
+            #         epoch=epoch,
+            #         save_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.png"),
+            #         title=f"{test_ds} ({shot_folder})",
+            #         json_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.json"),
+            #     )
+            #     if records:
+            #         sigma_records.extend(records)
+            #     model.train()
+            pass  # Evaluation disabled during training
 
         # Finalize weights and save: materialize the final deltas onto base params
         with torch.no_grad():
@@ -1153,6 +1175,7 @@ def run_energy(cfg: DictConfig) -> None:
             "model": cfg.model,
             "sigma_epochs": cfg.sigma_epochs,
             "sigma_lr": cfg.sigma_lr,
+            "sigma_wd": cfg.sigma_wd,
             "svd_keep_topk": getattr(cfg, "svd_keep_topk", 2),
             "initialize_sigma": getattr(cfg, "initialize_sigma", None),
             "adapter_choice": cfg.adapter,
@@ -1165,8 +1188,8 @@ def run_energy(cfg: DictConfig) -> None:
             "loss_history": loss_history,
             "validation_history": val_history,
             "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
-            "pretrained_accuracy": float(pretrained_acc),
-            "zeroshot_accuracy": float(zeroshot_acc),
+            # "pretrained_accuracy": float(pretrained_acc),  # Disabled
+            # "zeroshot_accuracy": float(zeroshot_acc),  # Disabled
             "config_tag": cfg.config_tag,
             "adapter_results": adapter_summary,
         }
@@ -1191,7 +1214,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test_dataset",
         type=str,
-        required=True,
+        # required=True,
+        default="Country211",
         # choices=allowed_test_datasets,
         help="Held-out dataset to train on (sigma epochs auto-set by dataset size)",
     )

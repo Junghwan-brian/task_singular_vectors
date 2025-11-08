@@ -45,7 +45,7 @@ from src.utils.variables_and_paths import (
 )
 
 # Utils
-from src.utils.utils import cosine_lr
+from src.utils.utils import cosine_lr, load_checkpoint_safe
 from src.datasets.common import get_dataloader, maybe_dictionarize
 
 # General dataset imports
@@ -191,26 +191,29 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for Atlas training (general datasets)
 ATLAS_EPOCHS_PER_DATASET = {
-    # "Cars": 35,
-    "DTD": 76,
-    # "EuroSAT": 12,
-    "GTSRB": 11,
-    "MNIST": 5,
-    # "RESISC45": 15,
-    # "SUN397": 14,
-    "SVHN": 4,
-    "CIFAR10": 6,
-    "CIFAR100": 6,
-    "STL10": 60,
-    "Food101": 4,
-    "Flowers102": 147,
-    # "FER2013": 10,
-    "PCAM": 1,
-    "OxfordIIITPet": 82,
-    "RenderedSST2": 39,
-    "EMNIST": 2,
-    "FashionMNIST": 5,
-    "KMNIST": 5,
+    # "Cars": 20,
+    "DTD": 20,
+    # "EuroSAT": 20,
+    "GTSRB": 20,
+    "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
+    "SVHN": 20,
+    "CIFAR10": 20,
+    "CIFAR100": 20,
+    "STL10": 20,
+    "Food101":20,
+    "Flowers102": 20,
+    # "FER2013": 20,
+    "PCAM":20,
+    "OxfordIIITPet": 20,
+    "RenderedSST2": 20,
+    "EMNIST":20,
+    "FashionMNIST":20,
+    # "KMNIST":20,
+    "FGVCAircraft": 20,
+    "CUB200": 20,
+    "Country211": 20,
 }
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
@@ -580,7 +583,7 @@ def train_single_task(args, comp_acc=None, logger=None):
             args.model_location, dataset_val, args.model)
         
         if os.path.exists(finetuned_checkpoint_path):
-            ft_checks[dataset] = torch.load(finetuned_checkpoint_path, map_location="cpu")
+            ft_checks[dataset] = load_checkpoint_safe(finetuned_checkpoint_path, map_location="cpu")
             logger.info(f"✓ Loaded fine-tuned checkpoint for {dataset}")
         else:
             logger.warning(f"✗ Missing fine-tuned checkpoint for {dataset}")
@@ -591,7 +594,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     zeroshot_path = get_zeroshot_path(args.model_location, first_dataset_val, args.model)
     
     logger.info(f"Loading shared zeroshot model from: {zeroshot_path}")
-    ptm_check = torch.load(zeroshot_path, map_location="cpu")
+    ptm_check = load_checkpoint_safe(zeroshot_path, map_location="cpu")
 
     # Create task vectors using shared zeroshot checkpoint
     task_vectors = {}
@@ -735,7 +738,7 @@ def train_single_task(args, comp_acc=None, logger=None):
             if base_dataset is None:
                 base_dataset = getattr(train_loader, "dataset", None)
             if base_dataset is not None:
-                num_workers = getattr(train_loader, "num_workers", 8)
+                num_workers = 2  # Fixed num_workers
                 collate_fn = getattr(train_loader, "collate_fn", None)
                 train_loader = torch.utils.data.DataLoader(
                     torch.utils.data.Subset(base_dataset, selected_indices),
@@ -792,21 +795,23 @@ def train_single_task(args, comp_acc=None, logger=None):
     val_history = []
     record_validation = ValidationRecorder(overall_start, val_history)
 
-    # Evaluate zeroshot accuracy using pre-loaded dataloader
-    image_encoder.eval()
-    classification_head.eval()
+    # # Evaluate zeroshot accuracy using pre-loaded dataloader
+    # image_encoder.eval()
+    # classification_head.eval()
     
-    pretrained_metrics = evaluate_encoder_with_dataloader(
-        image_encoder, classification_head, val_loader, args.device
-    )
-    pretrained_acc = pretrained_metrics['top1']
-    comp_acc[f"{target_dataset}_zeroshot"] = pretrained_acc
-    args.zs_acc[f"{target_dataset}"] = pretrained_acc
-    logger.info(
-        f"=> Zero-shot accuracy on {target_dataset}:\t{100*pretrained_acc:.2f}%.")
+    # pretrained_metrics = evaluate_encoder_with_dataloader(
+    #     image_encoder, classification_head, val_loader, args.device
+    # )
+    # pretrained_acc = pretrained_metrics['top1']
+    # comp_acc[f"{target_dataset}_zeroshot"] = pretrained_acc
+    # args.zs_acc[f"{target_dataset}"] = pretrained_acc
+    # logger.info(
+    #     f"=> Zero-shot accuracy on {target_dataset}:\t{100*pretrained_acc:.2f}%.")
 
-    record_validation("pretrained", -2, pretrained_acc)
-    record_validation("zeroshot", -1, pretrained_acc)
+    # record_validation("pretrained", -2, pretrained_acc)
+    # record_validation("zeroshot", -1, pretrained_acc)
+    
+    pretrained_acc = 0.0  # Placeholder when evaluation is disabled
 
     image_encoder.train()
     classification_head.train()
@@ -875,36 +880,36 @@ def train_single_task(args, comp_acc=None, logger=None):
         epoch_times.append(epoch_train_time)
         logger.info(f"Epoch {epoch} training time: {epoch_train_time:.2f}s")
 
-        # Evaluate after selected epochs using pre-loaded dataloader
-        if epoch in eval_epochs:
-            image_encoder = model.image_encoder
-            coef = model.image_encoder.coef
-            
-            image_encoder.eval()
-            classification_head.eval()
-            
-            # Use pre-loaded dataloader
-            metrics = evaluate_encoder_with_dataloader(
-                image_encoder, classification_head, val_loader, args.device
-            )
-            acc = metrics['top1']
-            
-            # Set back to train mode
-            image_encoder.train()
-            classification_head.train()
-            
-            logger.info(f"Epoch {epoch}: Accuracy = {100*acc:.2f}%")
-            record_validation("epoch", epoch, acc)
-            
-            if acc > best_acc:
-                best_acc = acc
-                best_coef = coef.data.clone()
-                logger.info(f"✓ New best accuracy: {100*best_acc:.2f}%")
+        # # Evaluate after selected epochs using pre-loaded dataloader
+        # if epoch in eval_epochs:
+        #     image_encoder = model.image_encoder
+        #     coef = model.image_encoder.coef
+        #     
+        #     image_encoder.eval()
+        #     classification_head.eval()
+        #     
+        #     # Use pre-loaded dataloader
+        #     metrics = evaluate_encoder_with_dataloader(
+        #         image_encoder, classification_head, val_loader, args.device
+        #     )
+        #     acc = metrics['top1']
+        #     
+        #     # Set back to train mode
+        #     image_encoder.train()
+        #     classification_head.train()
+        #     
+        #     logger.info(f"Epoch {epoch}: Accuracy = {100*acc:.2f}%")
+        #     record_validation("epoch", epoch, acc)
+        #     
+        #     if acc > best_acc:
+        #         best_acc = acc
+        #         best_coef = coef.data.clone()
+        #         logger.info(f"✓ New best accuracy: {100*best_acc:.2f}%")
 
-    comp_acc[target_dataset] = best_acc
+    # comp_acc[target_dataset] = best_acc
     target_dataset_clean = target_dataset.replace("Val", "")
     image_encoder = model.image_encoder
-    image_encoder.coef = torch.nn.Parameter(best_coef)
+    # image_encoder.coef = torch.nn.Parameter(best_coef)  # Use final coef instead of best
 
     # Final evaluation using pre-loaded dataloader
     image_encoder.eval()
@@ -939,7 +944,8 @@ def train_single_task(args, comp_acc=None, logger=None):
     os.makedirs(save_dir, exist_ok=True)
 
     atlas_path = os.path.join(save_dir, "atlas.pt")
-    torch.save(best_coef, atlas_path)
+    final_coef = model.image_encoder.coef.data.clone()
+    torch.save(final_coef, atlas_path)
     logger.info(f"✓ Saved learned atlas coefficients to {atlas_path}")
 
     adapter_result_tag = "none"
@@ -959,7 +965,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     result_log = {
         "target_dataset": target_dataset_clean,
         "final_accuracy": final_acc,
-        "best_val_accuracy": best_acc,
+        # "best_val_accuracy": best_acc,  # Disabled during training
         "k_shot": k,
         "model": args.model,
         "epochs": args.epochs,
@@ -972,8 +978,8 @@ def train_single_task(args, comp_acc=None, logger=None):
         "loss_history": loss_history,
         "validation_history": val_history,
         "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
-        "pretrained_accuracy": float(pretrained_acc),
-        "zeroshot_accuracy": float(pretrained_acc),
+        # "pretrained_accuracy": float(pretrained_acc),  # Disabled
+        # "zeroshot_accuracy": float(pretrained_acc),  # Disabled
         "config_tag": config_tag,
         "adapter_choice": adapter_choice_value,
         "adapter_results": adapter_summary,

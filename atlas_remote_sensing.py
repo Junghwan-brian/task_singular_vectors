@@ -23,13 +23,13 @@ from tqdm.auto import tqdm
 # Disable problematic attention backends that cause "No execution plans support the graph" error
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
-# torch.backends.cuda.enable_cudnn_sdp(False)
-# # Additional cuDNN settings for H100 compatibility
-# torch.backends.cudnn.allow_tf32 = False
-# torch.backends.cuda.matmul.allow_tf32 = False
-# # Set cuDNN benchmark to False for stability
-# torch.backends.cudnn.benchmark = False
-# torch.backends.cudnn.deterministic = True
+torch.backends.cuda.enable_cudnn_sdp(False)
+# Additional cuDNN settings for H100 compatibility
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+# Set cuDNN benchmark to False for stability
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
@@ -193,22 +193,21 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for Atlas training (matching fine-tuning epochs)
 ATLAS_EPOCHS_PER_DATASET = {
-    "AID": 10,              # ~10,000 train samples, 600x600
-    "CLRS": 10,             # ~30,000 train samples, 256x256
-    "EuroSAT_RGB": 15,      # ~21,600 train samples, 64x64
-    "MLRSNet": 15,          # ~17,000 train samples, 256x256
-    "NWPU-RESISC45": 15,    # ~25,200 train samples, 256x256
-    "Optimal-31": 50,       # ~6,200 train samples, 256x256
+    "AID": 20,              # ~10,000 train samples, 600x600
+    "CLRS": 20,             # ~30,000 train samples, 256x256
+    "EuroSAT_RGB": 20,      # ~21,600 train samples, 64x64
+    "MLRSNet": 20,          # ~17,000 train samples, 256x256
+    "NWPU-RESISC45": 20,    # ~25,200 train samples, 256x256
+    "Optimal-31": 20,       # ~6,200 train samples, 256x256
     "PatternNet": 20,       # ~10,000 train samples, 256x256
-    "RS_C11": 60,           # ~5,000 train samples, 512x512
+    "RS_C11": 20,           # ~5,000 train samples, 512x512
     "RSD46-WHU": 20,        # ~10,000 train samples, 256x256
-    "RSI-CB128": 15,        # ~18,000 train samples, 128x128
-    "RSSCN7": 80,           # ~2,800 train samples, 400x400
-    "SAT-4": 5,             # ~60,000 train samples, 28x28
-    "SAT-6": 10,            # ~40,000 train samples, 28x28
-    "SIRI-WHU": 100,        # ~2,400 train samples, 200x200
-    "UC_Merced": 100,       # ~2,100 train samples, 256x256
-    "WHU-RS19": 150,        # ~1,000 train samples, 600x600
+    "RSI-CB128": 20,        # ~18,000 train samples, 128x128
+    "RSSCN7": 20,           # ~2,800 train samples, 400x400
+    "SAT-4": 20,             # ~60,000 train samples, 28x28
+    "SIRI-WHU": 20,        # ~2,400 train samples, 200x200
+    "UC_Merced": 20,       # ~2,100 train samples, 256x256
+    "WHU-RS19": 20,        # ~1,000 train samples, 600x600
 }
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
@@ -641,7 +640,7 @@ def train_single_task(args, comp_acc=None, logger=None):
         preprocess_fn,
         location=args.data_location,
         batch_size=args.batch_size,
-        num_workers=8,
+        num_workers=2,  # Fixed num_workers
     )
 
     # Get classification head for remote sensing dataset
@@ -664,7 +663,7 @@ def train_single_task(args, comp_acc=None, logger=None):
             model.val_preprocess,
             location=args.data_location,
             batch_size=args.batch_size,
-            num_workers=8,
+            num_workers=2,  # Fixed num_workers
         )
         val_progress.update(1)
         val_loader = get_dataloader(
@@ -744,7 +743,7 @@ def train_single_task(args, comp_acc=None, logger=None):
             if base_dataset is None:
                 base_dataset = getattr(train_loader, "dataset", None)
             if base_dataset is not None:
-                num_workers = getattr(train_loader, "num_workers", 8)
+                num_workers = 2  # Fixed num_workers
                 collate_fn = getattr(train_loader, "collate_fn", None)
                 train_loader = torch.utils.data.DataLoader(
                     torch.utils.data.Subset(base_dataset, selected_indices),
@@ -801,19 +800,21 @@ def train_single_task(args, comp_acc=None, logger=None):
     val_history = []
     record_validation = ValidationRecorder(overall_start, val_history)
 
-    # Evaluate zeroshot accuracy using unified evaluation function
-    image_encoder.eval()
-    classification_head.eval()
-    pretrained_metrics = evaluate_encoder_with_dataloader(
-        image_encoder, classification_head, val_loader, 'cuda')
-    pretrained_acc = pretrained_metrics['top1']
-    comp_acc[f"{target_dataset}_zeroshot"] = pretrained_acc
-    args.zs_acc[f"{target_dataset}"] = pretrained_acc
-    logger.info(
-        f"=> Zero-shot accuracy on {target_dataset}:\t{100*pretrained_acc:.2f}%.")
+    # # Evaluate zeroshot accuracy using unified evaluation function
+    # image_encoder.eval()
+    # classification_head.eval()
+    # pretrained_metrics = evaluate_encoder_with_dataloader(
+    #     image_encoder, classification_head, val_loader, 'cuda')
+    # pretrained_acc = pretrained_metrics['top1']
+    # comp_acc[f"{target_dataset}_zeroshot"] = pretrained_acc
+    # args.zs_acc[f"{target_dataset}"] = pretrained_acc
+    # logger.info(
+    #     f"=> Zero-shot accuracy on {target_dataset}:\t{100*pretrained_acc:.2f}%.")
 
-    record_validation("pretrained", -2, pretrained_acc)
-    record_validation("zeroshot", -1, pretrained_acc)
+    # record_validation("pretrained", -2, pretrained_acc)
+    # record_validation("zeroshot", -1, pretrained_acc)
+    
+    pretrained_acc = 0.0  # Placeholder when evaluation is disabled
 
     image_encoder.train()
     classification_head.train()
@@ -882,35 +883,35 @@ def train_single_task(args, comp_acc=None, logger=None):
         epoch_times.append(epoch_train_time)
         logger.info(f"Epoch {epoch} training time: {epoch_train_time:.2f}s")
 
-        # Evaluate after selected epochs using unified evaluation function
-        if epoch in eval_epochs:
-            image_encoder = model.image_encoder
-            coef = model.image_encoder.coef
-            
-            image_encoder.eval()
-            classification_head.eval()
-            
-            # Use unified evaluation function
-            metrics = evaluate_encoder_with_dataloader(
-                image_encoder, classification_head, val_loader, 'cuda')
-            acc = metrics['top1']
-            
-            # Set back to train mode
-            image_encoder.train()
-            classification_head.train()
-            
-            logger.info(f"Epoch {epoch}: Accuracy = {100*acc:.2f}%")
-            record_validation("epoch", epoch, acc)
-            
-            if acc > best_acc:
-                best_acc = acc
-                best_coef = coef.data.clone()
-                logger.info(f"✓ New best accuracy: {100*best_acc:.2f}%")
+        # # Evaluate after selected epochs using unified evaluation function
+        # if epoch in eval_epochs:
+        #     image_encoder = model.image_encoder
+        #     coef = model.image_encoder.coef
+        #     
+        #     image_encoder.eval()
+        #     classification_head.eval()
+        #     
+        #     # Use unified evaluation function
+        #     metrics = evaluate_encoder_with_dataloader(
+        #         image_encoder, classification_head, val_loader, 'cuda')
+        #     acc = metrics['top1']
+        #     
+        #     # Set back to train mode
+        #     image_encoder.train()
+        #     classification_head.train()
+        #     
+        #     logger.info(f"Epoch {epoch}: Accuracy = {100*acc:.2f}%")
+        #     record_validation("epoch", epoch, acc)
+        #     
+        #     if acc > best_acc:
+        #         best_acc = acc
+        #         best_coef = coef.data.clone()
+        #         logger.info(f"✓ New best accuracy: {100*best_acc:.2f}%")
 
-    comp_acc[target_dataset] = best_acc
+    # comp_acc[target_dataset] = best_acc
     target_dataset_clean = target_dataset.replace("Val", "")
     image_encoder = model.image_encoder
-    image_encoder.coef = torch.nn.Parameter(best_coef)
+    # image_encoder.coef = torch.nn.Parameter(best_coef)  # Use final coef instead of best
 
     # Final evaluation using unified evaluation function
     image_encoder.eval()
@@ -944,7 +945,8 @@ def train_single_task(args, comp_acc=None, logger=None):
     os.makedirs(save_dir, exist_ok=True)
 
     atlas_path = os.path.join(save_dir, "atlas.pt")
-    torch.save(best_coef, atlas_path)
+    final_coef = model.image_encoder.coef.data.clone()
+    torch.save(final_coef, atlas_path)
     logger.info(f"✓ Saved learned atlas coefficients to {atlas_path}")
 
     adapter_result_tag = "none"
@@ -964,7 +966,7 @@ def train_single_task(args, comp_acc=None, logger=None):
     result_log = {
         "target_dataset": target_dataset_clean,
         "final_accuracy": final_acc,
-        "best_val_accuracy": best_acc,
+        # "best_val_accuracy": best_acc,  # Disabled during training
         "k_shot": k,
         "model": args.model,
         "epochs": args.epochs,
@@ -977,8 +979,8 @@ def train_single_task(args, comp_acc=None, logger=None):
         "loss_history": loss_history,
         "validation_history": val_history,
         "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
-        "pretrained_accuracy": float(pretrained_acc),
-        "zeroshot_accuracy": float(pretrained_acc),
+        # "pretrained_accuracy": float(pretrained_acc),  # Disabled
+        # "zeroshot_accuracy": float(pretrained_acc),  # Disabled
         "config_tag": config_tag,
         "adapter_choice": adapter_choice_value,
         "adapter_results": adapter_summary,
