@@ -46,10 +46,9 @@ from src.utils.variables_and_paths import (
 
 # Utils
 from src.utils.utils import cosine_lr
-from src.datasets.common import get_dataloader, maybe_dictionarize
 
 # General dataset imports
-from src.datasets import get_dataset
+from src.datasets import get_dataset, get_dataloader, maybe_dictionarize
 from src.models import get_classification_head
 from src.datasets.remote_sensing import sample_k_shot_indices
 

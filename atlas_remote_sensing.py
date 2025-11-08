@@ -193,22 +193,21 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for Atlas training (matching fine-tuning epochs)
 ATLAS_EPOCHS_PER_DATASET = {
-    "AID": 10,              # ~10,000 train samples, 600x600
-    "CLRS": 10,             # ~30,000 train samples, 256x256
-    "EuroSAT_RGB": 15,      # ~21,600 train samples, 64x64
-    "MLRSNet": 15,          # ~17,000 train samples, 256x256
-    "NWPU-RESISC45": 15,    # ~25,200 train samples, 256x256
-    "Optimal-31": 50,       # ~6,200 train samples, 256x256
+    "AID": 20,              # ~10,000 train samples, 600x600
+    "CLRS": 20,             # ~30,000 train samples, 256x256
+    "EuroSAT_RGB": 20,      # ~21,600 train samples, 64x64
+    "MLRSNet": 20,          # ~17,000 train samples, 256x256
+    "NWPU-RESISC45": 20,    # ~25,200 train samples, 256x256
+    "Optimal-31": 20,       # ~6,200 train samples, 256x256
     "PatternNet": 20,       # ~10,000 train samples, 256x256
-    "RS_C11": 60,           # ~5,000 train samples, 512x512
+    "RS_C11": 20,           # ~5,000 train samples, 512x512
     "RSD46-WHU": 20,        # ~10,000 train samples, 256x256
-    "RSI-CB128": 15,        # ~18,000 train samples, 128x128
-    "RSSCN7": 80,           # ~2,800 train samples, 400x400
-    "SAT-4": 5,             # ~60,000 train samples, 28x28
-    "SAT-6": 10,            # ~40,000 train samples, 28x28
-    "SIRI-WHU": 100,        # ~2,400 train samples, 200x200
-    "UC_Merced": 100,       # ~2,100 train samples, 256x256
-    "WHU-RS19": 150,        # ~1,000 train samples, 600x600
+    "RSI-CB128": 20,        # ~18,000 train samples, 128x128
+    "RSSCN7": 20,           # ~2,800 train samples, 400x400
+    "SAT-4": 20,             # ~60,000 train samples, 28x28
+    "SIRI-WHU": 20,        # ~2,400 train samples, 200x200
+    "UC_Merced": 20,       # ~2,100 train samples, 256x256
+    "WHU-RS19": 20,        # ~1,000 train samples, 600x600
 }
 
 def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
