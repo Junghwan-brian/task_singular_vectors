@@ -198,17 +198,17 @@ REMOTE_SENSING_DATASETS = {
 
 GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
 ENERGY_MODELS = ["ViT-B-16"]
-ENERGY_INITIALIZE_SIGMA = ["sum"]
+ENERGY_INITIALIZE_SIGMA = ["average", "sum"]
 ENERGY_ADAPTERS = ["none"]
-ENERGY_K = [16]
-ENERGY_SVD_KEEP_TOPK = [5]
+ENERGY_K = [1,2,4,8,16]
+ENERGY_SVD_KEEP_TOPK = [10, 12]
 ENERGY_SIGMA_LR = [1e-3]
-ENERGY_SIGMA_WD = [0.0, 0.1]
+ENERGY_SIGMA_WD = [0.05, 0.1]
 ENERGY_WARMUP_RATIO = [0.1]
 
 ATLAS_MODELS = ["ViT-B-16"]
 ATLAS_ADAPTERS = ["none", "lp++", "tip"]
-ATLAS_K = [16]
+ATLAS_K = [1,2,4,8,16]
 
 def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
     commands: List[List[str]] = []
