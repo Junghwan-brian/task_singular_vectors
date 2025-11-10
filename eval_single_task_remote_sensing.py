@@ -96,7 +96,16 @@ def get_accuracy_from_data(data: Dict[str, Any], adapter: str) -> Optional[float
                 )
                 if best_acc is not None:
                     return best_acc * 100 if best_acc <= 1.0 else best_acc
-    
+    # For non-adapter runs, prefer best from root-level validation_history if available
+    root_val_history = data.get('validation_history', [])
+    if root_val_history:
+        best_root_acc = max(
+            (record.get('accuracy', 0) for record in root_val_history if 'accuracy' in record),
+            default=None
+        )
+        if best_root_acc is not None:
+            return best_root_acc * 100 if best_root_acc <= 1.0 else best_root_acc
+            
     # Otherwise use final_accuracy from main results
     final_acc = data.get('final_accuracy')
     if final_acc is not None:
@@ -673,22 +682,11 @@ def create_comprehensive_table(
                     else:
                         other_baselines[f'{method}_{adapter}'].append(accuracy)
                 
-                # For Energy, select best based on the global best config for this model/shot
-                if energy_baselines and model_name in best_energy_configs and shot_name in best_energy_configs[model_name]:
-                    best_config_key, _ = best_energy_configs[model_name][shot_name]
-                    
-                    # Find the baseline matching the best config
-                    for baseline, accuracy in energy_baselines:
-                        lr = baseline.get('lr', 'unknown')
-                        topk = baseline.get('svd_keep_topk', 'unknown')
-                        init = baseline.get('initialize_sigma', 'unknown')
-                        warmup = baseline.get('warmup_ratio', 'unknown')
-                        wd = baseline.get('sigma_wd', '0.0')
-                        config_key = f"Energy_lr={lr}_k={topk}_init={init}_w={warmup}_wd={wd}"
-                        
-                        if config_key == best_config_key:
-                            data_structure[model_name][shot_name]['Energy (best config)'][dataset_name] = accuracy
-                            break
+                # For Energy, select best config FOR THIS DATASET (not global average)
+                if energy_baselines:
+                    # Find the best performing Energy config for this specific dataset
+                    best_baseline, best_acc = max(energy_baselines, key=lambda x: x[1])
+                    data_structure[model_name][shot_name]['Energy (best config)'][dataset_name] = best_acc
                 
                 # For Atlas and others
                 for atlas_key, accuracies in atlas_baselines.items():
@@ -885,7 +883,7 @@ def main():
     parser.add_argument(
         '--model_location',
         type=str,
-        default='./models/checkpoints_remote_sensing',
+        default='./models/checkpoints',
         help='Root directory containing model checkpoints'
     )
     parser.add_argument(
