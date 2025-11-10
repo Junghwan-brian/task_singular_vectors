@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
@@ -353,6 +354,230 @@ def visualize_shot_results(
     logger.info(f"Saved: {output_path}")
 
 
+def aggregate_across_datasets(all_results: Dict) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    Aggregate results across all datasets to get average accuracy.
+    
+    Returns:
+        {
+            'ViT-B-32': {
+                '16shots': {
+                    'Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0': 85.5,
+                    'Atlas_none': 82.3,
+                    'Atlas_tip': 87.1,
+                    ...
+                },
+                ...
+            },
+            ...
+        }
+    """
+    aggregated = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    
+    for model_name, datasets in all_results.items():
+        for dataset_name, shots in datasets.items():
+            for shot_name, baselines in shots.items():
+                for baseline in baselines:
+                    method = baseline['method']
+                    adapter = baseline.get('adapter', 'none')
+                    accuracy = baseline['accuracy']
+                    
+                    # Create unique key based on method type
+                    if method == 'Energy':
+                        # For Energy, use hyperparameters as key
+                        lr = baseline.get('lr', 'unknown')
+                        topk = baseline.get('svd_keep_topk', 'unknown')
+                        init = baseline.get('initialize_sigma', 'unknown')
+                        warmup = baseline.get('warmup_ratio', 'unknown')
+                        wd = baseline.get('sigma_wd', '0.0')
+                        key = f"Energy_lr={lr}_k={topk}_init={init}_w={warmup}_wd={wd}"
+                    elif method == 'Atlas':
+                        # For Atlas, distinguish by adapter
+                        key = f"Atlas_{adapter}"
+                    else:
+                        key = f"{method}_{adapter}"
+                    
+                    aggregated[model_name][shot_name][key].append(accuracy)
+    
+    # Average the accuracies
+    averaged = {}
+    for model_name, shots in aggregated.items():
+        averaged[model_name] = {}
+        for shot_name, methods in shots.items():
+            averaged[model_name][shot_name] = {}
+            for method_key, accuracies in methods.items():
+                averaged[model_name][shot_name][method_key] = sum(accuracies) / len(accuracies)
+    
+    return averaged
+
+
+def select_best_energy_config(averaged_results: Dict) -> Dict[str, Dict[str, tuple]]:
+    """
+    For each model and shot, select the best Energy hyperparameter configuration.
+    
+    Returns:
+        {
+            'ViT-B-32': {
+                '16shots': ('Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0', 85.5),
+                ...
+            },
+            ...
+        }
+    """
+    best_energy = {}
+    
+    for model_name, shots in averaged_results.items():
+        best_energy[model_name] = {}
+        for shot_name, methods in shots.items():
+            # Filter Energy methods
+            energy_methods = {k: v for k, v in methods.items() if k.startswith('Energy_')}
+            
+            if energy_methods:
+                # Select best performing Energy configuration
+                best_key = max(energy_methods, key=energy_methods.get)
+                best_acc = energy_methods[best_key]
+                best_energy[model_name][shot_name] = (best_key, best_acc)
+    
+    return best_energy
+
+
+def visualize_aggregated_table(
+    averaged_results: Dict,
+    best_energy_configs: Dict,
+    output_dir: str
+) -> None:
+    """
+    Create a table visualization similar to Table 2 in the paper.
+    Shows averaged accuracy across all datasets.
+    """
+    # Define shot order
+    shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
+    
+    # Collect all unique methods
+    all_methods = set()
+    for model_name, shots in averaged_results.items():
+        for shot_name, methods in shots.items():
+            all_methods.update(methods.keys())
+    
+    # Separate Energy and non-Energy methods
+    energy_methods = {m for m in all_methods if m.startswith('Energy_')}
+    atlas_methods = {m for m in all_methods if m.startswith('Atlas_')}
+    other_methods = all_methods - energy_methods - atlas_methods
+    
+    # Prepare method list (Energy as single entry, then Atlas variants, then others)
+    method_list = ['Energy (best config)'] + sorted(atlas_methods) + sorted(other_methods)
+    
+    # Get models
+    models = sorted(averaged_results.keys())
+    
+    # Create data structure for plotting
+    # Structure: method -> model -> shot -> accuracy
+    table_data = defaultdict(lambda: defaultdict(dict))
+    energy_config_info = defaultdict(dict)
+    
+    for model_name in models:
+        for shot_name in shot_order:
+            if shot_name not in averaged_results[model_name]:
+                continue
+            
+            methods = averaged_results[model_name][shot_name]
+            
+            # Handle Energy - use best config
+            if model_name in best_energy_configs and shot_name in best_energy_configs[model_name]:
+                best_config_key, best_acc = best_energy_configs[model_name][shot_name]
+                table_data['Energy (best config)'][model_name][shot_name] = best_acc
+                energy_config_info[model_name][shot_name] = best_config_key
+            
+            # Handle Atlas and others
+            for method_key, accuracy in methods.items():
+                if method_key.startswith('Atlas_'):
+                    table_data[method_key][model_name][shot_name] = accuracy
+                elif not method_key.startswith('Energy_'):
+                    table_data[method_key][model_name][shot_name] = accuracy
+    
+    # Create visualization
+    fig, ax = plt.subplots(figsize=(20, max(8, len(method_list) * 0.6)))
+    
+    # Prepare data for grouped bar chart
+    n_models = len(models)
+    n_shots = len(shot_order)
+    n_methods = len(method_list)
+    
+    x_positions = np.arange(n_models * n_shots)
+    bar_width = 0.8 / n_methods
+    
+    colors = plt.cm.Set3(np.linspace(0, 1, n_methods))
+    
+    for method_idx, method in enumerate(method_list):
+        accuracies = []
+        for model in models:
+            for shot in shot_order:
+                acc = table_data[method].get(model, {}).get(shot, 0)
+                accuracies.append(acc)
+        
+        offset = (method_idx - n_methods / 2) * bar_width + bar_width / 2
+        ax.bar(x_positions + offset, accuracies, bar_width, 
+               label=format_method_label(method), color=colors[method_idx],
+               edgecolor='black', linewidth=0.5)
+    
+    # Customize x-axis
+    x_labels = []
+    for model in models:
+        for shot in shot_order:
+            shot_num = shot.replace('shots', '')
+            x_labels.append(f"{model}\n{shot_num}-shot")
+    
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel('Accuracy (%) - Averaged Across Datasets', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Model and Shot Configuration', fontsize=12, fontweight='bold')
+    ax.set_title('Few-Shot Remote Sensing Results - Dataset-Averaged Comparison', 
+                 fontsize=14, fontweight='bold', pad=20)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, 'aggregated_results_all_datasets.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    
+    logger.info(f"Saved aggregated visualization: {output_path}")
+    
+    # Save best Energy configurations to text file
+    config_output_path = os.path.join(output_dir, 'best_energy_configs.txt')
+    with open(config_output_path, 'w') as f:
+        f.write("Best Energy Hyperparameter Configurations\n")
+        f.write("=" * 80 + "\n\n")
+        for model in models:
+            f.write(f"Model: {model}\n")
+            f.write("-" * 80 + "\n")
+            for shot in shot_order:
+                if shot in energy_config_info.get(model, {}):
+                    config_key = energy_config_info[model][shot]
+                    accuracy = table_data['Energy (best config)'][model][shot]
+                    f.write(f"  {shot}: {config_key} (Acc: {accuracy:.2f}%)\n")
+            f.write("\n")
+    
+    logger.info(f"Saved best Energy configurations: {config_output_path}")
+
+
+def format_method_label(method_key: str) -> str:
+    """Format method key for display."""
+    if method_key == 'Energy (best config)':
+        return 'Energy (best)'
+    elif method_key.startswith('Atlas_'):
+        adapter = method_key.replace('Atlas_', '')
+        if adapter == 'none':
+            return 'Atlas'
+        else:
+            return f'Atlas+{adapter.upper()}'
+    else:
+        return method_key
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Aggregate and visualize remote sensing experiment results'
@@ -387,6 +612,11 @@ def main():
         default=None,
         help='Specific shots to process (e.g., 16shots 8shots)'
     )
+    parser.add_argument(
+        '--aggregate_only',
+        action='store_true',
+        help='Only generate aggregated visualization (skip individual charts)'
+    )
     
     args = parser.parse_args()
     
@@ -418,27 +648,37 @@ def main():
                     k: v for k, v in all_results[model][dataset].items() if k in shots_normalized
                 }
     
-    # Count total combinations
-    total_combinations = sum(
-        len(shots_dict)
-        for dataset_dict in all_results.values()
-        for shots_dict in dataset_dict.values()
-    )
-    
     logger.info(f"\nFound {len(all_results)} models")
-    logger.info(f"Total combinations to visualize: {total_combinations}")
     
-    # Generate visualizations
-    logger.info("\nGenerating visualizations...")
-    count = 0
-    for model_name, datasets in sorted(all_results.items()):
-        for dataset_name, shots in sorted(datasets.items()):
-            for shot_name, baselines in sorted(shots.items()):
-                count += 1
-                logger.info(f"[{count}/{total_combinations}] Processing {model_name}/{dataset_name}/{shot_name} ({len(baselines)} baselines)")
-                visualize_shot_results(
-                    model_name, dataset_name, shot_name, baselines, args.output_dir
-                )
+    # Generate aggregated visualization
+    logger.info("\nAggregating results across datasets...")
+    averaged_results = aggregate_across_datasets(all_results)
+    
+    logger.info("Selecting best Energy configurations...")
+    best_energy_configs = select_best_energy_config(averaged_results)
+    
+    logger.info("Generating aggregated visualization...")
+    visualize_aggregated_table(averaged_results, best_energy_configs, args.output_dir)
+    
+    # Generate individual visualizations if not aggregate_only
+    if not args.aggregate_only:
+        total_combinations = sum(
+            len(shots_dict)
+            for dataset_dict in all_results.values()
+            for shots_dict in dataset_dict.values()
+        )
+        
+        logger.info(f"\nTotal combinations to visualize: {total_combinations}")
+        logger.info("\nGenerating individual visualizations...")
+        count = 0
+        for model_name, datasets in sorted(all_results.items()):
+            for dataset_name, shots in sorted(datasets.items()):
+                for shot_name, baselines in sorted(shots.items()):
+                    count += 1
+                    logger.info(f"[{count}/{total_combinations}] Processing {model_name}/{dataset_name}/{shot_name} ({len(baselines)} baselines)")
+                    visualize_shot_results(
+                        model_name, dataset_name, shot_name, baselines, args.output_dir
+                    )
     
     logger.info("=" * 80)
     logger.info(f"✓ Complete! Results saved to {args.output_dir}")
