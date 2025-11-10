@@ -27,6 +27,88 @@ from src.datasets.imagenet_ood import ImageNetILSVRCVal
 from src.utils.utils import cosine_lr
 
 
+def grid_search_sigma_alpha(
+    sigma_modules: torch.nn.ModuleDict,
+    sigma_key_map,
+    base_params,
+    base_buffers,
+    model,
+    train_loader,
+    device,
+    alphas=None,
+    max_batches: int = None,
+    apply_best: bool = True,
+    logger: Optional[logging.Logger] = None,
+):
+    """
+    모든 Sigma(diag)에 동일 스케일(alpha)을 곱해본 뒤,
+    주어진 데이터에서 정확도가 가장 높은 alpha를 선택.
+    Returns:
+        (best_alpha, best_acc)
+    """
+    if alphas is None:
+        alphas = [1, 5, 10, 15, 20]
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    model.eval()
+    best_alpha = None
+    best_acc = -1.0
+    with torch.no_grad():
+        for alpha in alphas:
+            correct = 0.0
+            total = 0.0
+            for b_idx, batch in enumerate(train_loader):
+                if max_batches is not None and max_batches > 0 and b_idx >= max_batches:
+                    break
+                batch = maybe_dictionarize(batch)
+                inputs = batch["images"].to(device)
+                labels = batch["labels"].to(device)
+                # build delta map (no grad)
+                delta_map = {}
+                for safe_key, module in sigma_modules.items():
+                    orig_key = sigma_key_map.get(safe_key, safe_key)
+                    if orig_key in base_params and module.sigma.numel() > 0:
+                        # scaled delta: U @ diag(relu(sigma) * alpha) @ V
+                        sigma_vec = torch.relu(module.sigma) * float(alpha)
+                        delta = module.U @ torch.diag(sigma_vec) @ module.V
+                        if delta.shape == base_params[orig_key].shape:
+                            delta_map[orig_key] = delta
+                # merge params
+                params_map = {}
+                for name, p in base_params.items():
+                    if name in delta_map:
+                        params_map[name] = p + delta_map[name]
+                    else:
+                        params_map[name] = p
+                # functional forward
+                def encoder_forward(mod, x):
+                    merged = {}
+                    merged.update(base_buffers)
+                    merged.update(params_map)
+                    return functional_call(mod, merged, (x,))
+                features = encoder_forward(model.image_encoder, inputs)
+                logits = model.classification_head(features)
+                preds = logits.argmax(dim=1, keepdim=False)
+                correct += float(preds.eq(labels).sum().item())
+                total += float(labels.size(0))
+            acc = (correct / total) if total > 0 else 0.0
+            logger.info(f"[alpha-grid] alpha={alpha} -> train accuracy={acc*100:.2f}%")
+            if acc > best_acc:
+                best_acc = acc
+                best_alpha = alpha
+    if best_alpha is None:
+        best_alpha = 1.0
+    # 적용
+    if apply_best:
+        for _, module in sigma_modules.items():
+            if module.sigma.numel() > 0:
+                module.sigma.data.mul_(float(best_alpha))
+        logger.info(f"[alpha-grid] Selected alpha={best_alpha} (acc={best_acc*100:.2f}%), applied to sigma.")
+    else:
+        logger.info(f"[alpha-grid] Selected alpha={best_alpha} (acc={best_acc*100:.2f}%), not applied (apply_best=False).")
+    return best_alpha, best_acc
+
+
 def setup_logger(name: str = __name__) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
@@ -451,6 +533,31 @@ def run_imagenet_energy(cfg) -> None:
             f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
         record_validation("zeroshot", -1, zeroshot_acc)
         model.image_encoder.load_state_dict(base_state_dict, strict=False)
+
+    # Alpha grid search for Sigma scaling (pre-train)
+    try:
+        alphas = getattr(cfg, "alpha_grid_alphas", None)
+        max_batches = getattr(cfg, "alpha_grid_max_batches", 50)
+        if isinstance(max_batches, (int, float)):
+            max_batches = int(max(0, max_batches))
+        else:
+            max_batches = 50
+        best_alpha, best_acc = grid_search_sigma_alpha(
+            sigma_modules=sigma_modules,
+            sigma_key_map=sigma_key_map,
+            base_params=base_params,
+            base_buffers=base_buffers,
+            model=model,
+            train_loader=train_loader,
+            device=device,
+            alphas=alphas,
+            max_batches=max_batches,
+            apply_best=True,
+            logger=logger,
+        )
+        logger.info(f"[alpha-grid] Using alpha={best_alpha} before training (acc={best_acc*100:.2f}%)")
+    except Exception as e:
+        logger.warning(f"[alpha-grid] Skipped due to error: {e}")
 
     # Train
     model.train()
