@@ -17,4 +17,8 @@ datasets/*
 *.txt
 *.csv
 models/*
-*tar.gz
+*.tar
+*.zip
+*.gz
+imagenet/*
+*.jpeg

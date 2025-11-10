@@ -30,13 +30,26 @@ def load_checkpoint_safe(path, map_location='cpu'):
     # First, add module redirect to handle old module paths if needed
     if 'src.modeling' not in sys.modules:
         try:
-            import src.models.modeling
-            sys.modules['src.modeling'] = src.models.modeling
+            import src.models.modeling as modeling_mod
+            sys.modules['src.modeling'] = modeling_mod
+            # For PyTorch 2.6+ safe loading path, allowlist known globals if available
+            try:
+                import torch.serialization as _ts
+                encoder_cls = getattr(modeling_mod, 'ImageEncoder', None)
+                if hasattr(_ts, 'add_safe_globals') and encoder_cls is not None:
+                    _ts.add_safe_globals([encoder_cls])
+            except Exception:
+                pass
         except ImportError:
             pass  # If import fails, continue without redirect
     
     try:
-        checkpoint = torch.load(path, map_location=map_location)
+        # PyTorch 2.6+ defaults to weights_only=True which breaks pickled modules.
+        # Explicitly set weights_only=False; fall back for older versions.
+        try:
+            checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(path, map_location=map_location)
         
         # Check if checkpoint is a full model object or state_dict
         if isinstance(checkpoint, dict):
