@@ -6,6 +6,10 @@ import random
 import logging
 from typing import Dict, Iterator, List, Tuple
 
+# Ensure SDPA fast backends are disabled before importing torch (needed for higher-order grads)
+os.environ.setdefault("PYTORCH_SDP_DISABLE_FLASH_ATTENTION", "1")
+os.environ.setdefault("PYTORCH_SDP_DISABLE_MEM_EFFICIENT_ATTENTION", "1")
+
 import torch
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
@@ -17,10 +21,28 @@ import torchvision
 from omegaconf import DictConfig, OmegaConf, open_dict
 import argparse
 
+# NOTE: MAML은 2차 미분이 필요합니다. SDPA의 flash/mem_efficient 백엔드는
+# double backward를 지원하지 않아 에러가 발생할 수 있으므로 math 구현으로 강제합니다.
+try:
+    # Global toggles (preferred)
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+except Exception:
+    pass
+try:
+    from torch.backends.cuda import sdp_kernel
+    sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False)
+except Exception:
+    pass
+
 from src.utils.variables_and_paths import (
     ALL_DATASETS,
+    get_zeroshot_path,
 )
+from src.utils.utils import load_checkpoint_safe
 from src.datasets import get_dataloader, maybe_dictionarize, get_dataset
+from src.datasets.remote_sensing import sample_k_shot_indices
 from src.models import ImageClassifier, ImageEncoder, get_classification_head
 from src.eval.eval import eval_single_dataset
 
@@ -129,28 +151,28 @@ def maml_meta_train(
         if cfg.get("seed") is None:
             cfg.seed = 1
         if cfg.get("batch_size") is None:
-            cfg.batch_size = 64
+            cfg.batch_size = 8
         # heads.py가 사용하는 save_dir 보장
         if "save_dir" not in cfg:
             cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
         os.makedirs(cfg.save_dir, exist_ok=True)
         # meta settings defaults
         cfg.meta_iterations = int(getattr(cfg, "meta_iterations", 2000))
-        cfg.meta_batch_size = int(getattr(cfg, "meta_batch_size", 4))
+        cfg.meta_batch_size = int(getattr(cfg, "meta_batch_size", 4)) # inner loop task 갯수
         cfg.inner_steps = int(getattr(cfg, "inner_steps", 1))
-        cfg.inner_lr = float(getattr(cfg, "inner_lr", 1e-2))
+        cfg.inner_lr = float(getattr(cfg, "inner_lr", 1e-4))
         cfg.meta_lr = float(getattr(cfg, "meta_lr", 5e-5))
         cfg.meta_wd = float(getattr(cfg, "meta_wd", 0.0))
         cfg.grad_clip = float(getattr(cfg, "grad_clip", 1.0))
         cfg.save_model_dir = getattr(
             cfg,
             "save_model_dir",
-            "/disk3/junghwan/task_vector/maml/models",
+            "maml/models",
         )
         cfg.save_result_dir = getattr(
             cfg,
             "save_result_dir",
-            "/disk3/junghwan/task_vector/maml/results",
+            "maml/results",
         )
 
     set_seed(int(cfg.seed))
@@ -173,7 +195,28 @@ def maml_meta_train(
     logger.info(f"Model: {cfg.model}")
 
     # 모형 준비 (메타 파라미터 = encoder 파라미터)
-    image_encoder = ImageEncoder(cfg.model).cuda()
+    model_name_for_init = str(cfg.model)
+    image_encoder = ImageEncoder(model_name_for_init).cuda()
+    # zeroshot 체크포인트에서 초기화 시도
+    try:
+        zeroshot_path = get_zeroshot_path(
+            cfg.model_location, f"{cfg.test_dataset}Val", model=str(cfg.model)
+        )
+        if os.path.exists(zeroshot_path):
+            base_state = load_checkpoint_safe(zeroshot_path, map_location="cpu")
+            load_res = image_encoder.load_state_dict(base_state, strict=False)
+            if isinstance(load_res, tuple) and len(load_res) == 2:
+                missing_keys, unexpected_keys = load_res
+                logger.info(
+                    f"✓ Loaded zeroshot checkpoint: {zeroshot_path} "
+                    f"(missing={len(missing_keys)}, unexpected={len(unexpected_keys)})"
+                )
+            else:
+                logger.info(f"✓ Loaded zeroshot checkpoint: {zeroshot_path}")
+        else:
+            logger.warning(f"Zeroshot checkpoint not found: {zeroshot_path}. Falling back to pretrained '{model_name_for_init}'.")
+    except Exception as e:
+        logger.error(f"Failed to load zeroshot checkpoint: {e}. Falling back to pretrained '{model_name_for_init}'.")
     # 메타학습을 위해 인코더 파라미터의 미분 허용 보장
     for p in image_encoder.parameters():
         p.requires_grad_(True)
@@ -284,6 +327,8 @@ def finetune_on_test_dataset(
         cfg.finetune_wd = float(getattr(cfg, "finetune_wd", 0.0))
         cfg.lr_step_size = int(getattr(cfg, "lr_step_size", 0))
         cfg.lr_gamma = float(getattr(cfg, "lr_gamma", 0.1))
+        # k-shot (0이면 full-shot)
+        cfg.k_shot = int(getattr(cfg, "k_shot", 16))
         # heads.py가 사용하는 save_dir 보장
         if "save_dir" not in cfg:
             cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
@@ -300,6 +345,116 @@ def finetune_on_test_dataset(
     train_loader = get_dataloader(
         dataset_train, is_train=True, args=cfg, image_encoder=None)
     val_dataset_name = cfg.test_dataset + "Val"
+
+    # k-shot 적용: 클래스당 k개로 학습 서브셋 구성
+    if int(cfg.k_shot) and int(cfg.k_shot) > 0:
+        def _save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+            with open(path, "w") as f:
+                json.dump({"indices": indices, "dataset": dataset_name, "k": int(k), "seed": int(seed)}, f)
+            return path
+
+        def _load_k_shot_indices(save_dir, k, seed):
+            path = os.path.join(save_dir, f"k_shot_indices_k{k}_seed{seed}.json")
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    data = json.load(f)
+                return data.get("indices", None)
+            return None
+
+        def _subsample_from_larger_k(larger_indices, dataset, target_k):
+            import numpy as np
+            from torch.utils.data import Subset
+            base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+            labels = []
+            # 다양한 데이터셋 포맷 지원
+            if hasattr(base_dataset, 'targets') and base_dataset.targets is not None:
+                all_targets = base_dataset.targets
+                if torch.is_tensor(all_targets):
+                    all_targets = all_targets.cpu().numpy()
+                elif not isinstance(all_targets, np.ndarray):
+                    all_targets = np.array(all_targets)
+                labels = [int(all_targets[idx]) for idx in larger_indices]
+            elif hasattr(base_dataset, 'data') and hasattr(base_dataset.data, 'iloc'):
+                try:
+                    all_targets = base_dataset.data['target'].values
+                    labels = [int(all_targets[idx]) - 1 for idx in larger_indices]
+                except Exception:
+                    labels = []
+            elif hasattr(base_dataset, 'samples') and base_dataset.samples is not None:
+                try:
+                    all_samples = base_dataset.samples
+                    labels = [int(all_samples[idx][1]) for idx in larger_indices]
+                except Exception:
+                    labels = []
+            elif hasattr(base_dataset, '_labels'):
+                all_labels = base_dataset._labels
+                if torch.is_tensor(all_labels):
+                    all_labels = all_labels.cpu().numpy()
+                elif not isinstance(all_labels, np.ndarray):
+                    all_labels = np.array(all_labels)
+                labels = [int(all_labels[idx]) for idx in larger_indices]
+            if not labels:
+                # 느리지만 안전한 폴백
+                for idx in larger_indices:
+                    try:
+                        _, label = base_dataset[idx]
+                        if torch.is_tensor(label):
+                            label = int(label.item())
+                        labels.append(int(label))
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to extract label for index {idx}: {e}")
+            # 클래스별 앞에서 target_k개 선택(결정적)
+            class_to_indices = {}
+            for idx, label in zip(larger_indices, labels):
+                class_to_indices.setdefault(int(label), []).append(idx)
+            selected = []
+            for label in sorted(class_to_indices.keys()):
+                selected.extend(class_to_indices[label][:target_k])
+            return selected
+
+        try:
+            k = int(cfg.k_shot)
+            seed = int(cfg.seed)
+            # 인덱스 저장/로드 위치: models/checkpoints/<MODEL>/<DatasetVal>/
+            indices_dir = os.path.join(cfg.model_location, cfg.model, val_dataset_name)
+            selected_indices = _load_k_shot_indices(indices_dir, k, seed)
+            if selected_indices is None:
+                # 16-shot에서 다운샘플 폴백 (energy_train_reverse.py 방식 준용)
+                larger_k = 16
+                base_train = getattr(dataset_train, "train_dataset", dataset_train)
+                if k < larger_k:
+                    larger = _load_k_shot_indices(indices_dir, larger_k, seed)
+                    if larger is not None:
+                        logger.info(f"✓ Subsampling from existing {larger_k}-shot to {k}-shot (seed={seed})")
+                        selected_indices = _subsample_from_larger_k(larger, base_train, k)
+                        saved_path = _save_k_shot_indices(selected_indices, indices_dir, val_dataset_name, k, seed)
+                        logger.info(f"✓ Saved {k}-shot indices to {saved_path}")
+                if selected_indices is None:
+                    logger.info(f"Sampling new {k}-shot indices for {cfg.test_dataset} (seed={seed})")
+                    selected_indices = sample_k_shot_indices(
+                        base_train, k, seed=seed, verbose=True, progress_desc=f"{cfg.test_dataset} {k}-shot"
+                    )
+                    saved_path = _save_k_shot_indices(selected_indices, indices_dir, val_dataset_name, k, seed)
+                    logger.info(f"✓ Saved k-shot indices to {saved_path}")
+            else:
+                logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
+
+            # k-shot DataLoader 생성
+            base_train = getattr(dataset_train, "train_dataset", dataset_train)
+            num_workers = getattr(train_loader, "num_workers", 8)
+            train_loader = torch.utils.data.DataLoader(
+                torch.utils.data.Subset(base_train, selected_indices),
+                batch_size=int(cfg.batch_size),
+                shuffle=True,
+                num_workers=int(num_workers),
+                pin_memory=True,
+            )
+            logger.info(f"✓ Created {k}-shot train loader with {len(selected_indices)} samples")
+        except Exception as e:
+            logger.error(f"Failed to apply k-shot sampling: {e}")
+            logger.warning("Falling back to full training set for fine-tuning.")
 
     head = get_classification_head(cfg, cfg.test_dataset).cuda()
     model = ImageClassifier(encoder, head).cuda()
@@ -398,6 +553,7 @@ def run_maml(cfg: DictConfig) -> None:
         "test_dataset": cfg.test_dataset,
         "model": cfg.model,
         "batch_size": cfg.batch_size,
+        "k_shot": int(getattr(cfg, "k_shot", 0)),
         "meta_iterations": cfg.meta_iterations,
         "meta_batch_size": cfg.meta_batch_size,
         "inner_steps": cfg.inner_steps,
@@ -437,6 +593,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int,
                         help="Batch size for loaders")
     parser.add_argument("--seed", type=int, help="Random seed")
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help="CUDA device index to use",
+    )
 
     # meta settings
     parser.add_argument("--meta_iterations", type=int,
@@ -465,18 +627,25 @@ if __name__ == "__main__":
                         help="LR scheduler step size for fine-tuning")
     parser.add_argument("--lr_gamma", type=float,
                         help="LR scheduler gamma for fine-tuning")
+    parser.add_argument(
+        "--k",
+        type=int,
+        dest="k_shot",
+        default=16,
+        help="K-shot samples per class for fine-tuning (0=fullshot)",
+    )
 
     # save dirs
     parser.add_argument(
         "--save_model_dir",
         type=str,
-        default="/disk3/junghwan/task_vector/maml/models",
+        default="maml/models",
         help="Directory to save meta-trained models",
     )
     parser.add_argument(
         "--save_result_dir",
         type=str,
-        default="/disk3/junghwan/task_vector/maml/results",
+        default="maml/results",
         help="Directory to save result JSONs",
     )
 
@@ -488,5 +657,8 @@ if __name__ == "__main__":
         cfg = OmegaConf.merge(cfg, OmegaConf.create(cli_overrides))
     if not cfg.get("test_dataset"):
         parser.error("--test_dataset is required")
+    # 선택한 GPU를 현재 디바이스로 설정
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(getattr(cfg, "gpu", 0)))
     OmegaConf.set_struct(cfg, True)
     run_maml(cfg)
