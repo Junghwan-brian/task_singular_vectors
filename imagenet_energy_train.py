@@ -23,6 +23,8 @@ from src.utils.variables_and_paths import (
     get_zeroshot_path,
 )
 from src.datasets.remote_sensing import sample_k_shot_indices
+from src.datasets.imagenet_ood import ImageNetILSVRCVal
+from src.utils.utils import cosine_lr
 
 
 def setup_logger(name: str = __name__) -> logging.Logger:
@@ -49,8 +51,10 @@ def build_config_tag(cfg) -> str:
     svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
     init_mode_part = _sanitize_value(
         getattr(cfg, "initialize_sigma", "average"))
+    warmup_part = _sanitize_value(getattr(cfg, "warmup_ratio", 0.1))
+    wd_part = _sanitize_value(getattr(cfg, "sigma_wd", 0.0))
     k_part = _sanitize_value(getattr(cfg, "train_k", 0))
-    return f"imagenet_energy_{lr_part}_{svd_part}_{init_mode_part}_{k_part}shot"
+    return f"imagenet_energy_{lr_part}_{svd_part}_{init_mode_part}_{warmup_part}_{wd_part}_{k_part}shot"
 
 
 def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
@@ -124,21 +128,28 @@ def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
 
 def run_imagenet_energy(cfg) -> None:
     logger = setup_logger(__name__)
+    device = cfg.device
 
     with open_dict(cfg):
         if cfg.sigma_epochs is None:
-            cfg.sigma_epochs = 10
+            cfg.sigma_epochs = 20
         if not cfg.get("config_tag"):
             cfg.config_tag = build_config_tag(cfg)
         if cfg.get("adapter_lr") is None:
             cfg.adapter_lr = cfg.sigma_lr
         if cfg.get("adapter_wd") is None:
             cfg.adapter_wd = cfg.sigma_wd
+        if cfg.get("warmup_ratio") is None:
+            cfg.warmup_ratio = 0.1
 
     test_ds = cfg.test_dataset  # e.g., "ImageNetILSVRC"
 
     # Basis datasets (exclude ImageNet)
-    base_list = ALL_DATASETS[:cfg.num_tasks]
+    if hasattr(cfg, 'DATASETS_ALL') and cfg.DATASETS_ALL:
+        base_list = list(cfg.DATASETS_ALL)
+    else:
+        base_list = ALL_DATASETS[:cfg.num_tasks]
+
     cfg.DATASETS = base_list
     cfg.num_tasks = len(base_list)
     cfg.DATASETS_VAL = [dataset + "Val" for dataset in base_list]
@@ -154,7 +165,7 @@ def run_imagenet_energy(cfg) -> None:
         path = get_finetuned_path(cfg.model_location, dataset, model=cfg.model)
         if os.path.exists(path):
             logger.info(f"✓ {path} exists")
-            ft_checks.append(torch.load(path, map_location="cpu"))
+            ft_checks.append(torch.load(path, map_location="cpu", weights_only=False))
         else:
             logger.error(f"✗ {path} does not exist")
             raise FileNotFoundError(f"Fine-tuned checkpoint not found: {path}")
@@ -164,7 +175,7 @@ def run_imagenet_energy(cfg) -> None:
     zeroshot_path = get_zeroshot_path(
         cfg.model_location, first_dataset, model=cfg.model)
     logger.info(f"Loading zeroshot model from: {zeroshot_path}")
-    ptm_check = torch.load(zeroshot_path, map_location="cpu")
+    ptm_check = torch.load(zeroshot_path, map_location="cpu", weights_only=False)
 
     overall_start = time.time()
     task_vectors = [NonLinearTaskVector(
@@ -205,7 +216,7 @@ def run_imagenet_energy(cfg) -> None:
                     safe_key = candidate
                 sigma_key_map[safe_key] = key
                 sigma_modules[safe_key] = SigmaParametrization(U, V, sigma)
-    sigma_modules = sigma_modules.cuda()
+    sigma_modules = sigma_modules.to(device)
 
     # Count params
     trainable_params = sum(p.numel()
@@ -227,63 +238,136 @@ def run_imagenet_energy(cfg) -> None:
         if "save_dir" not in cfg:
             cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
 
-    pretrained_encoder = ImageEncoder(cfg.model).cuda()
-    image_encoder = ImageEncoder(cfg.model).cuda()
+    pretrained_encoder = ImageEncoder(cfg.model).to(device)
+    image_encoder = ImageEncoder(cfg.model).to(device)
 
-    # Train dataset (ImageNet ILSVRC train)
-    logger.info(f"Loading dataset for training: {val_dataset_name}")
+    # Train/Val datasets from ImageNet-1k validation folder (flat)
+    logger.info(f"Loading ImageNet-1k validation dataset for train/val split: {val_dataset_name}")
     train_preprocess = torchvision.transforms.Compose([
         torchvision.transforms.RandomResizedCrop(size=224, scale=(
             0.5, 1.0), interpolation=torchvision.transforms.InterpolationMode.BICUBIC),
         torchvision.transforms.RandomHorizontalFlip(p=0.5),
     ] + image_encoder.train_preprocess.transforms[-3:])
 
-    dataset_train = get_dataset(
-        test_ds,
-        train_preprocess,
-        location=cfg.data_location,
-        batch_size=cfg.batch_size,
-    )
+    # Build two dataset objects pointing to the same files but with different transforms
+    _train_val_obj = ImageNetILSVRCVal(train_preprocess, location=cfg.data_location, batch_size=cfg.batch_size,
+                                       num_workers=int(getattr(cfg, "num_workers", 8)))
+    base_train_dataset = _train_val_obj.test_dataset  # use training augmentations
+
+    _eval_val_obj = ImageNetILSVRCVal(ImageEncoder(cfg.model).val_preprocess, location=cfg.data_location,
+                                      batch_size=cfg.batch_size, num_workers=int(getattr(cfg, "num_workers", 8)))
+    base_val_dataset = _eval_val_obj.test_dataset  # use eval transforms
 
     classification_head = get_classification_head(cfg, test_ds)
-    model = ImageClassifier(image_encoder, classification_head).cuda()
+    model = ImageClassifier(image_encoder, classification_head).to(device)
     model.freeze_head()
 
-    train_loader = get_dataloader(
-        dataset_train, is_train=True, args=cfg, image_encoder=None)
+    # Build initial loaders; will replace with k-shot split below
+    def _build_loader(dataset, is_train: bool):
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=int(cfg.batch_size),
+            shuffle=is_train,
+            num_workers=int(getattr(cfg, "num_workers", 8)),
+            pin_memory=True,
+        )
+    train_loader = _build_loader(base_train_dataset, is_train=True)
+    val_full_loader = _build_loader(base_val_dataset, is_train=False)
 
     # k-shot sampling
     if k is not None and k > 0:
-        logger.info(f"Applying k-shot sampling: {k} samples per class")
-        try:
+        logger.info(f"Applying k-shot sampling: {k} samples per class (seed={int(getattr(cfg,'seed',1))})")
+
+        def _save_k_shot_indices(indices, save_dir, dataset_name, kshot, seed):
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, f"k_shot_indices_k{kshot}_seed{seed}.json")
+            with open(path, "w") as f:
+                json.dump({"indices": indices, "dataset": dataset_name, "k": int(kshot), "seed": int(seed)}, f)
+            return path
+
+        def _load_k_shot_indices(save_dir, kshot, seed):
+            path = os.path.join(save_dir, f"k_shot_indices_k{kshot}_seed{seed}.json")
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    data = json.load(f)
+                return data.get("indices", None)
+            return None
+
+        def _extract_labels_for_indices(dataset, indices):
+            import numpy as np
+            labels: List[int] = []
+            # try fast paths
+            if hasattr(dataset, "targets") and dataset.targets is not None:
+                tgt = dataset.targets
+                if torch.is_tensor(tgt):
+                    tgt = tgt.cpu().numpy()
+                elif not isinstance(tgt, np.ndarray):
+                    tgt = np.array(tgt)
+                for idx in indices:
+                    labels.append(int(tgt[idx]))
+                return labels
+            # fallback: index pairs
+            for idx in indices:
+                _, label = dataset[idx]
+                if torch.is_tensor(label):
+                    label = int(label.item())
+                labels.append(int(label))
+            return labels
+
+        def _subsample_from_larger_k(larger_indices, dataset, target_k):
+            import numpy as np
+            labels = _extract_labels_for_indices(dataset, larger_indices)
+            class_to_indices: Dict[int, List[int]] = {}
+            for idx, lab in zip(larger_indices, labels):
+                class_to_indices.setdefault(int(lab), []).append(idx)
+            selected: List[int] = []
+            for lab in sorted(class_to_indices.keys()):
+                selected.extend(class_to_indices[lab][:target_k])
+            return selected
+
+        seed = int(getattr(cfg, "seed", 1))
+        indices_dir = os.path.join(cfg.model_location, cfg.model, val_dataset_name)
+        selected_indices = _load_k_shot_indices(indices_dir, k, seed)
+
+        if selected_indices is None:
+            larger_k = 16
+            if k < larger_k:
+                larger = _load_k_shot_indices(indices_dir, larger_k, seed)
+                if larger is not None:
+                    logger.info(f"✓ Subsampling from existing {larger_k}-shot to {k}-shot (seed={seed})")
+                    selected_indices = _subsample_from_larger_k(larger, base_train_dataset, k)
+                    saved_path = _save_k_shot_indices(selected_indices, indices_dir, val_dataset_name, k, seed)
+                    logger.info(f"✓ Saved {k}-shot indices to {saved_path}")
+        if selected_indices is None:
+            logger.info(f"Sampling new {k}-shot indices for {cfg.test_dataset} (seed={seed})")
             selected_indices = sample_k_shot_indices(
-                dataset_train,
-                k,
-                seed=int(getattr(cfg, 'seed', 1)),
-                verbose=True,
-                progress_desc=f"{test_ds} {k}-shot",
+                base_train_dataset, k, seed=seed, verbose=True, progress_desc=f"{cfg.test_dataset} {k}-shot"
             )
-            base_dataset = getattr(dataset_train, "train_dataset", None)
-            if base_dataset is None:
-                base_dataset = getattr(train_loader, "dataset", None)
-            if base_dataset is not None:
-                num_workers = getattr(train_loader, "num_workers", 8)
-                collate_fn = getattr(train_loader, "collate_fn", None)
-                train_loader = torch.utils.data.DataLoader(
-                    torch.utils.data.Subset(base_dataset, selected_indices),
-                    batch_size=cfg.batch_size,
-                    shuffle=True,
-                    num_workers=num_workers,
-                    collate_fn=collate_fn,
-                )
-                logger.info(
-                    f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples")
-            else:
-                logger.warning(
-                    "Could not locate base train_dataset for k-shot subsetting; using full loader instead.")
-        except Exception as e:
-            logger.error(f"Failed to apply k-shot sampling: {e}")
-            logger.warning("Falling back to full training set")
+            saved_path = _save_k_shot_indices(selected_indices, indices_dir, val_dataset_name, k, seed)
+            logger.info(f"✓ Saved k-shot indices to {saved_path}")
+
+        # Build train loader from selected indices (train transforms)
+        train_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(base_train_dataset, selected_indices),
+            batch_size=int(cfg.batch_size),
+            shuffle=True,
+            num_workers=int(getattr(cfg, "num_workers", 8)),
+            pin_memory=True,
+        )
+        logger.info(f"✓ Created {k}-shot train loader with {len(selected_indices)} samples")
+
+        # Build validation loader from the complement (eval transforms)
+        all_indices = set(range(len(base_val_dataset)))
+        comp_indices = sorted(all_indices.difference(set(selected_indices)))
+        if len(comp_indices) == 0:
+            raise RuntimeError("Validation set is empty after k-shot split; check data and k value.")
+        val_full_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(base_val_dataset, comp_indices),
+            batch_size=int(cfg.batch_size),
+            shuffle=False,
+            num_workers=int(getattr(cfg, "num_workers", 8)),
+            pin_memory=True,
+        )
 
     # Save dirs
     config_dir = os.path.join(
@@ -296,8 +380,6 @@ def run_imagenet_energy(cfg) -> None:
     params = [p for p in sigma_modules.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         params, lr=cfg.sigma_lr, weight_decay=cfg.sigma_wd)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(
-        cfg.sigma_lr_step_size), gamma=float(cfg.sigma_lr_gamma))
 
     # Base params/buffers snapshot
     base_params = {name: p.detach().clone()
@@ -328,12 +410,29 @@ def run_imagenet_energy(cfg) -> None:
         eval_counter += 1
         return record
 
+    def _eval_on_loader(image_encoder_mod, loader) -> float:
+        image_encoder_mod.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch in loader:
+                batch = maybe_dictionarize(batch)
+                x = batch["images"].to(device, non_blocking=True)
+                y = batch["labels"].to(device, non_blocking=True)
+                feats = image_encoder_mod(x)
+                logits = model.classification_head(feats)
+                pred = logits.argmax(dim=1)
+                correct += int((pred == y).sum().item())
+                total += int(y.size(0))
+        if total == 0:
+            raise RuntimeError("Validation loader is empty.")
+        return float(correct / total)
+
     # Pretrained/zeroshot evals
     model.eval()
     with torch.no_grad():
-        pretrained_metrics = eval_single_dataset(
-            pretrained_encoder, val_dataset_name, cfg)
-        pretrained_acc = pretrained_metrics['top1']
+        # Evaluate on our validation split instead of registry dataset to reflect k-shot split
+        pretrained_acc = _eval_on_loader(pretrained_encoder, val_full_loader)
         logger.info(
             f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
         record_validation("pretrained", -2, pretrained_acc)
@@ -347,9 +446,7 @@ def run_imagenet_energy(cfg) -> None:
                 if eval_params[orig_key].shape == delta.shape:
                     eval_params[orig_key] = eval_params[orig_key] + delta
         model.image_encoder.load_state_dict(eval_params, strict=False)
-        zeroshot_metrics = eval_single_dataset(
-            model.image_encoder, val_dataset_name, cfg)
-        zeroshot_acc = zeroshot_metrics['top1']
+        zeroshot_acc = _eval_on_loader(model.image_encoder, val_full_loader)
         logger.info(
             f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
         record_validation("zeroshot", -1, zeroshot_acc)
@@ -363,13 +460,19 @@ def run_imagenet_energy(cfg) -> None:
     logger.info(
         f"Train dataset size: {len(cast(Sized, train_loader.dataset))}, Batch size: {cfg.batch_size}, Steps per epoch: {steps_per_epoch}")
 
+    # Cosine LR scheduler with warmup (step-wise)
+    num_batches = steps_per_epoch
+    total_steps = int(cfg.sigma_epochs) * num_batches
+    warmup_steps = int(float(getattr(cfg, "warmup_ratio", 0.1)) * total_steps)
+    scheduler = cosine_lr(optimizer, cfg.sigma_lr, warmup_steps, total_steps)
+
     for epoch in range(int(cfg.sigma_epochs)):
         epoch_start = time.time()
         model.train()
         for i, batch in enumerate(train_loader):
             batch = maybe_dictionarize(batch)
-            inputs = batch["images"].cuda()
-            labels = batch["labels"].cuda()
+            inputs = batch["images"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
             delta_map = {}
             for safe_key, module in sigma_modules.items():
@@ -400,6 +503,9 @@ def run_imagenet_energy(cfg) -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
+            # step-wise LR scheduling
+            step = epoch * steps_per_epoch + i
+            scheduler(step)
 
             loss_history.append(
                 {"epoch": int(epoch), "iteration": int(i), "loss": float(loss.item())})
@@ -416,7 +522,6 @@ def run_imagenet_energy(cfg) -> None:
                     logger.info(
                         f"[sigma] epoch {epoch} {i + 1}/{len(train_loader)} loss {loss.item():.4f} lr {optimizer.param_groups[0]['lr']:.6f}")
 
-        scheduler.step()
         epoch_train_time = time.time() - epoch_start
         epoch_times.append(epoch_train_time)
 
@@ -434,9 +539,7 @@ def run_imagenet_energy(cfg) -> None:
                         if eval_params[orig_key].shape == delta.shape:
                             eval_params[orig_key] = eval_params[orig_key] + delta
                 model.image_encoder.load_state_dict(eval_params, strict=False)
-                val_metrics = eval_single_dataset(
-                    model.image_encoder, val_dataset_name, cfg)
-                val_acc = val_metrics['top1']
+                val_acc = _eval_on_loader(model.image_encoder, val_full_loader)
                 logger.info(
                     f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
                 record_validation("epoch", epoch, val_acc)
@@ -464,9 +567,7 @@ def run_imagenet_energy(cfg) -> None:
     # Final eval on ImageNet val
     model.eval()
     with torch.no_grad():
-        final_metrics = eval_single_dataset(
-            model.image_encoder, val_dataset_name, cfg)
-        final_acc = final_metrics['top1']
+        final_acc = _eval_on_loader(model.image_encoder, val_full_loader)
     logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
     record_validation("final", int(cfg.sigma_epochs), final_acc)
 
@@ -479,22 +580,17 @@ def run_imagenet_energy(cfg) -> None:
     model.eval()
     with torch.no_grad():
         for ood_name in ood_list:
-            try:
-                m = eval_single_dataset(model.image_encoder, ood_name, cfg)
-                ood_results[ood_name] = float(m.get("top1", 0.0))
-                logger.info(
-                    f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
-                record_validation(f"ood:{ood_name}", int(
-                    cfg.sigma_epochs), ood_results[ood_name])
-            except Exception as e:
-                logger.error(f"Failed OOD eval on {ood_name}: {e}")
-                ood_results[ood_name] = None
+            m = eval_single_dataset(model.image_encoder, ood_name, cfg)
+            ood_results[ood_name] = float(m.get("top1", 0.0))
+            logger.info(
+                f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
+            record_validation(f"ood:{ood_name}", int(
+                cfg.sigma_epochs), ood_results[ood_name])
 
     # Compose unified evaluation results
     all_eval_accuracies = {val_dataset_name: float(final_acc)}
     for k_name, v_acc in ood_results.items():
-        all_eval_accuracies[k_name] = float(
-            'nan') if v_acc is None else float(v_acc)
+        all_eval_accuracies[k_name] = float(v_acc)
 
     # Timings
     min_epoch_time = min(epoch_times) if epoch_times else 0.0
@@ -564,10 +660,8 @@ def main():
                         help="Learning rate for sigma optimization")
     parser.add_argument("--sigma_wd", type=float,
                         help="Weight decay for sigma optimization")
-    parser.add_argument("--sigma_lr_step_size", type=int,
-                        help="LR scheduler step size")
-    parser.add_argument("--sigma_lr_gamma", type=float,
-                        help="LR scheduler gamma")
+    parser.add_argument("--warmup_ratio", type=float,
+                        help="Warmup ratio for sigma learning rate")
     parser.add_argument("--batch_size", type=int, help="Training batch size")
     parser.add_argument("--k", type=int, dest="train_k",
                         help="K-shot samples per class (0=fullshot)")
@@ -587,9 +681,10 @@ def main():
                         help="Root dir containing 'imagenet' and OOD datasets")
     parser.add_argument("--model_location", type=str,
                         default="./models/checkpoints", help="Where checkpoints/heads are stored")
-    parser.add_argument("--num_tasks", type=int, default=15,
+    parser.add_argument("--num_tasks", type=int, default=17,
                         help="How many basis tasks to use from ALL_DATASETS")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--gpu", type=int, help="GPU id (overrides --device as cuda:{id})")
 
     args = parser.parse_args()
 
@@ -599,6 +694,13 @@ def main():
         args).items() if v is not None and k != "config_file"}
     if cli_overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.create(cli_overrides))
+    # Override device with specific GPU if provided
+    if getattr(args, "gpu", None) is not None:
+        try:
+            gpu_id = int(args.gpu)
+            cfg.device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            cfg.device = "cpu"
     OmegaConf.set_struct(cfg, True)
 
     run_imagenet_energy(cfg)

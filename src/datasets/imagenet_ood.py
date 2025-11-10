@@ -1,6 +1,6 @@
 import os
 import csv
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -12,26 +12,58 @@ from .imagenet import imagenet_classnames
 
 def _read_synset_to_index(base_dir: str) -> Dict[str, int]:
     """
-    Read LOC_synset_mapping.txt and build synset -> index mapping (0..999) in ImageNet order.
-    Expects file at: {base_dir}/imagenet/LOC_synset_mapping.txt
+    Read synset -> index mapping (0..999) in ImageNet order.
+    Preferred: {base_dir}/imagenet/LOC_synset_mapping.txt (wnid per line in 1000-class order)
+    Fallback:  {base_dir}/imagenet/imagenet-1k/data/meta.mat (requires scipy)
     """
-    mapping_file = os.path.join(base_dir, "imagenet", "LOC_synset_mapping.txt")
-    if not os.path.exists(mapping_file):
-        raise FileNotFoundError(f"Missing synset mapping file: {mapping_file}")
+    txt_mapping = os.path.join(base_dir, "imagenet", "LOC_synset_mapping.txt")
+    if os.path.exists(txt_mapping):
+        synset_to_idx: Dict[str, int] = {}
+        with open(txt_mapping, "r") as f:
+            for idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                synset = line.split(" ")[0]
+                synset_to_idx[synset] = idx
+        if len(synset_to_idx) != 1000:
+            print(f"[warn] Expected 1000 synsets, found {len(synset_to_idx)} in {txt_mapping}")
+        return synset_to_idx
 
-    synset_to_idx = {}
-    with open(mapping_file, "r") as f:
-        for idx, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                continue
-            # Each line: nXXXXXXXX description...
-            synset = line.split(" ")[0]
-            synset_to_idx[synset] = idx
+    # Fallback to meta.mat
+    meta_mat_path = os.path.join(base_dir, "imagenet", "imagenet-1k", "data", "meta.mat")
+    if not os.path.exists(meta_mat_path):
+        raise FileNotFoundError(
+            f"Missing synset mapping: neither {txt_mapping} nor {meta_mat_path} exists."
+        )
+    try:
+        import scipy.io as sio  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "scipy is required to read meta.mat for ImageNet synset mapping. "
+            "Please install scipy or provide LOC_synset_mapping.txt."
+        ) from e
+
+    meta = sio.loadmat(meta_mat_path, squeeze_me=True, struct_as_record=False)
+    # meta['synsets'] is an array of structs; leaf nodes have ILSVRC2012_ID in [1..1000]
+    synsets = meta.get("synsets", None)
+    if synsets is None:
+        raise RuntimeError(f"meta.mat at {meta_mat_path} missing 'synsets'")
+    # Build wnid -> index where index = ILSVRC2012_ID - 1
+    synset_to_idx: Dict[str, int] = {}
+    for s in synsets:
+        try:
+            wnid = str(s.WNID)
+            ilsvrc2012_id = int(s.ILSVRC2012_ID)
+        except Exception:
+            # Some entries might be non-leaf; skip those without proper fields
+            continue
+        if 1 <= ilsvrc2012_id <= 1000:
+            synset_to_idx[wnid] = ilsvrc2012_id - 1
     if len(synset_to_idx) != 1000:
-        # Not fatal, but warn
-        print(
-            f"[warn] Expected 1000 synsets, found {len(synset_to_idx)} in {mapping_file}")
+        raise RuntimeError(
+            f"Expected 1000 leaf synsets in meta.mat, found {len(synset_to_idx)}."
+        )
     return synset_to_idx
 
 
@@ -59,59 +91,65 @@ def _remap_imagefolder_labels_to_imagenet_indices(ds: ImageFolderWithPaths, syns
     ds.targets = new_targets
 
 
-class _ImageNetValFromCSV(Dataset):
+class _ImageNetValFromTxt(Dataset):
     """
-    ImageNet validation set using flat folder and LOC_val_solution.csv for labels.
+    ImageNet validation set using flat folder and validation_ground_truth.txt for labels.
     Expects:
-      - images at {base_dir}/imagenet/ILSVRC/Data/CLS-LOC/val/*.JPEG
-      - labels at  {base_dir}/imagenet/LOC_val_solution.csv (first synset used)
+      - images at {base_dir}/imagenet/imagenet-1k/*.JPEG
+      - labels at  {base_dir}/imagenet/imagenet-1k/data/ILSVRC2012_validation_ground_truth.txt
+      - optional meta at {base_dir}/imagenet/imagenet-1k/data/meta.mat (for consistency checks)
     """
 
     def __init__(self, base_dir: str, transform=None):
         self.transform = transform
         self.base_dir = base_dir
-        self.img_dir = os.path.join(
-            base_dir, "imagenet", "ILSVRC", "Data", "CLS-LOC", "val")
-        self.csv_path = os.path.join(
-            base_dir, "imagenet", "LOC_val_solution.csv")
-        self.synset_to_idx = _read_synset_to_index(base_dir)
+        self.img_dir = os.path.join(base_dir, "imagenet", "imagenet-1k")
+        self.gt_path = os.path.join(
+            base_dir, "imagenet", "imagenet-1k", "data", "ILSVRC2012_validation_ground_truth.txt"
+        )
 
         if not os.path.isdir(self.img_dir):
-            raise FileNotFoundError(
-                f"ImageNet val directory not found: {self.img_dir}")
-        if not os.path.exists(self.csv_path):
-            raise FileNotFoundError(
-                f"ImageNet val csv not found: {self.csv_path}")
+            raise FileNotFoundError(f"ImageNet-1k directory not found: {self.img_dir}")
+        if not os.path.exists(self.gt_path):
+            raise FileNotFoundError(f"Validation ground truth not found: {self.gt_path}")
 
-        img_to_synset: Dict[str, str] = {}
-        with open(self.csv_path, "r") as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-            for row in reader:
-                # Row: ImageId, PredictionString
-                # Use the first synset in PredictionString
-                if len(row) < 2:
+        # Read labels (1..1000) -> convert to 0..999
+        labels: List[int] = []
+        with open(self.gt_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
-                image_id = row[0].strip()  # e.g., ILSVRC2012_val_00000001
-                pred_str = row[1].strip()
-                if not pred_str:
-                    continue
-                first_synset = pred_str.split(" ")[0]
-                img_to_synset[image_id + ".JPEG"] = first_synset
+                lab = int(line)
+                if not (1 <= lab <= 1000):
+                    raise ValueError(f"Invalid label {lab} in {self.gt_path}")
+                labels.append(lab - 1)
 
-        # Build samples
-        self.samples: List[Tuple[str, int]] = []
-        for fname in os.listdir(self.img_dir):
-            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-            synset = img_to_synset.get(fname)
-            if synset is None:
-                # Skip files without label mapping
-                continue
-            idx = self.synset_to_idx.get(synset)
-            if idx is None:
-                continue
-            self.samples.append((os.path.join(self.img_dir, fname), idx))
+        # Gather image names sorted by numeric id to align with labels file
+        fnames = [fn for fn in os.listdir(self.img_dir) if fn.lower().endswith((".jpg", ".jpeg", ".png"))]
+        # Expect ILSVRC2012_val_00000001.JPEG naming
+        def _extract_num(name: str) -> int:
+            # fallback: extract last 8 digits in name
+            import re
+            m = re.search(r"(\d{8})", name)
+            return int(m.group(1)) if m else 10**9
+
+        fnames_sorted = sorted(fnames, key=_extract_num)
+        if len(fnames_sorted) < len(labels):
+            raise RuntimeError(
+                f"Number of images ({len(fnames_sorted)}) is smaller than number of labels ({len(labels)})."
+            )
+        if len(fnames_sorted) != len(labels):
+            # Allow extra files but enforce prefix match if not equal
+            print(
+                f"[warn] Number of images ({len(fnames_sorted)}) != labels ({len(labels)}). "
+                f"Using first {len(labels)} images in sorted order."
+            )
+            fnames_sorted = fnames_sorted[: len(labels)]
+
+        self.samples: List[Tuple[str, int]] = [
+            (os.path.join(self.img_dir, fname), labels[i]) for i, fname in enumerate(fnames_sorted)
+        ]
 
     def __len__(self):
         return len(self.samples)
@@ -211,7 +249,7 @@ class ImageNetILSVRC:
 
 class ImageNetILSVRCVal:
     """
-    Official ImageNet validation split using LOC_val_solution.csv labels
+    ImageNet validation split sourced from imagenet-1k flat folder with ground truth txt.
     """
 
     def __init__(self, preprocess, location=os.path.expanduser("~/data"), batch_size=32, num_workers=6):
@@ -224,7 +262,7 @@ class ImageNetILSVRCVal:
         self.train_dataset = None
         self.train_loader = None
 
-        self.test_dataset = _ImageNetValFromCSV(
+        self.test_dataset = _ImageNetValFromTxt(
             location, transform=self.preprocess)
         self.test_loader = torch.utils.data.DataLoader(
             self.test_dataset,
@@ -243,7 +281,7 @@ class ImageNetA:
         self.num_workers = num_workers
         self.classnames = imagenet_classnames
 
-        root = os.path.join(location, "imagenet-a", "imagenet-a")
+        root = os.path.join(location, "imagenet", "imagenet-a")
         if not os.path.isdir(root):
             raise FileNotFoundError(f"ImageNet-A root not found: {root}")
         synset_to_idx = _read_synset_to_index(location)
@@ -278,7 +316,7 @@ class ImageNetR:
         self.num_workers = num_workers
         self.classnames = imagenet_classnames
 
-        root = os.path.join(location, "imagenet-r", "imagenet-r")
+        root = os.path.join(location, "imagenet", "imagenet-r")
         if not os.path.isdir(root):
             raise FileNotFoundError(f"ImageNet-R root not found: {root}")
         synset_to_idx = _read_synset_to_index(location)
@@ -313,7 +351,7 @@ class ImageNetSketch:
         self.num_workers = num_workers
         self.classnames = imagenet_classnames
 
-        root = os.path.join(location, "ImageNet-Sketch", "sketch")
+        root = os.path.join(location, "imagenet", "ImageNet-Sketch", "sketch")
         if not os.path.isdir(root):
             raise FileNotFoundError(f"ImageNet-Sketch root not found: {root}")
         synset_to_idx = _read_synset_to_index(location)
@@ -352,7 +390,7 @@ class ImageNetV2MFVal:
         self.train_loader = None
 
         self.test_dataset = _ImageNetV2MFVal(
-            location, transform=self.preprocess)
+            os.path.join(location, "imagenet"), transform=self.preprocess)
         self.test_loader = torch.utils.data.DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
