@@ -345,11 +345,11 @@ def train_adapter_remote(
         logger.info(f"[adapter:lp++] Initializing LP++ with shots={shots_value}")
         adapter_model = LPPWrapper(model, features_cache, labels_cache, shots_value)
         adapter_lr = float(getattr(adapter_model, "lr_temp", args.lr))
-        adapter_epochs = 30
+        adapter_epochs = 20
     else:
         adapter_model = TIPWrapper(model, features_cache, labels_cache)
         adapter_lr = 1e-3
-        adapter_epochs = 30
+        adapter_epochs = 20
 
     adapter_model = adapter_model.to(device)
 

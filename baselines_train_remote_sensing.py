@@ -20,7 +20,7 @@ from atlas_src.utils import TIPWrapper, LPPWrapper
 from src.datasets.remote_sensing import (
     sample_k_shot_indices,
     get_remote_sensing_dataset,
-    split_remote_sensing_train_into_train_val,
+    get_remote_sensing_classification_head,
     REMOTE_SENSING_DATASETS
 )
 
@@ -42,6 +42,45 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     logger.propagate = False
     
     return logger
+
+
+def _sanitize_value(val):
+    """Sanitize value for use in config tag."""
+    if isinstance(val, float):
+        val = f"{val:.6g}"
+    elif isinstance(val, bool):
+        val = int(val)
+    return ''.join(ch if ch.isalnum() or ch in ['-', '_'] else '_' for ch in str(val).replace('.', 'p'))
+
+
+def build_baseline_config_tag(cfg) -> str:
+    """Build config tag for baseline method."""
+    method = cfg.baseline_method
+    
+    if method == 'linear_probe':
+        lr = _sanitize_value(cfg.lp_lr)
+        epochs = _sanitize_value(cfg.lp_epochs)
+        wd = _sanitize_value(cfg.lp_wd)
+        return f"baseline_lp_{lr}_{epochs}_{wd}"
+    
+    elif method == 'tip_adapter':
+        wd = _sanitize_value(cfg.adapter_wd)
+        return f"baseline_tip_{wd}"
+    
+    elif method == 'lp++':
+        wd = _sanitize_value(cfg.adapter_wd)
+        return f"baseline_lpp_{wd}"
+    
+    elif method == 'lora':
+        r = _sanitize_value(cfg.lora_r)
+        alpha = _sanitize_value(cfg.lora_alpha)
+        lr = _sanitize_value(cfg.lora_lr)
+        epochs = _sanitize_value(cfg.lora_epochs)
+        wd = _sanitize_value(cfg.lora_wd)
+        return f"baseline_lora_{r}_{alpha}_{lr}_{epochs}_{wd}"
+    
+    else:
+        return f"baseline_{method}"
 
 
 def save_k_shot_indices(indices, save_dir, dataset_name, k, seed):
@@ -104,58 +143,6 @@ def apply_lora_to_module(module: torch.nn.Module, r: int = 8, alpha: float = 16.
             setattr(module, name, wrapped)
         else:
             apply_lora_to_module(child, r=r, alpha=alpha, dropout=dropout)
-
-
-def build_train_loader_remote(cfg, model, dataset_obj, train_dataset_name, logger):
-    """Build train loader for remote sensing with optional k-shot sampling"""
-    k = int(cfg.k_shot)
-    
-    # Get the train_loader from dataset object
-    train_loader = dataset_obj.train_loader
-    
-    if k > 0:
-        try:
-            seed = int(cfg.seed)
-            indices_save_dir = os.path.join(cfg.save_dir, train_dataset_name)
-            
-            # Try to load existing k-shot indices
-            selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
-            
-            if selected_indices is not None:
-                logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
-            else:
-                # Sample new indices from scratch
-                logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
-                # Use the base train_dataset from the dataset object
-                base_dataset = dataset_obj.train_dataset
-                selected_indices = sample_k_shot_indices(
-                    base_dataset,
-                    k,
-                    seed=seed,
-                    verbose=True,
-                    progress_desc=f"{train_dataset_name} {k}-shot",
-                )
-                # Save the indices for future use
-                indices_path = save_k_shot_indices(selected_indices, indices_save_dir, train_dataset_name, k, seed)
-                logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
-            
-            # Create k-shot dataloader
-            base_dataset = dataset_obj.train_dataset
-            num_workers = getattr(train_loader, "num_workers", 8)
-            train_loader = torch.utils.data.DataLoader(
-                torch.utils.data.Subset(base_dataset, selected_indices),
-                batch_size=cfg.batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=True,
-            )
-            logger.info(f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples")
-        except Exception as e:
-            logger.error(f"Failed to apply k-shot sampling: {e}")
-            logger.warning("Falling back to full training set")
-            train_loader = dataset_obj.train_loader
-    
-    return train_loader
 
 
 def cache_features(ddp_model, ddp_loader, device):
@@ -319,19 +306,16 @@ def train_linear_probe(model, train_loader, val_loader, cfg, train_dataset_name,
     save_dir = cfg.save_dir
     k = int(cfg.k_shot)
     shot_folder = f"{k}shots" if k > 0 else "fullshots"
+    config_tag = getattr(cfg, 'config_tag', 'baseline_lp_default')
     
-    result_dir = os.path.join(save_dir, train_dataset_name, shot_folder)
+    result_dir = os.path.join(save_dir, train_dataset_name, config_tag, shot_folder)
     os.makedirs(result_dir, exist_ok=True)
     
-    head_path = os.path.join(result_dir, f"linear_probe_head.pt")
-    torch.save(model.classification_head.state_dict(), head_path)
-    logger.info(f"Saved linear probe head to {head_path}")
-    
-    # Save results to JSON
-    results_path = os.path.join(result_dir, f"linear_probe_results.json")
+    # Save results to JSON (use baseline naming convention)
+    results_path = os.path.join(result_dir, f"baseline_results_none.json")
     results = {
         "method": "linear_probe",
-        "target_dataset": train_dataset_name,
+        "target_dataset": train_dataset_name.replace("Val", ""),
         "final_accuracy": float(final_acc),
         "k_shot": k,
         "model": cfg.model,
@@ -345,6 +329,7 @@ def train_linear_probe(model, train_loader, val_loader, cfg, train_dataset_name,
         "batch_size": cfg.batch_size,
         "gpu_peak_mem_mb": gpu_peak_mem_mb,
         "loss_history": loss_history,
+        "config_tag": config_tag,
     }
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=4)
@@ -375,7 +360,7 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
         shots = int(cfg.k_shot) if int(cfg.k_shot) > 0 else 0
         adapter_model = LPPWrapper(
             adapter_model, features_cache, labels, shots)
-        epochs = 300
+        epochs = 20
         adapter_model = adapter_model.to(cfg.device)
         try:
             if hasattr(adapter_model, 'alpha_vec') and getattr(adapter_model.alpha_vec, 'requires_grad', None) is not False:
@@ -387,7 +372,7 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
         ]
     elif adapter == 'tip':
         adapter_model = TIPWrapper(adapter_model, features_cache, labels)
-        epochs = 10
+        epochs = 20
         adapter_model = adapter_model.to(cfg.device)
         param_groups = [
             {'params': [adapter_model.beta_alpha], 'lr': 1e-3}
@@ -486,19 +471,17 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
     save_dir = cfg.save_dir
     k = int(cfg.k_shot)
     shot_folder = f"{k}shots" if k > 0 else "fullshots"
+    config_tag = getattr(cfg, 'config_tag', f'baseline_{adapter}_default')
     
-    result_dir = os.path.join(save_dir, train_dataset_name, shot_folder)
+    result_dir = os.path.join(save_dir, train_dataset_name, config_tag, shot_folder)
     os.makedirs(result_dir, exist_ok=True)
     
-    adapter_path = os.path.join(result_dir, f"adapter_{adapter}.pt")
-    torch.save(adapter_coefs, adapter_path)
-    logger.info(f"Saved adapter weights to {adapter_path}")
     
-    # Save results to JSON
-    results_path = os.path.join(result_dir, f"{adapter}_results.json")
+    # Save results to JSON (use baseline naming convention)
+    results_path = os.path.join(result_dir, f"baseline_results_none.json")
     results = {
         "method": adapter,
-        "target_dataset": train_dataset_name,
+        "target_dataset": train_dataset_name.replace("Val", ""),
         "final_accuracy": float(final_acc),
         "k_shot": k,
         "model": cfg.model,
@@ -512,6 +495,7 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
         "gpu_peak_mem_mb": gpu_peak_mem_mb,
         "loss_history": loss_history,
         "cache_build_time": cache_time,
+        "config_tag": config_tag,
     }
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=4)
@@ -629,19 +613,17 @@ def train_lora(model, train_loader, val_loader, cfg, train_dataset_name, logger)
     save_dir = cfg.save_dir
     k = int(cfg.k_shot)
     shot_folder = f"{k}shots" if k > 0 else "fullshots"
+    config_tag = getattr(cfg, 'config_tag', 'baseline_lora_default')
     
-    result_dir = os.path.join(save_dir, train_dataset_name, shot_folder)
+    result_dir = os.path.join(save_dir, train_dataset_name, config_tag, shot_folder)
     os.makedirs(result_dir, exist_ok=True)
+
     
-    encoder_path = os.path.join(result_dir, f"lora_encoder.pt")
-    torch.save(model.image_encoder.state_dict(), encoder_path)
-    logger.info(f"Saved LoRA-updated encoder to {encoder_path}")
-    
-    # Save results to JSON
-    results_path = os.path.join(result_dir, f"lora_results.json")
+    # Save results to JSON (use baseline naming convention)
+    results_path = os.path.join(result_dir, f"baseline_results_none.json")
     results = {
         "method": "lora",
-        "target_dataset": train_dataset_name,
+        "target_dataset": train_dataset_name.replace("Val", ""),
         "final_accuracy": float(final_acc),
         "k_shot": k,
         "model": cfg.model,
@@ -659,6 +641,7 @@ def train_lora(model, train_loader, val_loader, cfg, train_dataset_name, logger)
         "batch_size": cfg.batch_size,
         "gpu_peak_mem_mb": gpu_peak_mem_mb,
         "loss_history": loss_history,
+        "config_tag": config_tag,
     }
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=4)
@@ -695,15 +678,21 @@ def run_baseline_training_remote(cfg: DictConfig) -> None:
     except Exception:
         pass
     
-    # Setup paths
-    if not hasattr(cfg, "model_location") or cfg.model_location in (None, ""):
-        cfg.model_location = os.path.expanduser("./models/checkpoints")
-    if not hasattr(cfg, "save_dir") or cfg.save_dir in (None, ""):
-        cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
-    if not hasattr(cfg, "data_location") or cfg.data_location in (None, ""):
-        cfg.data_location = os.path.expanduser("datasets")
+    # Setup paths (using open_dict for OmegaConf struct mode compatibility)
+    with open_dict(cfg):
+        if not hasattr(cfg, "model_location") or cfg.model_location in (None, ""):
+            cfg.model_location = os.path.expanduser("./models/checkpoints_remote_sensing")
+        if not hasattr(cfg, "save_dir") or cfg.save_dir in (None, ""):
+            cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
+        if not hasattr(cfg, "data_location") or cfg.data_location in (None, ""):
+            cfg.data_location = os.path.expanduser("datasets")
+        
+        cfg.data_location = os.path.expanduser(cfg.data_location)
+        
+        # Build config tag for this baseline configuration
+        config_tag = build_baseline_config_tag(cfg)
+        cfg.config_tag = config_tag
     
-    cfg.data_location = os.path.expanduser(cfg.data_location)
     OmegaConf.set_struct(cfg, True)
     
     logger.info("=" * 100)
@@ -714,57 +703,100 @@ def run_baseline_training_remote(cfg: DictConfig) -> None:
     logger.info(f"K-shot: {cfg.k_shot}")
     logger.info(f"Seed: {cfg.seed}")
     logger.info(f"Device: {cfg.device}")
+    logger.info(f"Config tag: {config_tag}")
     logger.info("=" * 100)
     
-    # Load remote sensing dataset
-    train_dataset_name = cfg.target_dataset
+    # Load remote sensing dataset (add Val suffix for consistency with atlas/energy)
+    train_dataset_name = cfg.target_dataset + "Val"
     
     logger.info(f"Loading remote sensing dataset: {train_dataset_name}")
     image_encoder = ImageEncoder(cfg.model).to(cfg.device)
     
-    # Load remote sensing dataset with train/val split
-    dataset_obj = get_remote_sensing_dataset(
+    # Load remote sensing dataset (same as atlas/energy)
+    train_dataset = get_remote_sensing_dataset(
         train_dataset_name,
         image_encoder.train_preprocess,
         location=cfg.data_location,
         batch_size=cfg.batch_size,
-        num_workers=8,
+        num_workers=2,  # Fixed num_workers (same as atlas/energy)
     )
     
-    # Split train into train/val
-    dataset_obj = split_remote_sensing_train_into_train_val(
-        dataset_obj,
-        val_fraction=0.1,
-        max_val_samples=5000,
-        seed=cfg.seed,
-    )
-    
-    logger.info(f"✓ Dataset loaded: train={len(dataset_obj.train_dataset)}, val={len(dataset_obj.val_dataset)}")
-    
-    # Get number of classes
-    if hasattr(dataset_obj, 'classnames'):
-        num_classes = len(dataset_obj.classnames)
-    else:
-        # Fallback: try to infer from dataset
-        num_classes = len(set(dataset_obj.train_dataset.targets))
-    
-    logger.info(f"Number of classes: {num_classes}")
-    
-    # Create classification head
-    classification_head = ClassificationHead(
-        normalize=True,
-        weights=torch.zeros((num_classes, image_encoder.module.output_dim if hasattr(image_encoder, 'module') else image_encoder.output_dim)),
-    ).to(cfg.device)
+    # Get classification head for remote sensing dataset (same as atlas/energy)
+    classification_head = get_remote_sensing_classification_head(cfg, train_dataset_name, train_dataset)
     
     # Create model
     model = ImageClassifier(image_encoder, classification_head).to(cfg.device)
     model.freeze_head()
     
-    # Build train loader (with optional k-shot)
-    train_loader = build_train_loader_remote(cfg, model, dataset_obj, train_dataset_name, logger)
+    # Get train loader from dataset
+    from src.datasets import get_dataloader
+    train_loader = get_dataloader(
+        train_dataset, is_train=True, args=cfg, image_encoder=None
+    )
     
-    # Build validation loader
-    val_loader = dataset_obj.val_loader
+    # Apply k-shot sampling if specified
+    k = int(cfg.k_shot)
+    if k > 0:
+        logger.info(f"Applying k-shot sampling: {k} samples per class")
+        try:
+            seed = int(cfg.seed)
+            
+            # Create directory for saving indices
+            indices_save_dir = os.path.join(cfg.model_location, cfg.model, train_dataset_name)
+            
+            # Try to load existing k-shot indices
+            selected_indices = load_k_shot_indices(indices_save_dir, k, seed)
+            
+            if selected_indices is not None:
+                logger.info(f"✓ Loaded existing {k}-shot indices (seed={seed})")
+            else:
+                # Sample new indices from scratch
+                logger.info(f"Sampling new {k}-shot indices from full dataset (seed={seed})")
+                selected_indices = sample_k_shot_indices(
+                    train_dataset,
+                    k,
+                    seed=seed,
+                    verbose=True,
+                    progress_desc=f"{train_dataset_name} {k}-shot",
+                )
+                # Save the indices for future use
+                indices_path = save_k_shot_indices(selected_indices, indices_save_dir, train_dataset_name, k, seed)
+                logger.info(f"✓ Saved {k}-shot indices to {indices_path}")
+            
+            # Get base dataset
+            base_dataset = getattr(train_dataset, "train_dataset", None)
+            if base_dataset is None:
+                base_dataset = getattr(train_loader, "dataset", None)
+            
+            if base_dataset is not None:
+                num_workers = 2  # Fixed num_workers
+                collate_fn = getattr(train_loader, "collate_fn", None)
+                train_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.Subset(base_dataset, selected_indices),
+                    batch_size=cfg.batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    collate_fn=collate_fn,
+                )
+                logger.info(f"✓ Created {k}-shot dataloader with {len(selected_indices)} samples")
+            else:
+                logger.warning("Could not locate base train_dataset for k-shot subsetting; using full loader instead.")
+        except Exception as e:
+            logger.error(f"Failed to apply k-shot sampling: {e}")
+            logger.warning("Falling back to full training set")
+    
+    # Load validation dataset (same as atlas/energy)
+    logger.info(f"Loading validation dataset: {train_dataset_name}")
+    val_dataset = get_remote_sensing_dataset(
+        train_dataset_name,
+        image_encoder.val_preprocess,
+        location=cfg.data_location,
+        batch_size=cfg.batch_size,
+        num_workers=2,
+    )
+    val_loader = get_dataloader(
+        val_dataset, is_train=False, args=cfg, image_encoder=None
+    )
     logger.info(f"✓ Validation loader ready ({len(val_loader.dataset)} samples)")
     
     # Train baseline
@@ -775,7 +807,7 @@ def run_baseline_training_remote(cfg: DictConfig) -> None:
     elif cfg.baseline_method == 'tip_adapter':
         results = train_tip_or_lpp(model, train_loader, val_loader, cfg,
                          train_dataset_name, logger, adapter='tip')
-    elif cfg.baseline_method == 'lp_plus_plus':
+    elif cfg.baseline_method == 'lp++':
         results = train_tip_or_lpp(model, train_loader, val_loader, cfg,
                          train_dataset_name, logger, adapter='lpp')
     elif cfg.baseline_method == 'lora':
@@ -823,7 +855,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--baseline_method",
         type=str,
-        choices=["linear_probe", "tip_adapter", "lp_plus_plus", "lora"],
+        choices=["linear_probe", "tip_adapter", "lp++", "lora"],
         default="linear_probe",
         help="Baseline to train",
     )
@@ -882,7 +914,7 @@ if __name__ == "__main__":
     if not cfg.get("device"):
         cfg.device = ""
     if not cfg.get("lp_epochs"):
-        cfg.lp_epochs = 10
+        cfg.lp_epochs = 20
     if not cfg.get("lp_lr"):
         cfg.lp_lr = 1e-3
     if not cfg.get("lp_wd"):
@@ -894,7 +926,7 @@ if __name__ == "__main__":
     if not cfg.get("adapter_wd"):
         cfg.adapter_wd = 0.0
     if not cfg.get("lora_epochs"):
-        cfg.lora_epochs = 5
+        cfg.lora_epochs = 20
     if not cfg.get("lora_lr"):
         cfg.lora_lr = 1e-4
     if not cfg.get("lora_wd"):
