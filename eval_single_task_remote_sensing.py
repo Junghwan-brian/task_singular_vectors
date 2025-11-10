@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
@@ -353,6 +354,530 @@ def visualize_shot_results(
     logger.info(f"Saved: {output_path}")
 
 
+def aggregate_across_datasets(all_results: Dict) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    Aggregate results across all datasets to get average accuracy.
+    
+    Returns:
+        {
+            'ViT-B-32': {
+                '16shots': {
+                    'Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0': 85.5,
+                    'Atlas_none': 82.3,
+                    'Atlas_tip': 87.1,
+                    ...
+                },
+                ...
+            },
+            ...
+        }
+    """
+    aggregated = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    
+    for model_name, datasets in all_results.items():
+        for dataset_name, shots in datasets.items():
+            for shot_name, baselines in shots.items():
+                for baseline in baselines:
+                    method = baseline['method']
+                    adapter = baseline.get('adapter', 'none')
+                    accuracy = baseline['accuracy']
+                    
+                    # Create unique key based on method type
+                    if method == 'Energy':
+                        # For Energy, use hyperparameters as key
+                        lr = baseline.get('lr', 'unknown')
+                        topk = baseline.get('svd_keep_topk', 'unknown')
+                        init = baseline.get('initialize_sigma', 'unknown')
+                        warmup = baseline.get('warmup_ratio', 'unknown')
+                        wd = baseline.get('sigma_wd', '0.0')
+                        key = f"Energy_lr={lr}_k={topk}_init={init}_w={warmup}_wd={wd}"
+                    elif method == 'Atlas':
+                        # For Atlas, distinguish by adapter
+                        key = f"Atlas_{adapter}"
+                    else:
+                        key = f"{method}_{adapter}"
+                    
+                    aggregated[model_name][shot_name][key].append(accuracy)
+    
+    # Average the accuracies
+    averaged = {}
+    for model_name, shots in aggregated.items():
+        averaged[model_name] = {}
+        for shot_name, methods in shots.items():
+            averaged[model_name][shot_name] = {}
+            for method_key, accuracies in methods.items():
+                averaged[model_name][shot_name][method_key] = sum(accuracies) / len(accuracies)
+    
+    return averaged
+
+
+def select_best_energy_config(averaged_results: Dict) -> Dict[str, Dict[str, tuple]]:
+    """
+    For each model and shot, select the best Energy hyperparameter configuration.
+    
+    Returns:
+        {
+            'ViT-B-32': {
+                '16shots': ('Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0', 85.5),
+                ...
+            },
+            ...
+        }
+    """
+    best_energy = {}
+    
+    for model_name, shots in averaged_results.items():
+        best_energy[model_name] = {}
+        for shot_name, methods in shots.items():
+            # Filter Energy methods
+            energy_methods = {k: v for k, v in methods.items() if k.startswith('Energy_')}
+            
+            if energy_methods:
+                # Select best performing Energy configuration
+                best_key = max(energy_methods, key=energy_methods.get)
+                best_acc = energy_methods[best_key]
+                best_energy[model_name][shot_name] = (best_key, best_acc)
+    
+    return best_energy
+
+
+def visualize_aggregated_table(
+    averaged_results: Dict,
+    best_energy_configs: Dict,
+    output_dir: str
+) -> None:
+    """
+    Create a table visualization similar to Table 2 in the paper.
+    Shows averaged accuracy across all datasets.
+    """
+    # Define shot order
+    shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
+    
+    # Collect all unique methods
+    all_methods = set()
+    for model_name, shots in averaged_results.items():
+        for shot_name, methods in shots.items():
+            all_methods.update(methods.keys())
+    
+    # Separate Energy and non-Energy methods
+    energy_methods = {m for m in all_methods if m.startswith('Energy_')}
+    atlas_methods = {m for m in all_methods if m.startswith('Atlas_')}
+    other_methods = all_methods - energy_methods - atlas_methods
+    
+    # Prepare method list (Energy as single entry, then Atlas variants, then others)
+    method_list = ['Energy (best config)'] + sorted(atlas_methods) + sorted(other_methods)
+    
+    # Get models
+    models = sorted(averaged_results.keys())
+    
+    # Create data structure for table
+    # Structure: method -> model -> shot -> accuracy
+    table_data = defaultdict(lambda: defaultdict(dict))
+    energy_config_info = defaultdict(dict)
+    
+    for model_name in models:
+        for shot_name in shot_order:
+            if shot_name not in averaged_results[model_name]:
+                continue
+            
+            methods = averaged_results[model_name][shot_name]
+            
+            # Handle Energy - use best config
+            if model_name in best_energy_configs and shot_name in best_energy_configs[model_name]:
+                best_config_key, best_acc = best_energy_configs[model_name][shot_name]
+                table_data['Energy (best config)'][model_name][shot_name] = best_acc
+                energy_config_info[model_name][shot_name] = best_config_key
+            
+            # Handle Atlas and others
+            for method_key, accuracy in methods.items():
+                if method_key.startswith('Atlas_'):
+                    table_data[method_key][model_name][shot_name] = accuracy
+                elif not method_key.startswith('Energy_'):
+                    table_data[method_key][model_name][shot_name] = accuracy
+    
+    # Create table visualization
+    fig = plt.figure(figsize=(18, max(6, len(method_list) * 0.5 + 2)))
+    ax = fig.add_subplot(111)
+    ax.axis('tight')
+    ax.axis('off')
+    
+    # Prepare column headers
+    col_labels = ['Method']
+    for model in models:
+        for shot in shot_order:
+            shot_num = shot.replace('shots', '')
+            col_labels.append(f"{model}\n{shot_num}-shot")
+    
+    # Prepare table data
+    table_content = []
+    for method in method_list:
+        row = [format_method_label(method)]
+        for model in models:
+            for shot in shot_order:
+                acc = table_data[method].get(model, {}).get(shot, None)
+                if acc is not None:
+                    row.append(f"{acc:.2f}")
+                else:
+                    row.append("-")
+        table_content.append(row)
+    
+    # Create table
+    table = ax.table(
+        cellText=table_content,
+        colLabels=col_labels,
+        cellLoc='center',
+        loc='center',
+        bbox=[0, 0, 1, 1]
+    )
+    
+    # Style the table
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 2)
+    
+    # Color header row
+    for i in range(len(col_labels)):
+        cell = table[(0, i)]
+        cell.set_facecolor('#4CAF50')
+        cell.set_text_props(weight='bold', color='white')
+    
+    # Color method column
+    for i in range(len(table_content)):
+        cell = table[(i+1, 0)]
+        cell.set_facecolor('#E8F5E9')
+        cell.set_text_props(weight='bold', ha='left')
+    
+    # Find best values per column and highlight
+    for col_idx in range(1, len(col_labels)):
+        values = []
+        for row_idx in range(len(table_content)):
+            cell_text = table_content[row_idx][col_idx]
+            if cell_text != "-":
+                try:
+                    values.append((float(cell_text), row_idx))
+                except:
+                    pass
+        
+        if values:
+            max_val, max_row_idx = max(values, key=lambda x: x[0])
+            cell = table[(max_row_idx + 1, col_idx)]
+            cell.set_facecolor('#FFEB3B')
+            cell.set_text_props(weight='bold')
+    
+    plt.title('Few-Shot Remote Sensing Results - Dataset-Averaged Accuracy (%)', 
+              fontsize=14, fontweight='bold', pad=20)
+    
+    # Save figure
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, 'aggregated_results_table.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    
+    logger.info(f"Saved aggregated table: {output_path}")
+    
+    # Save as CSV
+    csv_output_path = os.path.join(output_dir, 'aggregated_results_table.csv')
+    with open(csv_output_path, 'w') as f:
+        f.write(','.join(col_labels) + '\n')
+        for row in table_content:
+            f.write(','.join(row) + '\n')
+    
+    logger.info(f"Saved CSV table: {csv_output_path}")
+    
+    # Save best Energy configurations to text file
+    config_output_path = os.path.join(output_dir, 'best_energy_configs.txt')
+    with open(config_output_path, 'w') as f:
+        f.write("Best Energy Hyperparameter Configurations\n")
+        f.write("=" * 80 + "\n\n")
+        for model in models:
+            f.write(f"Model: {model}\n")
+            f.write("-" * 80 + "\n")
+            for shot in shot_order:
+                if shot in energy_config_info.get(model, {}):
+                    config_key = energy_config_info[model][shot]
+                    accuracy = table_data['Energy (best config)'][model][shot]
+                    f.write(f"  {shot}: {config_key} (Acc: {accuracy:.2f}%)\n")
+            f.write("\n")
+    
+    logger.info(f"Saved best Energy configurations: {config_output_path}")
+
+
+def create_comprehensive_table(
+    all_results: Dict,
+    best_energy_configs: Dict,
+    output_dir: str
+) -> None:
+    """
+    Create a single comprehensive table with datasets as columns.
+    Rows are organized by (Model, Shot, Method).
+    Last column shows the average across datasets.
+    """
+    # Define shot order
+    shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
+    
+    # Collect all datasets
+    all_datasets = set()
+    for model_data in all_results.values():
+        all_datasets.update(model_data.keys())
+    all_datasets = sorted(all_datasets)
+    
+    # Collect all models
+    models = sorted(all_results.keys())
+    
+    # Collect all unique methods across all datasets
+    all_methods = set()
+    for model_name in models:
+        for dataset_name in all_results[model_name]:
+            for shot_name in all_results[model_name][dataset_name]:
+                for baseline in all_results[model_name][dataset_name][shot_name]:
+                    method = baseline['method']
+                    adapter = baseline.get('adapter', 'none')
+                    if method == 'Energy':
+                        all_methods.add('Energy (best config)')
+                    elif method == 'Atlas':
+                        all_methods.add(f'Atlas_{adapter}')
+                    else:
+                        all_methods.add(f'{method}_{adapter}')
+    
+    # Prepare method list
+    energy_methods_set = {'Energy (best config)'}
+    atlas_methods = {m for m in all_methods if m.startswith('Atlas_')}
+    other_methods = all_methods - energy_methods_set - atlas_methods
+    method_list = sorted(energy_methods_set) + sorted(atlas_methods) + sorted(other_methods)
+    
+    # Build data structure: [model][shot][method][dataset] = accuracy
+    data_structure = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+    
+    for model_name in models:
+        for dataset_name in all_results[model_name]:
+            for shot_name in shot_order:
+                if shot_name not in all_results[model_name][dataset_name]:
+                    continue
+                
+                baselines = all_results[model_name][dataset_name][shot_name]
+                
+                # Group baselines by method
+                energy_baselines = []
+                atlas_baselines = defaultdict(list)
+                other_baselines = defaultdict(list)
+                
+                for baseline in baselines:
+                    method = baseline['method']
+                    adapter = baseline.get('adapter', 'none')
+                    accuracy = baseline['accuracy']
+                    
+                    if method == 'Energy':
+                        energy_baselines.append((baseline, accuracy))
+                    elif method == 'Atlas':
+                        atlas_baselines[f'Atlas_{adapter}'].append(accuracy)
+                    else:
+                        other_baselines[f'{method}_{adapter}'].append(accuracy)
+                
+                # For Energy, select best based on the global best config for this model/shot
+                if energy_baselines and model_name in best_energy_configs and shot_name in best_energy_configs[model_name]:
+                    best_config_key, _ = best_energy_configs[model_name][shot_name]
+                    
+                    # Find the baseline matching the best config
+                    for baseline, accuracy in energy_baselines:
+                        lr = baseline.get('lr', 'unknown')
+                        topk = baseline.get('svd_keep_topk', 'unknown')
+                        init = baseline.get('initialize_sigma', 'unknown')
+                        warmup = baseline.get('warmup_ratio', 'unknown')
+                        wd = baseline.get('sigma_wd', '0.0')
+                        config_key = f"Energy_lr={lr}_k={topk}_init={init}_w={warmup}_wd={wd}"
+                        
+                        if config_key == best_config_key:
+                            data_structure[model_name][shot_name]['Energy (best config)'][dataset_name] = accuracy
+                            break
+                
+                # For Atlas and others
+                for atlas_key, accuracies in atlas_baselines.items():
+                    if accuracies:
+                        data_structure[model_name][shot_name][atlas_key][dataset_name] = accuracies[0]
+                
+                for other_key, accuracies in other_baselines.items():
+                    if accuracies:
+                        data_structure[model_name][shot_name][other_key][dataset_name] = accuracies[0]
+    
+    # Create table
+    # Columns: Model | Shot | Method | Dataset1 | Dataset2 | ... | Average
+    col_labels = ['Model', 'Shot', 'Method'] + all_datasets + ['Average']
+    
+    # Prepare table content with row metadata
+    table_content = []
+    row_metadata = []  # Store (model, shot, method) for each row
+    
+    for model_name in models:
+        for shot_idx, shot_name in enumerate(shot_order):
+            shot_display = shot_name.replace('shots', '')
+            
+            for method_idx, method_key in enumerate(method_list):
+                # First method in shot shows model name (for first shot only) and shot number
+                if method_idx == 0:
+                    if shot_idx == 0:
+                        row = [model_name, shot_display, format_method_label(method_key)]
+                    else:
+                        row = ['', shot_display, format_method_label(method_key)]
+                else:
+                    row = ['', '', format_method_label(method_key)]
+                
+                # Get accuracy for each dataset
+                accuracies = []
+                for dataset_name in all_datasets:
+                    acc = data_structure[model_name][shot_name][method_key].get(dataset_name, None)
+                    if acc is not None:
+                        row.append(f"{acc:.2f}")
+                        accuracies.append(acc)
+                    else:
+                        row.append("-")
+                
+                # Calculate average
+                if accuracies:
+                    avg = sum(accuracies) / len(accuracies)
+                    row.append(f"{avg:.2f}")
+                else:
+                    row.append("-")
+                
+                table_content.append(row)
+                row_metadata.append((model_name, shot_name, method_key))
+            
+            # Add separator row between shots (not after last shot of a model)
+            if shot_idx < len(shot_order) - 1:
+                table_content.append([''] * len(col_labels))
+                row_metadata.append((None, None, None))
+        
+        # Add separator row between models (visual separation)
+        if model_name != models[-1]:
+            table_content.append([''] * len(col_labels))
+            row_metadata.append((None, None, None))
+    
+    # Create figure
+    n_rows = len(table_content)
+    n_cols = len(col_labels)
+    fig_height = max(12, n_rows * 0.25 + 2)
+    fig_width = max(20, n_cols * 1.2)
+    
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    ax = fig.add_subplot(111)
+    ax.axis('tight')
+    ax.axis('off')
+    
+    # Create table
+    table = ax.table(
+        cellText=table_content,
+        colLabels=col_labels,
+        cellLoc='center',
+        loc='center',
+        bbox=[0, 0, 1, 1]
+    )
+    
+    # Style the table
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1, 1.8)
+    
+    # Color header row
+    for i in range(len(col_labels)):
+        cell = table[(0, i)]
+        cell.set_facecolor('#4CAF50')
+        cell.set_text_props(weight='bold', color='white', fontsize=9)
+    
+    # Color first three columns (Model, Shot, Method)
+    for i in range(len(table_content)):
+        for j in range(3):
+            cell = table[(i+1, j)]
+            if table_content[i][j]:  # Not empty separator row
+                cell.set_facecolor('#E8F5E9')
+                if j == 0:  # Model column
+                    cell.set_text_props(weight='bold', ha='center', fontsize=9)
+                elif j == 1:  # Shot column
+                    cell.set_text_props(weight='bold', ha='center')
+                else:  # Method column
+                    cell.set_text_props(weight='bold', ha='left')
+    
+    # Highlight Energy(best) and Atlas rows with special colors
+    for i in range(len(table_content)):
+        model, shot, method = row_metadata[i]
+        if method:
+            method_label = format_method_label(method)
+            
+            # Energy(best) - light green background
+            if method == 'Energy (best config)':
+                for j in range(3, len(col_labels)):
+                    cell = table[(i+1, j)]
+                    if table_content[i][j] and table_content[i][j] != "-":
+                        cell.set_facecolor('#C8E6C9')
+            
+            # Atlas (without any adapter) - light blue background
+            elif method == 'Atlas_none':
+                for j in range(3, len(col_labels)):
+                    cell = table[(i+1, j)]
+                    if table_content[i][j] and table_content[i][j] != "-":
+                        cell.set_facecolor('#BBDEFB')
+    
+    # Highlight best values per model/shot combination with gold color
+    # Group by model and shot
+    current_group_start = 0
+    for i in range(len(table_content) + 1):
+        # Check if we reached end of a shot group (empty row or end of list)
+        if i == len(table_content) or row_metadata[i][0] is None:
+            # Process the current group
+            if current_group_start < i:
+                # For each dataset column (and average), find best value in this group
+                for col_idx in range(3, len(col_labels)):
+                    values = []
+                    for row_idx in range(current_group_start, i):
+                        cell_text = table_content[row_idx][col_idx]
+                        if cell_text != "-" and cell_text != "":
+                            try:
+                                values.append((float(cell_text), row_idx))
+                            except:
+                                pass
+                    
+                    if values:
+                        max_val, max_row_idx = max(values, key=lambda x: x[0])
+                        cell = table[(max_row_idx + 1, col_idx)]
+                        cell.set_facecolor('#FFD700')  # Gold color
+                        cell.set_text_props(weight='bold')
+            
+            # Move to next group
+            current_group_start = i + 1
+    
+    plt.title('Few-Shot Remote Sensing Results - All Datasets and Average', 
+              fontsize=16, fontweight='bold', pad=20)
+    
+    # Save figure
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, 'comprehensive_results_table.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    
+    logger.info(f"Saved comprehensive table: {output_path}")
+    
+    # Save as CSV
+    csv_output_path = os.path.join(output_dir, 'comprehensive_results_table.csv')
+    with open(csv_output_path, 'w') as f:
+        f.write(','.join(col_labels) + '\n')
+        for row in table_content:
+            f.write(','.join(row) + '\n')
+    
+    logger.info(f"Saved CSV: {csv_output_path}")
+
+
+def format_method_label(method_key: str) -> str:
+    """Format method key for display."""
+    if method_key == 'Energy (best config)':
+        return 'Energy (best)'
+    elif method_key.startswith('Atlas_'):
+        adapter = method_key.replace('Atlas_', '')
+        if adapter == 'none':
+            return 'Atlas'
+        else:
+            return f'Atlas+{adapter.upper()}'
+    else:
+        return method_key
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Aggregate and visualize remote sensing experiment results'
@@ -387,6 +912,11 @@ def main():
         default=None,
         help='Specific shots to process (e.g., 16shots 8shots)'
     )
+    parser.add_argument(
+        '--aggregate_only',
+        action='store_true',
+        help='Only generate aggregated visualization (skip individual charts)'
+    )
     
     args = parser.parse_args()
     
@@ -418,27 +948,41 @@ def main():
                     k: v for k, v in all_results[model][dataset].items() if k in shots_normalized
                 }
     
-    # Count total combinations
-    total_combinations = sum(
-        len(shots_dict)
-        for dataset_dict in all_results.values()
-        for shots_dict in dataset_dict.values()
-    )
-    
     logger.info(f"\nFound {len(all_results)} models")
-    logger.info(f"Total combinations to visualize: {total_combinations}")
     
-    # Generate visualizations
-    logger.info("\nGenerating visualizations...")
-    count = 0
-    for model_name, datasets in sorted(all_results.items()):
-        for dataset_name, shots in sorted(datasets.items()):
-            for shot_name, baselines in sorted(shots.items()):
-                count += 1
-                logger.info(f"[{count}/{total_combinations}] Processing {model_name}/{dataset_name}/{shot_name} ({len(baselines)} baselines)")
-                visualize_shot_results(
-                    model_name, dataset_name, shot_name, baselines, args.output_dir
-                )
+    # Generate aggregated visualization
+    logger.info("\nAggregating results across datasets...")
+    averaged_results = aggregate_across_datasets(all_results)
+    
+    logger.info("Selecting best Energy configurations...")
+    best_energy_configs = select_best_energy_config(averaged_results)
+    
+    logger.info("Generating aggregated visualization...")
+    visualize_aggregated_table(averaged_results, best_energy_configs, args.output_dir)
+    
+    # Generate comprehensive table with all datasets as columns
+    logger.info("\nGenerating comprehensive table (all datasets + average)...")
+    create_comprehensive_table(all_results, best_energy_configs, args.output_dir)
+    
+    # Generate individual visualizations if not aggregate_only
+    if not args.aggregate_only:
+        total_combinations = sum(
+            len(shots_dict)
+            for dataset_dict in all_results.values()
+            for shots_dict in dataset_dict.values()
+        )
+        
+        logger.info(f"\nTotal combinations to visualize: {total_combinations}")
+        logger.info("\nGenerating individual visualizations...")
+        count = 0
+        for model_name, datasets in sorted(all_results.items()):
+            for dataset_name, shots in sorted(datasets.items()):
+                for shot_name, baselines in sorted(shots.items()):
+                    count += 1
+                    logger.info(f"[{count}/{total_combinations}] Processing {model_name}/{dataset_name}/{shot_name} ({len(baselines)} baselines)")
+                    visualize_shot_results(
+                        model_name, dataset_name, shot_name, baselines, args.output_dir
+                    )
     
     logger.info("=" * 80)
     logger.info(f"✓ Complete! Results saved to {args.output_dir}")
