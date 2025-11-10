@@ -9,6 +9,7 @@ import sys
 import torchvision
 from tqdm.auto import tqdm
 import math
+from typing import Optional
 
 from src.eval.aggregation import create_task_vector
 from src.utils.variables_and_paths import (
@@ -273,16 +274,22 @@ def compute_eval_epochs(total_epochs: int, max_evals: int = 5) -> set:
     }
     return eval_epochs
 
-def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
+def compute_and_sum_svd_mem_reduction(task_vectors, config, sigma_reduce: str = "mean"):
     """
     여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
     각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
-    '재계산된 평균' sigma(diag)로 재구성.
+    '재계산된 집계(sigma_reduce)' sigma(diag)로 재구성.
+    
+    Args:
+        task_vectors: 태스크 벡터 리스트 (각 태스크의 state-delta)
+        config: 설정 객체 (device, DATASETS, svd_keep_topk 등 포함)
+        sigma_reduce: 'mean' | 'max' | 'sum' 중 하나로 sigma(diag) 집계 방법 선택
     """
     device = config.device
     datasets = list(config.DATASETS)
     num_tasks = int(len(datasets))
     desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
+    sigma_reduce = str(sigma_reduce).lower()
     with torch.no_grad():
         new_vector = {}
         # 공통 필터 함수(임베딩류 제외)
@@ -304,7 +311,6 @@ def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
                 new_vector[key] = avg
                 continue
             # -------- SVD 축 모으기 준비 --------
-            # 첫 태스크에서 모양/순위 파악
             vec0 = task_vectors[0].vector[key].to(device)
             u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
             m = int(u0.shape[0])
@@ -317,7 +323,6 @@ def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
             # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
             num_used = min(num_tasks, r)
             # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
-            # k = max(1, r // num_used)
             max_per_task = max(1, r // num_used)
             k = min(desired_k, max_per_task)
             if desired_k > max_per_task:
@@ -329,10 +334,8 @@ def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
                     k,
                 )
             chunks = int(k * num_used)    # <= r 보장
-            # print(f"chunks: {chunks}")
             # 버퍼를 '정수 차원'으로 명시해 생성
             sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
-            # sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype) # [수정] 더 이상 sum_s 필요 없음
             sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
             # 각 태스크에서 상위 k개 축만 수집
             for i, tv in enumerate(task_vectors[:num_used]):
@@ -344,248 +347,140 @@ def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
                 start = i * k
                 end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
                 sum_u[:, start:end] = u[:, :k_i]
-                # sum_s[start:end] = s[:k_i] # [수정] 더 이상 sum_s 필요 없음
                 sum_v[start:end, :] = vh[:k_i, :]
             # 직교화(각 집합에 대해 다시 SVD → U*Vh)
             u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
             u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
             U_orth = u_u @ vh_u          # (m × chunks)
             V_orth = u_v @ vh_v          # (chunks × n)
-            # -------- [수정된 Sigma 계산 로직 시작] --------
-            # 1. 각 태스크 벡터(M_i)를 공통 기저(U_orth, V_orth)로 투영하여
-            #    최적의 대각 행렬(sigma_task)을 찾습니다.
-            #    M_i ≈ U_orth @ Sigma_i @ V_orth 이므로,
-            #    Sigma_i' = U_orth.T @ M_i @ V_orth.T 를 계산합니다.
+            # -------- Sigma 계산 --------
             all_sigma_diags = []
-            # U_orth (m, chunks) -> U_orth.T (chunks, m)
-            # V_orth (chunks, n) -> V_orth.T (n, chunks)
             U_orth_T = U_orth.T
             V_orth_T = V_orth.T
-            # "모든" 태스크 벡터에 대해 반복 (num_used 뿐만 아니라)
             for tv in task_vectors:
-                M_i = tv.vector[key].to(device)  # 원본 태스크 행렬 (m, n)
-                # Sigma_i_prime = (U_orth.T @ M_i) @ V_orth.T
-                # (chunks, m) @ (m, n) @ (n, chunks) -> (chunks, chunks)
-                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T
-                # "이를 diagonal로 만들도록 해야해" -> 대각 성분만 추출
+                M_i = tv.vector[key].to(device)  # (m, n)
+                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T  # (chunks, chunks)
                 sigma_task_diag = torch.diag(Sigma_i_prime)  # (chunks,)
                 all_sigma_diags.append(sigma_task_diag)
-            # 2. 모든 태스크의 sigma_task_diag를 평균냅니다.
             if not all_sigma_diags:
-                # 엣지 케이스 방어
-                Sigma = torch.zeros(
-                    (chunks, chunks), device=device, dtype=u0.dtype)
+                Sigma = torch.zeros((chunks, chunks), device=device, dtype=u0.dtype)
             else:
-                # (num_tasks, chunks)
-                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
-                # (chunks,)
-                mean_sigma_diag = torch.sum(stacked_sigmas, dim=0)
-                # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
-                Sigma = torch.diag(mean_sigma_diag)   # (chunks, chunks)
-            # -------- [수정된 Sigma 계산 로직 끝] --------
+                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)  # (num_tasks, chunks)
+                if sigma_reduce in ("mean", "average"):
+                    agg_sigma_diag = torch.mean(stacked_sigmas, dim=0)
+                elif sigma_reduce == "max":
+                    agg_sigma_diag = torch.max(stacked_sigmas, dim=0).values
+                elif sigma_reduce == "sum":
+                    agg_sigma_diag = torch.sum(stacked_sigmas, dim=0)
+                else:
+                    # 기본값: mean
+                    agg_sigma_diag = torch.mean(stacked_sigmas, dim=0)
+                Sigma = torch.diag(agg_sigma_diag)   # (chunks, chunks)
             # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
             new_vector[key] = [U_orth, Sigma, V_orth]
     return new_vector
 
+# 하위 호환(기존 호출이 있을 수 있으므로), 내부적으로 통합 함수 호출
 def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
-    """
-    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
-    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과
-    '재계산된 평균' sigma(diag)로 재구성.
-    """
-    device = config.device
-    datasets = list(config.DATASETS)
-    num_tasks = int(len(datasets))
-    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
-    with torch.no_grad():
-        new_vector = {}
-        # 공통 필터 함수(임베딩류 제외)
-        def is_matrix_key(tv0, key):
-            return (
-                tv0.vector[key].ndim == 2 and
-                all(t not in key for t in ("text_projection",
-                    "positional", "token_embedding"))
-            )
-        # 키 순회
-        tv0 = task_vectors[0]
-        for key in tv0.vector:
-            # 2D 행렬이 아니거나 제외 키면: 단순 평균
-            if not is_matrix_key(tv0, key):
-                avg = None
-                for i, tv in enumerate(task_vectors):
-                    vec = tv.vector[key].to(device)
-                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
-                new_vector[key] = avg
-                continue
-            # -------- SVD 축 모으기 준비 --------
-            # 첫 태스크에서 모양/순위 파악
-            vec0 = task_vectors[0].vector[key].to(device)
-            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
-            m = int(u0.shape[0])
-            r = int(s0.shape[0])          # 유효 랭크 상한
-            n = int(vh0.shape[1])
-            if r == 0:
-                # 드물지만 0-rank 보호장치
-                new_vector[key] = torch.zeros_like(vec0)
-                continue
-            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
-            num_used = min(num_tasks, r)
-            # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
-            # k = max(1, r // num_used)
-            max_per_task = max(1, r // num_used)
-            k = min(desired_k, max_per_task)
-            if desired_k > max_per_task:
-                print(
-                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
-                    desired_k,
-                    max_per_task,
-                    key,
-                    k,
-                )
-            chunks = int(k * num_used)    # <= r 보장
-            # print(f"chunks: {chunks}")
-            # 버퍼를 '정수 차원'으로 명시해 생성
-            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
-            # sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype) # [수정] 더 이상 sum_s 필요 없음
-            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
-            # 각 태스크에서 상위 k개 축만 수집
-            for i, tv in enumerate(task_vectors[:num_used]):
-                vec = tv.vector[key].to(device)
-                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
-                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
-                r_i = int(s.shape[0])
-                k_i = min(k, r_i)  # 안전 클램프
-                start = i * k
-                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
-                sum_u[:, start:end] = u[:, :k_i]
-                # sum_s[start:end] = s[:k_i] # [수정] 더 이상 sum_s 필요 없음
-                sum_v[start:end, :] = vh[:k_i, :]
-            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
-            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
-            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
-            U_orth = u_u @ vh_u          # (m × chunks)
-            V_orth = u_v @ vh_v          # (chunks × n)
-            # -------- [수정된 Sigma 계산 로직 시작] --------
-            # 1. 각 태스크 벡터(M_i)를 공통 기저(U_orth, V_orth)로 투영하여
-            #    최적의 대각 행렬(sigma_task)을 찾습니다.
-            #    M_i ≈ U_orth @ Sigma_i @ V_orth 이므로,
-            #    Sigma_i' = U_orth.T @ M_i @ V_orth.T 를 계산합니다.
-            all_sigma_diags = []
-            # U_orth (m, chunks) -> U_orth.T (chunks, m)
-            # V_orth (chunks, n) -> V_orth.T (n, chunks)
-            U_orth_T = U_orth.T
-            V_orth_T = V_orth.T
-            # "모든" 태스크 벡터에 대해 반복 (num_used 뿐만 아니라)
-            for tv in task_vectors:
-                M_i = tv.vector[key].to(device)  # 원본 태스크 행렬 (m, n)
-                # Sigma_i_prime = (U_orth.T @ M_i) @ V_orth.T
-                # (chunks, m) @ (m, n) @ (n, chunks) -> (chunks, chunks)
-                Sigma_i_prime = (U_orth_T @ M_i) @ V_orth_T
-                # "이를 diagonal로 만들도록 해야해" -> 대각 성분만 추출
-                sigma_task_diag = torch.diag(Sigma_i_prime)  # (chunks,)
-                all_sigma_diags.append(sigma_task_diag)
-            # 2. 모든 태스크의 sigma_task_diag를 평균냅니다.
-            if not all_sigma_diags:
-                # 엣지 케이스 방어
-                Sigma = torch.zeros(
-                    (chunks, chunks), device=device, dtype=u0.dtype)
-            else:
-                # (num_tasks, chunks)
-                stacked_sigmas = torch.stack(all_sigma_diags, dim=0)
-                # (chunks,)
-                mean_sigma_diag = torch.mean(stacked_sigmas, dim=0)
-                # 최종 Sigma: 평균낸 대각 성분으로 대각 행렬 생성
-                Sigma = torch.diag(mean_sigma_diag)   # (chunks, chunks)
-            # -------- [수정된 Sigma 계산 로직 끝] --------
-            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
-            new_vector[key] = [U_orth, Sigma, V_orth]
-    return new_vector
+    return compute_and_sum_svd_mem_reduction(task_vectors, config, sigma_reduce="mean")
 
-def compute_and_sum_svd_mem_reduction_tsvm(task_vectors, config):
-    """
-    여러 태스크 벡터의 2D 가중치에 대해 SVD를 수행,
-    각 태스크에서 k개의 축만 모아 직교 기반(U_orth, V_orth)과 sigma(diag)로 재구성.
-    """
-    logger = setup_simple_logger(__name__)
-    device = config.device
-    datasets = list(config.DATASETS)
-    num_tasks = int(len(datasets))
-    desired_k = max(1, int(getattr(config, "svd_keep_topk", 2)))
-    with torch.no_grad():
-        new_vector = {}
-        # 공통 필터 함수(임베딩류 제외)
-        def is_matrix_key(tv0, key):
-            return (
-                tv0.vector[key].ndim == 2 and
-                all(t not in key for t in ("text_projection", "positional", "token_embedding"))
-            )
-        # 키 순회
-        tv0 = task_vectors[0]
-        for key in tv0.vector:
-            # 2D 행렬이 아니거나 제외 키면: 단순 평균
-            if not is_matrix_key(tv0, key):
-                avg = None
-                for i, tv in enumerate(task_vectors):
-                    vec = tv.vector[key].to(device)
-                    avg = vec.clone() if i == 0 else avg + (vec - avg) / (i + 1)
-                new_vector[key] = avg
-                continue
-            # -------- SVD 축 모으기 준비 --------
-            # 첫 태스크에서 모양/순위 파악
-            vec0 = task_vectors[0].vector[key].to(device)
-            u0, s0, vh0 = torch.linalg.svd(vec0, full_matrices=False)
-            m = int(u0.shape[0])
-            r = int(s0.shape[0])          # 유효 랭크 상한
-            n = int(vh0.shape[1])
-            if r == 0:
-                # 드물지만 0-rank 보호장치
-                new_vector[key] = torch.zeros_like(vec0)
-                continue
-            # 사용할 태스크 수: r 보다 많은 태스크를 모두 쓰면 k가 0이 될 수 있으니 cap
-            num_used = min(num_tasks, r)
-            # # 태스크당 축 수 k: floor로 잡으면 k*num_used <= r 보장
-            # k = max(1, r // num_used)
-            # 원하는 축 개수(desired_k)를 가능한 범위로 클램프
-            if num_used == 0:
-                continue
-            max_per_task = max(1, r // num_used)
-            k = min(desired_k, max_per_task)
-            if desired_k > max_per_task:
-                logger.warning(
-                    "[SVD] Requested %d comps/task but only %d available for %s; using %d.",
-                    desired_k,
-                    max_per_task,
-                    key,
-                    k,
-                )
-            chunks = int(k * num_used)    # <= r 보장
-            # 버퍼를 '정수 차원'으로 명시해 생성
-            sum_u = torch.zeros((m, chunks), device=device, dtype=u0.dtype)
-            sum_s = torch.zeros((chunks,), device=device, dtype=s0.dtype)
-            sum_v = torch.zeros((chunks, n), device=device, dtype=vh0.dtype)
-            # 각 태스크에서 상위 k개 축만 수집
-            for i, tv in enumerate(task_vectors[:num_used]):
-                vec = tv.vector[key].to(device)
-                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
-                # 실제 s 길이가 r보다 작을 수도 있으므로 k를 매 태스크마다 보정
-                r_i = int(s.shape[0])
-                k_i = min(k, r_i)  # 안전 클램프
-                start = i * k
-                end = start + k_i  # 마지막 태스크에서 k_i < k일 수 있음
-                sum_u[:, start:end] = u[:, :k_i]
-                sum_s[start:end]    = s[:k_i]
-                sum_v[start:end, :] = vh[:k_i, :]
-            # 직교화(각 집합에 대해 다시 SVD → U*Vh)
-            u_u, _, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
-            u_v, _, vh_v = torch.linalg.svd(sum_v, full_matrices=False)
-            U_orth = u_u @ vh_u          # (m × chunks)
-            V_orth = u_v @ vh_v          # (chunks × n)
-            # sigma는 대각으로 유지(여기서는 단순 concat된 sum_s)
-            Sigma = torch.diag(sum_s)
-            # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
+def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
+    return compute_and_sum_svd_mem_reduction(task_vectors, config, sigma_reduce="sum")
 
-            new_vector[key] = [U_orth, Sigma, V_orth]
-    return new_vector
+def grid_search_sigma_alpha(
+    sigma_modules: torch.nn.ModuleDict,
+    sigma_key_map,
+    base_params,
+    base_buffers,
+    model,
+    train_loader,
+    device,
+    alphas=None,
+    max_batches: int = None,
+    apply_best: bool = True,
+    logger: Optional[logging.Logger] = None,
+):
+    """
+    모든 Sigma(diag)에 동일 스케일(alpha)을 곱해본 뒤,
+    주어진 데이터에서 정확도가 가장 높은 alpha를 선택.
+    
+    Args:
+        sigma_modules: SigmaParametrization 모듈들의 ModuleDict
+        sigma_key_map: 안전 키명 -> 원래 state_dict 키명 매핑
+        base_params: frozen encoder의 파라미터 텐서 사본(dict)
+        base_buffers: encoder 버퍼 사본(dict)
+        model: ImageClassifier (image_encoder + classification_head)
+        train_loader: 평가에 사용할 학습 데이터 로더
+        device: 디바이스 문자열 또는 torch.device
+        alphas: 시도할 배율 리스트 (기본 [1,3,5,7,10])
+        max_batches: 평가에 사용할 최대 배치 수 (None이면 전체)
+        apply_best: True면 선택된 alpha로 sigma 파라미터를 실제 스케일링
+        logger: 로거
+    Returns:
+        (best_alpha, best_acc)
+    """
+    if alphas is None:
+        alphas = [1, 5, 10, 15, 20]
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    model.eval()
+    best_alpha = None
+    best_acc = -1.0
+    with torch.no_grad():
+        for alpha in alphas:
+            correct = 0.0
+            total = 0.0
+            for b_idx, batch in enumerate(train_loader):
+                if max_batches is not None and max_batches > 0 and b_idx >= max_batches:
+                    break
+                batch = maybe_dictionarize(batch)
+                inputs = batch["images"].to(device)
+                labels = batch["labels"].to(device)
+                # build delta map (no grad)
+                delta_map = {}
+                for safe_key, module in sigma_modules.items():
+                    orig_key = sigma_key_map.get(safe_key, safe_key)
+                    if orig_key in base_params and module.sigma.numel() > 0:
+                        # scaled delta: U @ diag(relu(sigma) * alpha) @ V
+                        sigma_vec = torch.relu(module.sigma) * float(alpha)
+                        delta = module.U @ torch.diag(sigma_vec) @ module.V
+                        if delta.shape == base_params[orig_key].shape:
+                            delta_map[orig_key] = delta
+                # merge params
+                params_map = {}
+                for name, p in base_params.items():
+                    if name in delta_map:
+                        params_map[name] = p + delta_map[name]
+                    else:
+                        params_map[name] = p
+                # functional forward
+                def encoder_forward(mod, x):
+                    merged = {}
+                    merged.update(base_buffers)
+                    merged.update(params_map)
+                    return functional_call(mod, merged, (x,))
+                features = encoder_forward(model.image_encoder, inputs)
+                logits = model.classification_head(features)
+                preds = logits.argmax(dim=1, keepdim=False)
+                correct += float(preds.eq(labels).sum().item())
+                total += float(labels.size(0))
+            acc = (correct / total) if total > 0 else 0.0
+            logger.info(f"[alpha-grid] alpha={alpha} -> train accuracy={acc*100:.2f}%")
+            if acc > best_acc:
+                best_acc = acc
+                best_alpha = alpha
+    if best_alpha is None:
+        best_alpha = 1.0
+    # 적용
+    if apply_best:
+        for _, module in sigma_modules.items():
+            if module.sigma.numel() > 0:
+                module.sigma.data.mul_(float(best_alpha))
+        logger.info(f"[alpha-grid] Selected alpha={best_alpha} (acc={best_acc*100:.2f}%), applied to sigma.")
+    else:
+        logger.info(f"[alpha-grid] Selected alpha={best_alpha} (acc={best_acc*100:.2f}%), not applied (apply_best=False).")
+    return best_alpha, best_acc
+
 
 
 def run_energy(cfg: DictConfig) -> None:
@@ -681,15 +576,16 @@ def run_energy(cfg: DictConfig) -> None:
     # create final task vector with timing
     svd_start = time.time()
     init_mode = getattr(cfg, "initialize_sigma", "average").lower()
-    if init_mode == "tsvm":
-        logger.info("Using TSVM SVD initialization")
-        svd_dict = compute_and_sum_svd_mem_reduction_tsvm(task_vectors, cfg)
-    elif init_mode == "average":
-        logger.info("Using average SVD initialization")
-        svd_dict = compute_and_sum_svd_mem_reduction_average(task_vectors, cfg)
+    # 'mean'/'average'/'max'/'sum' 지원
+    if init_mode in ("average", "mean"):
+        logger.info("Using SVD initialization with sigma_reduce=mean")
+        svd_dict = compute_and_sum_svd_mem_reduction(task_vectors, cfg, sigma_reduce="mean")
+    elif init_mode == "max":
+        logger.info("Using SVD initialization with sigma_reduce=max")
+        svd_dict = compute_and_sum_svd_mem_reduction(task_vectors, cfg, sigma_reduce="max")
     elif init_mode == "sum":
-        logger.info("Using sum SVD initialization")
-        svd_dict = compute_and_sum_svd_mem_reduction_sum(task_vectors, cfg)
+        logger.info("Using SVD initialization with sigma_reduce=sum")
+        svd_dict = compute_and_sum_svd_mem_reduction(task_vectors, cfg, sigma_reduce="sum")
     svd_time = time.time() - svd_start
     logger.info(f"Computed SVD bases in {svd_time:.2f}s")
 
@@ -914,6 +810,28 @@ def run_energy(cfg: DictConfig) -> None:
             name: tensor.detach().clone()
             for name, tensor in model.image_encoder.state_dict().items()
         }
+
+        # Grid search로 sigma 초기 스케일 최적화 (train 데이터 기준)
+        try:
+            alpha_candidates = getattr(cfg, "sigma_alpha_candidates", [1, 3, 5, 7, 10])
+            max_eval_batches = int(getattr(cfg, "sigma_alpha_eval_batches", 0)) or None
+            logger.info(f"Running alpha grid search over {alpha_candidates} (max_batches={max_eval_batches})")
+            best_alpha, best_acc = grid_search_sigma_alpha(
+                sigma_modules=sigma_modules,
+                sigma_key_map=sigma_key_map,
+                base_params=base_params,
+                base_buffers=base_buffers,
+                model=model,
+                train_loader=train_loader,
+                device=cfg.device,
+                alphas=alpha_candidates,
+                max_batches=max_eval_batches,
+                apply_best=True,
+                logger=logger,
+            )
+            logger.info(f"Selected alpha={best_alpha} (train acc={best_acc*100:.2f}%) for sigma initialization.")
+        except Exception as e:
+            logger.warning(f"Alpha grid search failed: {e}. Proceeding without scaling.")
 
         # Prepare evaluation schedule and history tracking
         eval_epochs = compute_eval_epochs(int(cfg.sigma_epochs))
