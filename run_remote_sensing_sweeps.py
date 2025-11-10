@@ -195,14 +195,14 @@ REMOTE_SENSING_DATASETS = {
     "WHU-RS19": 150,
 }
 
-GPU_IDS = [1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
-ENERGY_MODELS = ["ViT-B-32"]
-ENERGY_INITIALIZE_SIGMA = ["average", "sum"]
+GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
+ENERGY_MODELS = ["ViT-L-14", "ViT-B-16", "ViT-B-32"]
+ENERGY_INITIALIZE_SIGMA = ["average"]
 ENERGY_ADAPTERS = ["none"]
 ENERGY_K = [1,2,4,8,16]
 ENERGY_SVD_KEEP_TOPK = [12]
-ENERGY_SIGMA_LR = [1e-3, 1e-4]
-ENERGY_SIGMA_WD = [0.001, 0.01, 0.1]
+ENERGY_SIGMA_LR = [1e-2, 1e-3, 5e-3]
+ENERGY_SIGMA_WD = [0.0]
 ENERGY_WARMUP_RATIO = [0.1]
 
 ATLAS_MODELS = ["ViT-B-16"]
