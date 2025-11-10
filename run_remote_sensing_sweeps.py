@@ -209,6 +209,20 @@ ATLAS_MODELS = ["ViT-B-16"]
 ATLAS_ADAPTERS = ["none", "lp++", "tip"]
 ATLAS_K = [1,2,4,8,16]
 
+# Baseline configurations
+BASELINE_MODELS = ["ViT-B-16"]
+BASELINE_METHODS = ["linear_probe", "tip_adapter", "lp++", "lora"]
+BASELINE_K = [1,2,4,8,16]
+BASELINE_LP_LR = [1e-3]
+BASELINE_LP_EPOCHS = [20]
+BASELINE_LP_WD = [0.0]
+BASELINE_ADAPTER_WD = [0.0]
+BASELINE_LORA_R = [8]
+BASELINE_LORA_ALPHA = [16.0]
+BASELINE_LORA_LR = [1e-4]
+BASELINE_LORA_EPOCHS = [20]
+BASELINE_LORA_WD = [0.0]
+
 # Best Energy hyperparameter configurations from evaluation
 BEST_ENERGY_CONFIGS = {
     "ViT-B-16": {
@@ -388,6 +402,150 @@ def build_atlas_commands(datasets: Sequence[str]) -> List[List[str]]:
     return commands
 
 
+def _baseline_config_tag(method: str, **kwargs) -> str:
+    """Build config tag for baseline method."""
+    if method == 'linear_probe':
+        lr = _sanitize_value(kwargs.get('lp_lr', 1e-3))
+        epochs = _sanitize_value(kwargs.get('lp_epochs', 20))
+        wd = _sanitize_value(kwargs.get('lp_wd', 0.0))
+        return f"baseline_lp_{lr}_{epochs}_{wd}"
+    elif method == 'tip_adapter':
+        wd = _sanitize_value(kwargs.get('adapter_wd', 0.0))
+        return f"baseline_tip_{wd}"
+    elif method == 'lp++':
+        wd = _sanitize_value(kwargs.get('adapter_wd', 0.0))
+        return f"baseline_lpp_{wd}"
+    elif method == 'lora':
+        r = _sanitize_value(kwargs.get('lora_r', 8))
+        alpha = _sanitize_value(kwargs.get('lora_alpha', 16.0))
+        lr = _sanitize_value(kwargs.get('lora_lr', 1e-4))
+        epochs = _sanitize_value(kwargs.get('lora_epochs', 20))
+        wd = _sanitize_value(kwargs.get('lora_wd', 0.0))
+        return f"baseline_lora_{r}_{alpha}_{lr}_{epochs}_{wd}"
+    else:
+        return f"baseline_{method}"
+
+
+def _expected_baseline_paths(
+    model: str,
+    dataset: str,
+    method: str,
+    k: int,
+    **kwargs
+) -> str:
+    """Return expected baseline results path."""
+    config_tag = _baseline_config_tag(method, **kwargs)
+    dataset_dir = f"{dataset}Val"
+    base_dir = os.path.join(MODEL_ROOT, model, dataset_dir, config_tag, _shot_folder(k))
+    results_json = os.path.join(base_dir, "baseline_results_none.json")
+    return results_json
+
+
+def build_baseline_commands(datasets: Sequence[str]) -> List[List[str]]:
+    """Build baseline training commands for remote sensing datasets."""
+    commands: List[List[str]] = []
+    
+    for model, method, dataset, k in itertools.product(
+        BASELINE_MODELS, BASELINE_METHODS, datasets, BASELINE_K
+    ):
+        # Build hyperparameters based on method
+        hparams = {}
+        if method == 'linear_probe':
+            for lp_lr, lp_epochs, lp_wd in itertools.product(
+                BASELINE_LP_LR, BASELINE_LP_EPOCHS, BASELINE_LP_WD
+            ):
+                hparams = {
+                    'lp_lr': lp_lr,
+                    'lp_epochs': lp_epochs,
+                    'lp_wd': lp_wd,
+                }
+                results_json = _expected_baseline_paths(
+                    model=model, dataset=dataset, method=method, k=k, **hparams
+                )
+                if _path_exists(results_json):
+                    print(
+                        f"[skip] baseline {model} {dataset} (method={method}, k={k}) -> {results_json}",
+                        flush=True,
+                    )
+                    continue
+                
+                cmd = [
+                    sys.executable,
+                    "baselines_train_remote_sensing.py",
+                    "--model", model,
+                    "--baseline_method", method,
+                    "--k", str(k),
+                    "--target_dataset", dataset,
+                    "--lp_lr", f"{lp_lr:.6g}",
+                    "--lp_epochs", str(lp_epochs),
+                    "--lp_wd", f"{lp_wd:.6g}",
+                ]
+                commands.append(cmd)
+        
+        elif method in ['tip_adapter', 'lp++']:
+            for adapter_wd in BASELINE_ADAPTER_WD:
+                hparams = {'adapter_wd': adapter_wd}
+                results_json = _expected_baseline_paths(
+                    model=model, dataset=dataset, method=method, k=k, **hparams
+                )
+                if _path_exists(results_json):
+                    print(
+                        f"[skip] baseline {model} {dataset} (method={method}, k={k}) -> {results_json}",
+                        flush=True,
+                    )
+                    continue
+                
+                cmd = [
+                    sys.executable,
+                    "baselines_train_remote_sensing.py",
+                    "--model", model,
+                    "--baseline_method", method,
+                    "--k", str(k),
+                    "--target_dataset", dataset,
+                    "--adapter_wd", f"{adapter_wd:.6g}",
+                ]
+                commands.append(cmd)
+        
+        elif method == 'lora':
+            for lora_r, lora_alpha, lora_lr, lora_epochs, lora_wd in itertools.product(
+                BASELINE_LORA_R, BASELINE_LORA_ALPHA, BASELINE_LORA_LR, 
+                BASELINE_LORA_EPOCHS, BASELINE_LORA_WD
+            ):
+                hparams = {
+                    'lora_r': lora_r,
+                    'lora_alpha': lora_alpha,
+                    'lora_lr': lora_lr,
+                    'lora_epochs': lora_epochs,
+                    'lora_wd': lora_wd,
+                }
+                results_json = _expected_baseline_paths(
+                    model=model, dataset=dataset, method=method, k=k, **hparams
+                )
+                if _path_exists(results_json):
+                    print(
+                        f"[skip] baseline {model} {dataset} (method={method}, k={k}) -> {results_json}",
+                        flush=True,
+                    )
+                    continue
+                
+                cmd = [
+                    sys.executable,
+                    "baselines_train_remote_sensing.py",
+                    "--model", model,
+                    "--baseline_method", method,
+                    "--k", str(k),
+                    "--target_dataset", dataset,
+                    "--lora_r", str(lora_r),
+                    "--lora_alpha", f"{lora_alpha:.6g}",
+                    "--lora_lr", f"{lora_lr:.6g}",
+                    "--lora_epochs", str(lora_epochs),
+                    "--lora_wd", f"{lora_wd:.6g}",
+                ]
+                commands.append(cmd)
+    
+    return commands
+
+
 def run_commands_in_parallel(
     commands: Sequence[Sequence[str]],
     gpu_ids: Sequence[int],
@@ -455,6 +613,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-energy", action="store_true", help="Skip energy sweeps")
     parser.add_argument("--skip-atlas", action="store_true", help="Skip atlas sweeps")
+    parser.add_argument("--skip-baselines", action="store_true", help="Skip baseline sweeps")
     parser.add_argument(
         "--use_best_hyper",
         action="store_true",
@@ -497,9 +656,11 @@ def main() -> None:
         commands.extend(build_energy_commands(datasets, use_best_hyper=args.use_best_hyper))
     if not args.skip_atlas:
         commands.extend(build_atlas_commands(datasets))
+    if not args.skip_baselines:
+        commands.extend(build_baseline_commands(datasets))
 
     if not commands:
-        print("Nothing to run (both sweeps skipped).", file=sys.stderr)
+        print("Nothing to run (all sweeps skipped).", file=sys.stderr)
         return
 
     if args.shuffle:
