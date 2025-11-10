@@ -215,59 +215,148 @@ ATLAS_MODELS = ["ViT-B-16"]
 ATLAS_ADAPTERS = ["none", "lp++", "tip"]
 ATLAS_K = [16]
 
-def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
+# Best Energy hyperparameter configurations from evaluation
+# Note: These are from remote sensing evaluation, may need adjustment for other datasets
+BEST_ENERGY_CONFIGS = {
+    "ViT-B-16": {
+        1: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.1},
+        2: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.05},
+        4: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.01},
+        8: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+        16: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+    },
+    "ViT-B-32": {
+        1: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+        2: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.1},
+        4: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+        8: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.1},
+        16: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+    },
+    "ViT-L-14": {
+        1: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+        2: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+        4: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+        8: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.01},
+        16: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
+    },
+}
+
+def build_energy_commands(datasets: Sequence[str], use_best_hyper: bool = False) -> List[List[str]]:
     commands: List[List[str]] = []
-    for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio in itertools.product(
-        ENERGY_MODELS,
-        ENERGY_INITIALIZE_SIGMA,
-        ENERGY_ADAPTERS,
-        datasets,
-        ENERGY_K,
-        ENERGY_SVD_KEEP_TOPK,
-        ENERGY_SIGMA_LR,
-        ENERGY_SIGMA_WD,
-        ENERGY_WARMUP_RATIO,
-    ):
-        _, results_json = _expected_energy_paths(
-            model=model,
-            dataset=dataset,
-            init_mode=init_mode,
-            adapter=adapter,
-            sigma_lr=sigma_lr,
-            topk=topk,
-            sigma_wd=sigma_wd,
-            k=int(k),
-            warmup_ratio=warmup_ratio,
-        )
-        if _path_exists(results_json):
-            print(
-                f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}, warmup={warmup_ratio}) -> {results_json}",
-                flush=True,
+    
+    if use_best_hyper:
+        # Use best hyperparameter configurations
+        print("Using best hyperparameter configurations for Energy...")
+        for model, adapter, dataset, k in itertools.product(
+            ENERGY_MODELS,
+            ENERGY_ADAPTERS,
+            datasets,
+            ENERGY_K,
+        ):
+            if model not in BEST_ENERGY_CONFIGS or k not in BEST_ENERGY_CONFIGS[model]:
+                print(f"[warning] No best config for {model} k={k}, skipping...", flush=True)
+                continue
+            
+            best_config = BEST_ENERGY_CONFIGS[model][k]
+            init_mode = best_config["init"]
+            sigma_lr = best_config["sigma_lr"]
+            topk = best_config["topk"]
+            sigma_wd = best_config["wd"]
+            warmup_ratio = best_config["warmup"]
+            
+            _, results_json = _expected_energy_paths(
+                model=model,
+                dataset=dataset,
+                init_mode=init_mode,
+                adapter=adapter,
+                sigma_lr=sigma_lr,
+                topk=topk,
+                sigma_wd=sigma_wd,
+                k=int(k),
+                warmup_ratio=warmup_ratio,
             )
-            continue
-        cmd = [
-            sys.executable,
-            "energy_train_reverse.py",
-            "--model",
-            model,
-            "--initialize_sigma",
-            init_mode,
-            "--k",
-            str(k),
-            "--test_dataset",
-            dataset,
-            "--svd_keep_topk",
-            str(topk),
-            "--sigma_lr",
-            f"{sigma_lr:.6g}",
-            "--sigma_wd",
-            f"{sigma_wd:.6g}",
-            "--warmup_ratio",
-            f"{warmup_ratio:.6g}",
-            "--adapter",
-            adapter,
-        ]
-        commands.append(cmd)
+            if _path_exists(results_json):
+                print(
+                    f"[skip] energy {model} {dataset} (BEST: init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}) -> {results_json}",
+                    flush=True,
+                )
+                continue
+            cmd = [
+                sys.executable,
+                "energy_train_reverse.py",
+                "--model",
+                model,
+                "--initialize_sigma",
+                init_mode,
+                "--k",
+                str(k),
+                "--test_dataset",
+                dataset,
+                "--svd_keep_topk",
+                str(topk),
+                "--sigma_lr",
+                f"{sigma_lr:.6g}",
+                "--sigma_wd",
+                f"{sigma_wd:.6g}",
+                "--warmup_ratio",
+                f"{warmup_ratio:.6g}",
+                "--adapter",
+                adapter,
+            ]
+            commands.append(cmd)
+    else:
+        # Original grid search
+        for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio in itertools.product(
+            ENERGY_MODELS,
+            ENERGY_INITIALIZE_SIGMA,
+            ENERGY_ADAPTERS,
+            datasets,
+            ENERGY_K,
+            ENERGY_SVD_KEEP_TOPK,
+            ENERGY_SIGMA_LR,
+            ENERGY_SIGMA_WD,
+            ENERGY_WARMUP_RATIO,
+        ):
+            _, results_json = _expected_energy_paths(
+                model=model,
+                dataset=dataset,
+                init_mode=init_mode,
+                adapter=adapter,
+                sigma_lr=sigma_lr,
+                topk=topk,
+                sigma_wd=sigma_wd,
+                k=int(k),
+                warmup_ratio=warmup_ratio,
+            )
+            if _path_exists(results_json):
+                print(
+                    f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}, warmup={warmup_ratio}) -> {results_json}",
+                    flush=True,
+                )
+                continue
+            cmd = [
+                sys.executable,
+                "energy_train_reverse.py",
+                "--model",
+                model,
+                "--initialize_sigma",
+                init_mode,
+                "--k",
+                str(k),
+                "--test_dataset",
+                dataset,
+                "--svd_keep_topk",
+                str(topk),
+                "--sigma_lr",
+                f"{sigma_lr:.6g}",
+                "--sigma_wd",
+                f"{sigma_wd:.6g}",
+                "--warmup_ratio",
+                f"{warmup_ratio:.6g}",
+                "--adapter",
+                adapter,
+            ]
+            commands.append(cmd)
     return commands
 
 
@@ -374,6 +463,11 @@ def main() -> None:
     parser.add_argument("--skip-energy", action="store_true", help="Skip energy sweeps")
     parser.add_argument("--skip-atlas", action="store_true", help="Skip atlas sweeps")
     parser.add_argument(
+        "--use_best_hyper",
+        action="store_true",
+        help="Use best hyperparameter configurations for Energy (instead of grid search)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands without executing them",
@@ -408,7 +502,7 @@ def main() -> None:
 
     commands: List[List[str]] = []
     if not args.skip_energy:
-        commands.extend(build_energy_commands(datasets))
+        commands.extend(build_energy_commands(datasets, use_best_hyper=args.use_best_hyper))
     if not args.skip_atlas:
         commands.extend(build_atlas_commands(datasets))
 

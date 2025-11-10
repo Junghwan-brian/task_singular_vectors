@@ -438,15 +438,15 @@ def train_adapter(
             f"[adapter:{display_choice}] epoch {epoch}: train loss {avg_epoch_loss:.6f}"
         )
 
-        if epoch in eval_epochs:
-            acc = evaluate_adapter_model(adapter_model, val_loader, device)
-            record_validation("epoch", epoch, acc)
-            logger.info(
-                f"[adapter:{display_choice}] epoch {epoch}: accuracy {acc * 100:.2f}%"
-            )
-            if acc > best_acc:
-                best_acc = acc
-                best_state = copy.deepcopy(adapter_model.state_dict())
+        # if epoch in eval_epochs:
+        #     acc = evaluate_adapter_model(adapter_model, val_loader, device)
+        #     record_validation("epoch", epoch, acc)
+        #     logger.info(
+        #         f"[adapter:{display_choice}] epoch {epoch}: accuracy {acc * 100:.2f}%"
+        #     )
+        #     if acc > best_acc:
+        #         best_acc = acc
+        #         best_state = copy.deepcopy(adapter_model.state_dict())
 
     adapter_model.load_state_dict(best_state)
     final_acc = evaluate_adapter_model(adapter_model, val_loader, device)

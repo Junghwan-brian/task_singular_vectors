@@ -23,13 +23,13 @@ from tqdm.auto import tqdm
 # Disable problematic attention backends that cause "No execution plans support the graph" error
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_cudnn_sdp(False)
-# Additional cuDNN settings for H100 compatibility
-torch.backends.cudnn.allow_tf32 = False
-torch.backends.cuda.matmul.allow_tf32 = False
-# Set cuDNN benchmark to False for stability
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
+# torch.backends.cuda.enable_cudnn_sdp(False)
+# # Additional cuDNN settings for H100 compatibility
+# torch.backends.cudnn.allow_tf32 = False
+# torch.backends.cuda.matmul.allow_tf32 = False
+# # Set cuDNN benchmark to False for stability
+# torch.backends.cudnn.benchmark = False
+# torch.backends.cudnn.deterministic = True
 
 from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
@@ -432,15 +432,15 @@ def train_adapter_remote(
             f"[adapter:{display_choice}] epoch {epoch}: train loss {avg_epoch_loss:.6f}"
         )
 
-        if epoch in eval_epochs:
-            acc = evaluate_adapter_model(adapter_model, val_loader, device)
-            record_validation("epoch", epoch, acc)
-            logger.info(
-                f"[adapter:{display_choice}] epoch {epoch}: accuracy {acc * 100:.2f}%"
-            )
-            if acc > best_acc:
-                best_acc = acc
-                best_state = copy.deepcopy(adapter_model.state_dict())
+        # if epoch in eval_epochs:
+        #     acc = evaluate_adapter_model(adapter_model, val_loader, device)
+        #     record_validation("epoch", epoch, acc)
+        #     logger.info(
+        #         f"[adapter:{display_choice}] epoch {epoch}: accuracy {acc * 100:.2f}%"
+        #     )
+        #     if acc > best_acc:
+        #         best_acc = acc
+        #         best_state = copy.deepcopy(adapter_model.state_dict())
 
     adapter_model.load_state_dict(best_state)
     final_acc = evaluate_adapter_model(adapter_model, val_loader, device)
