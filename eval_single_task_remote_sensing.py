@@ -700,19 +700,26 @@ def create_comprehensive_table(
                         data_structure[model_name][shot_name][other_key][dataset_name] = accuracies[0]
     
     # Create table
-    # Columns: Shot | Method | Dataset1 | Dataset2 | ... | Average
-    col_labels = ['Shot', 'Method'] + all_datasets + ['Average']
+    # Columns: Model | Shot | Method | Dataset1 | Dataset2 | ... | Average
+    col_labels = ['Model', 'Shot', 'Method'] + all_datasets + ['Average']
     
-    # Prepare table content
+    # Prepare table content with row metadata
     table_content = []
+    row_metadata = []  # Store (model, shot, method) for each row
     
     for model_name in models:
-        # Add model header row (merged cells effect via formatting later)
-        for shot_name in shot_order:
+        for shot_idx, shot_name in enumerate(shot_order):
             shot_display = shot_name.replace('shots', '')
             
-            for method_key in method_list:
-                row = [shot_display, format_method_label(method_key)]
+            for method_idx, method_key in enumerate(method_list):
+                # First method in shot shows model name (for first shot only) and shot number
+                if method_idx == 0:
+                    if shot_idx == 0:
+                        row = [model_name, shot_display, format_method_label(method_key)]
+                    else:
+                        row = ['', shot_display, format_method_label(method_key)]
+                else:
+                    row = ['', '', format_method_label(method_key)]
                 
                 # Get accuracy for each dataset
                 accuracies = []
@@ -732,10 +739,17 @@ def create_comprehensive_table(
                     row.append("-")
                 
                 table_content.append(row)
+                row_metadata.append((model_name, shot_name, method_key))
+            
+            # Add separator row between shots (not after last shot of a model)
+            if shot_idx < len(shot_order) - 1:
+                table_content.append([''] * len(col_labels))
+                row_metadata.append((None, None, None))
         
         # Add separator row between models (visual separation)
         if model_name != models[-1]:
             table_content.append([''] * len(col_labels))
+            row_metadata.append((None, None, None))
     
     # Create figure
     n_rows = len(table_content)
@@ -768,54 +782,66 @@ def create_comprehensive_table(
         cell.set_facecolor('#4CAF50')
         cell.set_text_props(weight='bold', color='white', fontsize=9)
     
-    # Color first two columns (Shot and Method)
+    # Color first three columns (Model, Shot, Method)
     for i in range(len(table_content)):
-        for j in range(2):
+        for j in range(3):
             cell = table[(i+1, j)]
-            cell.set_facecolor('#E8F5E9')
             if table_content[i][j]:  # Not empty separator row
-                cell.set_text_props(weight='bold', ha='left' if j == 1 else 'center')
+                cell.set_facecolor('#E8F5E9')
+                if j == 0:  # Model column
+                    cell.set_text_props(weight='bold', ha='center', fontsize=9)
+                elif j == 1:  # Shot column
+                    cell.set_text_props(weight='bold', ha='center')
+                else:  # Method column
+                    cell.set_text_props(weight='bold', ha='left')
     
-    # Color average column
-    avg_col_idx = len(col_labels) - 1
+    # Highlight Energy(best) and Atlas rows with special colors
     for i in range(len(table_content)):
-        cell = table[(i+1, avg_col_idx)]
-        if table_content[i][avg_col_idx] != "-" and table_content[i][avg_col_idx] != "":
-            cell.set_facecolor('#FFE0B2')
-            cell.set_text_props(weight='bold')
+        model, shot, method = row_metadata[i]
+        if method:
+            method_label = format_method_label(method)
+            
+            # Energy(best) - light green background
+            if method == 'Energy (best config)':
+                for j in range(3, len(col_labels)):
+                    cell = table[(i+1, j)]
+                    if table_content[i][j] and table_content[i][j] != "-":
+                        cell.set_facecolor('#C8E6C9')
+            
+            # Atlas (without any adapter) - light blue background
+            elif method == 'Atlas_none':
+                for j in range(3, len(col_labels)):
+                    cell = table[(i+1, j)]
+                    if table_content[i][j] and table_content[i][j] != "-":
+                        cell.set_facecolor('#BBDEFB')
     
-    # Highlight best values per dataset column (excluding Shot, Method, and Average columns)
-    for col_idx in range(2, len(col_labels) - 1):
-        values = []
-        for row_idx in range(len(table_content)):
-            cell_text = table_content[row_idx][col_idx]
-            if cell_text != "-" and cell_text != "":
-                try:
-                    values.append((float(cell_text), row_idx))
-                except:
-                    pass
-        
-        if values:
-            max_val, max_row_idx = max(values, key=lambda x: x[0])
-            cell = table[(max_row_idx + 1, col_idx)]
-            cell.set_facecolor('#FFEB3B')
-            cell.set_text_props(weight='bold')
-    
-    # Highlight best values in Average column
-    values = []
-    for row_idx in range(len(table_content)):
-        cell_text = table_content[row_idx][avg_col_idx]
-        if cell_text != "-" and cell_text != "":
-            try:
-                values.append((float(cell_text), row_idx))
-            except:
-                pass
-    
-    if values:
-        max_val, max_row_idx = max(values, key=lambda x: x[0])
-        cell = table[(max_row_idx + 1, avg_col_idx)]
-        cell.set_facecolor('#FFEB3B')
-        cell.set_text_props(weight='bold')
+    # Highlight best values per model/shot combination with gold color
+    # Group by model and shot
+    current_group_start = 0
+    for i in range(len(table_content) + 1):
+        # Check if we reached end of a shot group (empty row or end of list)
+        if i == len(table_content) or row_metadata[i][0] is None:
+            # Process the current group
+            if current_group_start < i:
+                # For each dataset column (and average), find best value in this group
+                for col_idx in range(3, len(col_labels)):
+                    values = []
+                    for row_idx in range(current_group_start, i):
+                        cell_text = table_content[row_idx][col_idx]
+                        if cell_text != "-" and cell_text != "":
+                            try:
+                                values.append((float(cell_text), row_idx))
+                            except:
+                                pass
+                    
+                    if values:
+                        max_val, max_row_idx = max(values, key=lambda x: x[0])
+                        cell = table[(max_row_idx + 1, col_idx)]
+                        cell.set_facecolor('#FFD700')  # Gold color
+                        cell.set_text_props(weight='bold')
+            
+            # Move to next group
+            current_group_start = i + 1
     
     plt.title('Few-Shot Remote Sensing Results - All Datasets and Average', 
               fontsize=16, fontweight='bold', pad=20)
