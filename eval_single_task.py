@@ -309,9 +309,36 @@ def format_baseline_label(baseline: Dict[str, Any]) -> str:
         label = f"Atlas(lr={lr})"
         if adapter != 'none':
             label += f" + {adapter.upper()}"
-    elif method in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
-        # Baseline methods - just use method name
+    elif method == 'LinearProbe':
+        # Show LinearProbe hyperparameters from config_tag
+        config_tag = baseline.get('config_tag', '')
+        if config_tag and config_tag.startswith('baseline_lp_'):
+            parts = config_tag.replace('baseline_lp_', '').split('_')
+            if len(parts) >= 2:
+                lr = parts[0].replace('p', '.')
+                epochs = parts[1]
+                label = f"LinearProbe(lr={lr}, ep={epochs})"
+            else:
+                label = method
+        else:
+            label = method
+    elif method in ['TIP', 'LP++']:
+        # TIP and LP++ usually don't have many hyperparameters shown
         label = method
+    elif method == 'LoRA':
+        # Show LoRA hyperparameters from config_tag
+        config_tag = baseline.get('config_tag', '')
+        if config_tag and config_tag.startswith('baseline_lora_'):
+            parts = config_tag.replace('baseline_lora_', '').split('_')
+            if len(parts) >= 3:
+                r = parts[0]
+                alpha = parts[1].replace('p', '.')
+                lr = parts[2].replace('p', '.')
+                label = f"LoRA(r={r}, α={alpha}, lr={lr})"
+            else:
+                label = method
+        else:
+            label = method
     else:
         label = method
         if adapter != 'none':
@@ -456,9 +483,61 @@ def aggregate_across_datasets(all_results: Dict) -> Dict[str, Dict[str, Dict[str
     return averaged
 
 
-def select_best_energy_config(averaged_results: Dict) -> Dict[str, Dict[str, tuple]]:
+def select_best_energy_config_per_dataset(
+    all_results: Dict
+) -> Dict[str, Dict[str, Dict[str, tuple]]]:
     """
-    For each model and shot, select the best Energy hyperparameter configuration.
+    For each dataset, model, and shot, select the best Energy hyperparameter configuration.
+    
+    Returns:
+        {
+            'AID': {
+                'ViT-B-32': {
+                    '16shots': ('Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0', 85.5, 'energy_14_0p001_4_average_0p1_0p0'),
+                    ...
+                },
+                ...
+            },
+            ...
+        }
+    """
+    best_energy_per_dataset = defaultdict(lambda: defaultdict(dict))
+    
+    for model_name, datasets in all_results.items():
+        for dataset_name, shots in datasets.items():
+            for shot_name, baselines in shots.items():
+                # Filter Energy baselines
+                energy_baselines = [
+                    b for b in baselines if b['method'] == 'Energy'
+                ]
+                
+                if energy_baselines:
+                    # Select best performing Energy configuration
+                    best_baseline = max(energy_baselines, key=lambda b: b['accuracy'])
+                    
+                    # Build config key
+                    lr = best_baseline.get('lr', 'unknown')
+                    topk = best_baseline.get('svd_keep_topk', 'unknown')
+                    init = best_baseline.get('initialize_sigma', 'unknown')
+                    warmup = best_baseline.get('warmup_ratio', 'unknown')
+                    wd = best_baseline.get('sigma_wd', '0.0')
+                    config_key = f"Energy_lr={lr}_k={topk}_init={init}_w={warmup}_wd={wd}"
+                    
+                    best_energy_per_dataset[dataset_name][model_name][shot_name] = (
+                        config_key,
+                        best_baseline['accuracy'],
+                        best_baseline.get('config_tag', '')
+                    )
+    
+    return dict(best_energy_per_dataset)
+
+
+def compute_averaged_best_energy_configs(
+    best_energy_per_dataset: Dict
+) -> Dict[str, Dict[str, tuple]]:
+    """
+    Compute averaged best Energy configs across datasets for each model/shot.
+    Used for the aggregated table visualization.
     
     Returns:
         {
@@ -469,21 +548,31 @@ def select_best_energy_config(averaged_results: Dict) -> Dict[str, Dict[str, tup
             ...
         }
     """
-    best_energy = {}
+    # Group by model and shot, average accuracy across datasets
+    grouped = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     
-    for model_name, shots in averaged_results.items():
-        best_energy[model_name] = {}
-        for shot_name, methods in shots.items():
-            # Filter Energy methods
-            energy_methods = {k: v for k, v in methods.items() if k.startswith('Energy_')}
-            
-            if energy_methods:
-                # Select best performing Energy configuration
-                best_key = max(energy_methods, key=energy_methods.get)
-                best_acc = energy_methods[best_key]
-                best_energy[model_name][shot_name] = (best_key, best_acc)
+    for dataset, models in best_energy_per_dataset.items():
+        for model, shots in models.items():
+            for shot, (config_key, accuracy, config_tag) in shots.items():
+                grouped[model][shot][config_key].append(accuracy)
     
-    return best_energy
+    # Select best average config for each model/shot
+    best_avg = {}
+    for model, shots in grouped.items():
+        best_avg[model] = {}
+        for shot, configs in shots.items():
+            # Average accuracy for each config
+            config_averages = {
+                config_key: sum(accuracies) / len(accuracies)
+                for config_key, accuracies in configs.items()
+            }
+            # Select best
+            if config_averages:
+                best_key = max(config_averages, key=config_averages.get)
+                best_acc = config_averages[best_key]
+                best_avg[model][shot] = (best_key, best_acc)
+    
+    return best_avg
 
 
 def visualize_aggregated_table(
@@ -652,13 +741,14 @@ def visualize_aggregated_table(
 
 def create_comprehensive_table(
     all_results: Dict,
-    best_energy_configs: Dict,
+    best_energy_per_dataset: Dict,
     output_dir: str
 ) -> None:
     """
     Create a single comprehensive table with datasets as columns.
     Rows are organized by (Model, Shot, Method).
     Last column shows the average across datasets.
+    Uses dataset-specific best Energy configurations.
     """
     # Define shot order
     shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
@@ -727,11 +817,12 @@ def create_comprehensive_table(
                     else:
                         other_baselines[f'{method}_{adapter}'].append(accuracy)
                 
-                # For Energy, select best config FOR THIS DATASET (not global average)
-                if energy_baselines:
-                    # Find the best performing Energy config for this specific dataset
-                    best_baseline, best_acc = max(energy_baselines, key=lambda x: x[1])
-                    data_structure[model_name][shot_name]['Energy (best config)'][dataset_name] = best_acc
+                # For Energy, use dataset-specific best config from best_energy_per_dataset
+                if dataset_name in best_energy_per_dataset:
+                    if model_name in best_energy_per_dataset[dataset_name]:
+                        if shot_name in best_energy_per_dataset[dataset_name][model_name]:
+                            _, best_acc, _ = best_energy_per_dataset[dataset_name][model_name][shot_name]
+                            data_structure[model_name][shot_name]['Energy (best config)'][dataset_name] = best_acc
                 
                 # For Atlas
                 for atlas_key, accuracies in atlas_baselines.items():
@@ -981,19 +1072,43 @@ def main():
     
     logger.info(f"\nFound {len(all_results)} models")
     
+    # Select best Energy configurations per dataset
+    logger.info("\nSelecting best Energy configurations per dataset...")
+    best_energy_per_dataset = select_best_energy_config_per_dataset(all_results)
+    
+    # Save best Energy configurations to JSON for future use (e.g., adapter training)
+    best_config_path = os.path.join(args.output_dir, 'best_energy_configs_per_dataset.json')
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(best_config_path, 'w') as f:
+        # Convert to serializable format
+        serializable_config = {}
+        for dataset, models in best_energy_per_dataset.items():
+            serializable_config[dataset] = {}
+            for model, shots in models.items():
+                serializable_config[dataset][model] = {}
+                for shot, (config_key, accuracy, config_tag) in shots.items():
+                    serializable_config[dataset][model][shot] = {
+                        'config_key': config_key,
+                        'accuracy': accuracy,
+                        'config_tag': config_tag
+                    }
+        json.dump(serializable_config, f, indent=2)
+    logger.info(f"Saved best Energy configs per dataset to: {best_config_path}")
+    
     # Generate aggregated visualization
     logger.info("\nAggregating results across datasets...")
     averaged_results = aggregate_across_datasets(all_results)
     
-    logger.info("Selecting best Energy configurations...")
-    best_energy_configs = select_best_energy_config(averaged_results)
+    # For visualization, still compute average best configs
+    logger.info("Computing averaged best Energy configurations...")
+    best_energy_configs_avg = compute_averaged_best_energy_configs(best_energy_per_dataset)
     
     logger.info("Generating aggregated visualization...")
-    visualize_aggregated_table(averaged_results, best_energy_configs, args.output_dir)
+    visualize_aggregated_table(averaged_results, best_energy_configs_avg, args.output_dir)
     
     # Generate comprehensive table with all datasets as columns
     logger.info("\nGenerating comprehensive table (all datasets + average)...")
-    create_comprehensive_table(all_results, best_energy_configs, args.output_dir)
+    create_comprehensive_table(all_results, best_energy_per_dataset, args.output_dir)
     
     # Generate individual visualizations if not aggregate_only
     if not args.aggregate_only:

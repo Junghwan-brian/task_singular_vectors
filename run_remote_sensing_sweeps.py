@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import os
 import random
 import subprocess
@@ -205,165 +206,80 @@ ENERGY_SIGMA_LR = [1e-2, 1e-3, 5e-3]
 ENERGY_SIGMA_WD = [0.0]
 ENERGY_WARMUP_RATIO = [0.1]
 
-ATLAS_MODELS = ["ViT-B-16"]
+ATLAS_MODELS = ["ViT-L-14", "ViT-B-16", "ViT-B-32"]
 ATLAS_ADAPTERS = ["none", "lp++", "tip"]
 ATLAS_K = [1,2,4,8,16]
 
 # Baseline configurations
-BASELINE_MODELS = ["ViT-B-16"]
-BASELINE_METHODS = ["linear_probe", "tip_adapter", "lp++", "lora"]
+BASELINE_MODELS = ["ViT-L-14", "ViT-B-16", "ViT-B-32"]
+BASELINE_METHODS = ["lp++", "lora"]
 BASELINE_K = [1,2,4,8,16]
-BASELINE_LP_LR = [1e-3]
+BASELINE_LP_LR = [1e-3, 1e-4]
 BASELINE_LP_EPOCHS = [20]
 BASELINE_LP_WD = [0.0]
 BASELINE_ADAPTER_WD = [0.0]
 BASELINE_LORA_R = [8]
-BASELINE_LORA_ALPHA = [16.0]
-BASELINE_LORA_LR = [1e-4]
+BASELINE_LORA_ALPHA = [32.0]
+BASELINE_LORA_LR = [3e-5]
 BASELINE_LORA_EPOCHS = [20]
 BASELINE_LORA_WD = [0.0]
 
-# Best Energy hyperparameter configurations from evaluation
-BEST_ENERGY_CONFIGS = {
-    "ViT-B-16": {
-        1: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.1},
-        2: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.05},
-        4: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.01},
-        8: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-        16: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-    },
-    "ViT-B-32": {
-        1: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-        2: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.1},
-        4: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-        8: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.1},
-        16: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-    },
-    "ViT-L-14": {
-        1: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-        2: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-        4: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-        8: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.01},
-        16: {"sigma_lr": 1e-3, "topk": 12, "init": "sum", "warmup": 0.1, "wd": 0.001},
-    },
-}
-
-def build_energy_commands(datasets: Sequence[str], use_best_hyper: bool = False) -> List[List[str]]:
+def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
+    """Build Energy grid search commands."""
     commands: List[List[str]] = []
     
-    if use_best_hyper:
-        # Use best hyperparameter configurations
-        print("Using best hyperparameter configurations for Energy...")
-        for model, adapter, dataset, k in itertools.product(
-            ENERGY_MODELS,
-            ENERGY_ADAPTERS,
-            datasets,
-            ENERGY_K,
-        ):
-            if model not in BEST_ENERGY_CONFIGS or k not in BEST_ENERGY_CONFIGS[model]:
-                print(f"[warning] No best config for {model} k={k}, skipping...", flush=True)
-                continue
-            
-            best_config = BEST_ENERGY_CONFIGS[model][k]
-            init_mode = best_config["init"]
-            sigma_lr = best_config["sigma_lr"]
-            topk = best_config["topk"]
-            sigma_wd = best_config["wd"]
-            warmup_ratio = best_config["warmup"]
-            
-            _, results_json = _expected_energy_paths(
-                model=model,
-                dataset=dataset,
-                init_mode=init_mode,
-                adapter=adapter,
-                sigma_lr=sigma_lr,
-                topk=topk,
-                sigma_wd=sigma_wd,
-                k=int(k),
-                warmup_ratio=warmup_ratio,
+    for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio in itertools.product(
+        ENERGY_MODELS,
+        ENERGY_INITIALIZE_SIGMA,
+        ENERGY_ADAPTERS,
+        datasets,
+        ENERGY_K,
+        ENERGY_SVD_KEEP_TOPK,
+        ENERGY_SIGMA_LR,
+        ENERGY_SIGMA_WD,
+        ENERGY_WARMUP_RATIO,
+    ):
+        _, results_json = _expected_energy_paths(
+            model=model,
+            dataset=dataset,
+            init_mode=init_mode,
+            adapter=adapter,
+            sigma_lr=sigma_lr,
+            topk=topk,
+            sigma_wd=sigma_wd,
+            k=int(k),
+            warmup_ratio=warmup_ratio,
+        )
+        if _path_exists(results_json):
+            print(
+                f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}, warmup={warmup_ratio}) -> {results_json}",
+                flush=True,
             )
-            if _path_exists(results_json):
-                print(
-                    f"[skip] energy {model} {dataset} (BEST: init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}) -> {results_json}",
-                    flush=True,
-                )
-                continue
-            cmd = [
-                sys.executable,
-                "energy_train_remote_sensing.py",
-                "--model",
-                model,
-                "--initialize_sigma",
-                init_mode,
-                "--k",
-                str(k),
-                "--test_dataset",
-                dataset,
-                "--svd_keep_topk",
-                str(topk),
-                "--sigma_lr",
-                f"{sigma_lr:.6g}",
-                "--sigma_wd",
-                f"{sigma_wd:.6g}",
-                "--warmup_ratio",
-                f"{warmup_ratio:.6g}",
-                "--adapter",
-                adapter,
-            ]
-            commands.append(cmd)
-    else:
-        # Original grid search
-        for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio in itertools.product(
-            ENERGY_MODELS,
-            ENERGY_INITIALIZE_SIGMA,
-            ENERGY_ADAPTERS,
-            datasets,
-            ENERGY_K,
-            ENERGY_SVD_KEEP_TOPK,
-            ENERGY_SIGMA_LR,
-            ENERGY_SIGMA_WD,
-            ENERGY_WARMUP_RATIO,
-        ):
-            _, results_json = _expected_energy_paths(
-                model=model,
-                dataset=dataset,
-                init_mode=init_mode,
-                adapter=adapter,
-                sigma_lr=sigma_lr,
-                topk=topk,
-                sigma_wd=sigma_wd,
-                k=int(k),
-                warmup_ratio=warmup_ratio,
-            )
-            if _path_exists(results_json):
-                print(
-                    f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}, warmup={warmup_ratio}) -> {results_json}",
-                    flush=True,
-                )
-                continue
-            cmd = [
-                sys.executable,
-                "energy_train_remote_sensing.py",
-                "--model",
-                model,
-                "--initialize_sigma",
-                init_mode,
-                "--k",
-                str(k),
-                "--test_dataset",
-                dataset,
-                "--svd_keep_topk",
-                str(topk),
-                "--sigma_lr",
-                f"{sigma_lr:.6g}",
-                "--sigma_wd",
-                f"{sigma_wd:.6g}",
-                "--warmup_ratio",
-                f"{warmup_ratio:.6g}",
-                "--adapter",
-                adapter,
-            ]
-            commands.append(cmd)
+            continue
+        cmd = [
+            sys.executable,
+            "energy_train_remote_sensing.py",
+            "--model",
+            model,
+            "--initialize_sigma",
+            init_mode,
+            "--k",
+            str(k),
+            "--test_dataset",
+            dataset,
+            "--svd_keep_topk",
+            str(topk),
+            "--sigma_lr",
+            f"{sigma_lr:.6g}",
+            "--sigma_wd",
+            f"{sigma_wd:.6g}",
+            "--warmup_ratio",
+            f"{warmup_ratio:.6g}",
+            "--adapter",
+            adapter,
+        ]
+        commands.append(cmd)
+    
     return commands
 
 
@@ -462,12 +378,12 @@ def build_baseline_commands(datasets: Sequence[str]) -> List[List[str]]:
                 results_json = _expected_baseline_paths(
                     model=model, dataset=dataset, method=method, k=k, **hparams
                 )
-                if _path_exists(results_json):
-                    print(
-                        f"[skip] baseline {model} {dataset} (method={method}, k={k}) -> {results_json}",
-                        flush=True,
-                    )
-                    continue
+                # if _path_exists(results_json):
+                #     print(
+                #         f"[skip] baseline {model} {dataset} (method={method}, k={k}) -> {results_json}",
+                #         flush=True,
+                #     )
+                #     continue
                 
                 cmd = [
                     sys.executable,
@@ -609,15 +525,91 @@ def run_commands_in_parallel(
             print("  " + " ".join(cmd))
 
 
+def build_energy_adapter_commands(datasets: Sequence[str], best_config_file: str) -> List[List[str]]:
+    """Build Energy + Adapter (TIP/LP++) commands using best configs per dataset."""
+    commands: List[List[str]] = []
+    
+    if not os.path.exists(best_config_file):
+        print(f"[warning] Best config file not found: {best_config_file}", flush=True)
+        return commands
+    
+    try:
+        with open(best_config_file, 'r') as f:
+            best_configs = json.load(f)
+    except Exception as e:
+        print(f"[warning] Failed to load best config file: {e}", flush=True)
+        return commands
+    
+    adapters = ['tip', 'lp++']
+    
+    for dataset in datasets:
+        if dataset not in best_configs:
+            continue
+        
+        for model in best_configs[dataset]:
+            for shot in best_configs[dataset][model]:
+                config_data = best_configs[dataset][model][shot]
+                config_tag = config_data.get('config_tag', '')
+                
+                if not config_tag:
+                    continue
+                
+                # Parse config tag to extract hyperparameters
+                # Format: energy_{num_tasks}_{lr}_{topk}_{init}_{warmup}_{wd}
+                parts = config_tag.split('_')
+                if len(parts) < 7 or parts[0] != 'energy':
+                    continue
+                
+                sigma_lr = parts[2].replace('p', '.')
+                topk = parts[3]
+                init_mode = parts[4]
+                warmup_ratio = parts[5].replace('p', '.')
+                sigma_wd = parts[6].replace('p', '.')
+                
+                k = int(shot.replace('shots', ''))
+                
+                for adapter in adapters:
+                    adapter_tag = _adapter_tag(adapter)
+                    dataset_dir = f"{dataset}Val"
+                    base_dir = os.path.join(MODEL_ROOT, model, dataset_dir, config_tag, _shot_folder(k))
+                    results_json = os.path.join(base_dir, f"energy_results_{adapter_tag}.json")
+                    
+                    if _path_exists(results_json):
+                        print(
+                            f"[skip] energy+{adapter} {model} {dataset} (k={k}) -> {results_json}",
+                            flush=True,
+                        )
+                        continue
+                    
+                    cmd = [
+                        sys.executable,
+                        "energy_train_remote_sensing.py",
+                        "--model", model,
+                        "--initialize_sigma", init_mode,
+                        "--k", str(k),
+                        "--test_dataset", dataset,
+                        "--svd_keep_topk", topk,
+                        "--sigma_lr", sigma_lr,
+                        "--sigma_wd", sigma_wd,
+                        "--warmup_ratio", warmup_ratio,
+                        "--adapter", adapter,
+                    ]
+                    commands.append(cmd)
+    
+    return commands
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-energy", action="store_true", help="Skip energy sweeps")
     parser.add_argument("--skip-atlas", action="store_true", help="Skip atlas sweeps")
     parser.add_argument("--skip-baselines", action="store_true", help="Skip baseline sweeps")
+    parser.add_argument("--skip-energy-adapters", action="store_true", help="Skip Energy + Adapter sweeps")
     parser.add_argument(
-        "--use_best_hyper",
-        action="store_true",
-        help="Use best hyperparameter configurations for Energy (instead of grid search)",
+        "--best_config_file",
+        type=str,
+        default="./results/best_energy_configs_per_dataset.json",
+        help="Path to best Energy configs JSON file for adapter training",
     )
     parser.add_argument(
         "--dry-run",
@@ -653,11 +645,16 @@ def main() -> None:
 
     commands: List[List[str]] = []
     if not args.skip_energy:
-        commands.extend(build_energy_commands(datasets, use_best_hyper=args.use_best_hyper))
+        commands.extend(build_energy_commands(datasets))
     if not args.skip_atlas:
         commands.extend(build_atlas_commands(datasets))
     if not args.skip_baselines:
         commands.extend(build_baseline_commands(datasets))
+    if not args.skip_energy_adapters:
+        energy_adapter_cmds = build_energy_adapter_commands(datasets, args.best_config_file)
+        if energy_adapter_cmds:
+            commands.extend(energy_adapter_cmds)
+            print(f"Added {len(energy_adapter_cmds)} Energy+Adapter commands")
 
     if not commands:
         print("Nothing to run (all sweeps skipped).", file=sys.stderr)
