@@ -1,5 +1,4 @@
 #%%
-#%%
 import os
 import pandas as pd
 import numpy as np
@@ -15,7 +14,12 @@ if os.path.exists(csv_path):
     df_raw = pd.read_csv(csv_path)
 else:
     raise FileNotFoundError(f"파일이 존재하지 않습니다: {csv_path}")
-
+import matplotlib as mpl
+mpl.rcParams.update({
+    "font.family": "DejaVu Sans",   # 대부분 환경에서 기본 제공
+    "font.size": 11,
+    "mathtext.default": "regular"
+})
 # ------------------------------------------------------------
 # 전처리
 # ------------------------------------------------------------
@@ -84,6 +88,7 @@ def save_legend_only(methods, colors, save_path="figures/legend_only.png", fonts
 # ------------------------------------------------------------
 # 레이더 플롯 (추천: 반환값으로 methods/colors를 돌려받아 legend 저장에 재사용)
 # ------------------------------------------------------------
+
 def plot_radar_for_selection(model: str, shot: int,
                              methods_to_show=None, method_idx=None,
                              color_list=None):
@@ -119,7 +124,6 @@ def plot_radar_for_selection(model: str, shot: int,
 
     # 기본 극좌표 세팅
     labels = dataset_cols
-    
     N = len(labels)
     angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
     angles += angles[:1]
@@ -135,29 +139,37 @@ def plot_radar_for_selection(model: str, shot: int,
     ax.grid(False)
 
     # 배경 링 + 시작 오프셋
-    rings = np.linspace(0, 1, 6)
-    base_radius_offset = rings[1]     # 꼴찌 시작 반경(가장 작은 원)
+    rings = np.linspace(0, 1, 6)          # 5개 구간
+    base_radius_offset = rings[1]         # 꼴찌 시작 반경(가장 작은 원)
     theta_bg = np.linspace(0, 2*np.pi, 720)
 
-    # 교차 링 배경 (아래 레이어)
+    # 교차 링 배경
     for i in range(5):
         color_bg = "white" if i % 2 == 0 else "#e0e0e0"
-        ax.fill_between(theta_bg, rings[i], rings[i+1], color=color_bg, alpha=0.3, zorder=-2)
+        ax.fill_between(theta_bg, rings[i], rings[i+1],
+                        color=color_bg, alpha=0.30, zorder=-2)
+
+    # (②) 내부 링 경계선 살짝 진하게
+    ring_edge_color = "#9a9a9a"
+    for rr in rings[1:-1]:  # 내부 경계만
+        ax.plot(theta_bg, np.full_like(theta_bg, rr),
+                color=ring_edge_color, linewidth=0.9, alpha=0.9, zorder=-1)
 
     ax.set_ylim(0, 1.05)
 
-    # 라디얼 가이드 (옅은 선)
-    guide_color = "#bfbfbf"
+    # (③) 라디얼 가이드(방사선) 진하게/굵게
+    guide_color = "#7f7f7f"
     for a in angles[:-1]:
-        ax.plot([a, a], [0, 1.0], color=guide_color, linewidth=0.6, alpha=0.8, zorder=-1)
+        ax.plot([a, a], [0, 1.0], color=guide_color, linewidth=1.2,
+                alpha=0.95, zorder=-1)
 
-    # 바깥 원을 아래 레이어에 (숫자/마커 가리지 않도록)
+    # 바깥 원 (아래 레이어)
     outer_eps = 0.010
     ax.plot(theta_bg, np.ones_like(theta_bg) - outer_eps,
-            color=guide_color, linewidth=0.7, alpha=0.65,
+            color=guide_color, linewidth=0.9, alpha=0.8,
             solid_capstyle="round", zorder=-5)
 
-    # 색상 팔레트 준비 (입력 없으면 tab20에서 필요한 만큼)
+    # 색상 팔레트
     if color_list is None:
         color_list = plt.cm.tab20(np.linspace(0, 1, len(sub)))
     elif len(color_list) < len(sub):
@@ -178,10 +190,10 @@ def plot_radar_for_selection(model: str, shot: int,
 
         # 내부 채움(옅게) → 선(진하게)
         ax.fill(angles, vals, color=color, alpha=0.25, linewidth=0, zorder=2)
-        ax.plot(angles, vals, linewidth=1.8, color=color, alpha=0.9, zorder=3)
+        ax.plot(angles, vals, linewidth=2.0, color=color, alpha=0.95, zorder=3)
 
         # 꼭짓점: 내부 흰색, 테두리 해당 색
-        ax.scatter(angles, vals, s=28, facecolors="white", edgecolors=[color],
+        ax.scatter(angles, vals, s=30, facecolors="white", edgecolors=[color],
                    linewidths=1.2, zorder=4)
 
         # 점수 텍스트(조금 안쪽)
@@ -189,8 +201,7 @@ def plot_radar_for_selection(model: str, shot: int,
             ax.text(
                 a, r - 0.04, f"{raw:.1f}",
                 ha="center", va="center",
-                fontsize=11,                      # ← 크기 키움 (예: 10~12)
-                # fontweight="bold",                # ← 진하게
+                fontsize=11,
                 color="black",
                 zorder=6
             )
@@ -201,13 +212,13 @@ def plot_radar_for_selection(model: str, shot: int,
         ax.text(angle, label_radius, label, fontsize=11, fontweight="bold",
                 ha="center", va="center", zorder=6)
 
-    # 축별 최소값 (중심쪽)
-    for ang, dmin in zip(angles[:-1], data_min.tolist()):
-        ax.text(ang, base_radius_offset - 0.05, f"{dmin:.1f}",
-                ha="center", va="center", fontsize=8, color="gray", zorder=6)
+    # (①) 축별 최소값 회색 텍스트 **제거**: 아래 블록 삭제
+    # for ang, dmin in zip(angles[:-1], data_min.tolist()):
+    #     ax.text(ang, base_radius_offset - 0.05, f"{dmin:.1f}",
+    #             ha="center", va="center", fontsize=8, color="gray", zorder=6)
 
     # 범례는 본 플롯에서 그리지 않음(별도 저장을 위해)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # ✅ 위쪽 여유 확보
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
     return used_methods, used_colors
@@ -221,7 +232,7 @@ if __name__ == "__main__":
     methods_to_use = ["Energy (best)", "LinearProbe (best config)", "TIP (best config)", "LP++ (best config)", "Atlas"]
     custom_colors   = plt.cm.tab20(np.linspace(0, 1, 6))
     used_methods, used_colors = plot_radar_for_selection(
-        "ViT-B-16", 4,
+        "ViT-B-32", 1,
         methods_to_show=methods_to_use,
         color_list=custom_colors
     )
