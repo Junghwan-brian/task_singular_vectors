@@ -58,6 +58,34 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     return logger
 
 
+# Dataset-specific epochs for UFM-Atlas training (general datasets)
+UFM_ATLAS_EPOCHS_PER_DATASET = {
+    # "Cars": 20,
+    "DTD": 20,
+    # "EuroSAT": 20,
+    "GTSRB": 20,
+    "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
+    "SVHN": 20,
+    "CIFAR10": 20,
+    "CIFAR100": 20,
+    "STL10": 20,
+    "Food101": 20,
+    "Flowers102": 20,
+    # "FER2013": 20,
+    "PCAM": 20,
+    "OxfordIIITPet": 20,
+    "RenderedSST2": 20,
+    "EMNIST": 20,
+    "FashionMNIST": 20,
+    # "KMNIST": 20,
+    "FGVCAircraft": 20,
+    "CUB200": 20,
+    "Country211": 20,
+}
+
+
 def ssl_loss_trusted(
     logits1: torch.Tensor,
     logits2: torch.Tensor,
@@ -232,6 +260,15 @@ def run_ufm_atlas(args):
     logger.info("=" * 100)
     logger.info("UFM (Unsupervised FixMatch) Training for Atlas")
     logger.info("=" * 100)
+    
+    # Auto-set epochs based on dataset if not provided
+    test_ds = args.test_dataset
+    if test_ds in UFM_ATLAS_EPOCHS_PER_DATASET and args.epochs is None:
+        args.epochs = UFM_ATLAS_EPOCHS_PER_DATASET[test_ds]
+        logger.info(f"✓ Auto-set epochs={args.epochs} for {test_ds} (dataset-specific)")
+    elif args.epochs is None:
+        args.epochs = 10
+        logger.info(f"Using default epochs={args.epochs} for {test_ds}")
     
     # Load config
     config_path = os.path.join(os.path.dirname(__file__), "config", "config_reverse.yaml")
@@ -491,6 +528,10 @@ def run_ufm_atlas(args):
 
 
 if __name__ == "__main__":
+    # Load config file first
+    config_path = os.path.join(os.path.dirname(__file__), "config", "config_reverse.yaml")
+    config = OmegaConf.load(config_path)
+    
     parser = argparse.ArgumentParser(
         description="UFM training for Atlas",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -498,27 +539,30 @@ if __name__ == "__main__":
     
     parser.add_argument("--test_dataset", type=str, required=True,
                        help="Target dataset for UFM adaptation")
-    parser.add_argument("--model", type=str, default="ViT-B-16",
+    parser.add_argument("--model", type=str, default=config.get("model", "ViT-B-16"),
                        help="Model architecture")
-    parser.add_argument("--data_location", type=str, default="./datasets",
+    parser.add_argument("--data_location", type=str, 
+                       default=config.get("data_location", "./datasets"),
                        help="Root directory for datasets")
-    parser.add_argument("--model_location", type=str, default="./models/checkpoints",
+    parser.add_argument("--model_location", type=str, 
+                       default=config.get("model_location", "./models/checkpoints"),
                        help="Directory for model checkpoints")
-    parser.add_argument("--batch_size", type=int, default=128,
+    parser.add_argument("--batch_size", type=int, 
+                       default=config.get("batch_size", 128),
                        help="Training batch size")
     parser.add_argument("--lr", type=float, default=1e-3,
                        help="Learning rate")
     parser.add_argument("--wd", type=float, default=0.1,
                        help="Weight decay")
-    parser.add_argument("--epochs", type=int, default=10,
-                       help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=None,
+                       help="Number of training epochs (auto-set per dataset if not provided)")
     parser.add_argument("--k", type=int, default=0,
                        help="K-shot samples per class (0=fullshot)")
     parser.add_argument("--blockwise_coef", action="store_true", default=True,
                        help="Learn per-block coefficients")
     parser.add_argument("--partition", type=int, default=None,
                        help="Partition size for coefficients")
-    parser.add_argument("--seed", type=int, default=1,
+    parser.add_argument("--seed", type=int, default=config.get("seed", 1),
                        help="Random seed")
     
     args = parser.parse_args()
@@ -529,6 +573,12 @@ if __name__ == "__main__":
     # Expand paths
     args.data_location = os.path.expanduser(args.data_location)
     args.model_location = os.path.expanduser(args.model_location)
+    
+    # Model-specific adjustments
+    if args.model == "ViT-L-14":
+        if args.batch_size == config.get("batch_size", 128):  # If using default
+            args.batch_size = 32
+            print(f"Adjusted batch_size to {args.batch_size} for ViT-L-14")
     
     run_ufm_atlas(args)
 

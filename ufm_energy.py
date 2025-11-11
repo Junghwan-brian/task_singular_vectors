@@ -45,6 +45,34 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
     return logger
 
 
+# Dataset-specific epochs for UFM-Energy training (general datasets)
+UFM_SIGMA_EPOCHS_PER_DATASET = {
+    # "Cars": 20,
+    "DTD": 20,
+    # "EuroSAT": 20,
+    "GTSRB": 20,
+    "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
+    "SVHN": 20,
+    "CIFAR10": 20,
+    "CIFAR100": 20,
+    "STL10": 20,
+    "Food101": 20,
+    "Flowers102": 20,
+    # "FER2013": 20,
+    "PCAM": 20,
+    "OxfordIIITPet": 20,
+    "RenderedSST2": 20,
+    "EMNIST": 20,
+    "FashionMNIST": 20,
+    # "KMNIST": 20,
+    "FGVCAircraft": 20,
+    "CUB200": 20,
+    "Country211": 20,
+}
+
+
 def ssl_loss_trusted(
     logits1: torch.Tensor,
     logits2: torch.Tensor,
@@ -341,8 +369,14 @@ def run_ufm_energy(cfg: DictConfig) -> None:
     logger.info("=" * 100)
     
     with open_dict(cfg):
-        if cfg.sigma_epochs is None:
+        # Auto-set sigma_epochs if not provided
+        test_ds = cfg.test_dataset
+        if test_ds and test_ds in UFM_SIGMA_EPOCHS_PER_DATASET and cfg.sigma_epochs is None:
+            cfg.sigma_epochs = UFM_SIGMA_EPOCHS_PER_DATASET[test_ds]
+            logger.info(f"✓ Auto-set sigma_epochs={cfg.sigma_epochs} for {test_ds} (dataset-specific)")
+        elif cfg.sigma_epochs is None:
             cfg.sigma_epochs = 10
+            logger.info(f"Using default sigma_epochs={cfg.sigma_epochs}")
         
         if not cfg.config_tag:
             cfg.config_tag = build_ufm_energy_config_tag(cfg)
@@ -752,7 +786,7 @@ if __name__ == "__main__":
     parser.add_argument("--config_file", type=str, default="config/config_reverse.yaml",
                        help="Path to configuration YAML file")
     parser.add_argument("--model", type=str, help="Vision backbone")
-    parser.add_argument("--sigma_epochs", type=int, help="Number of sigma training epochs")
+    parser.add_argument("--sigma_epochs", type=int, help="Number of sigma training epochs (auto-set per dataset if not provided)")
     parser.add_argument("--sigma_lr", type=float, help="Learning rate for sigma")
     parser.add_argument("--sigma_wd", type=float, help="Weight decay for sigma")
     parser.add_argument("--batch_size", type=int, help="Training batch size")
@@ -779,6 +813,14 @@ if __name__ == "__main__":
     # Validate
     if not cfg.get("test_dataset"):
         parser.error("--test_dataset is required")
+    
+    # Model-specific adjustments
+    if cfg.model == "ViT-L-14":
+        if not hasattr(cfg, 'batch_size_override') or not cfg.batch_size_override:
+            original_batch_size = cfg.get('batch_size', 128)
+            if original_batch_size >= 128:
+                cfg.batch_size = 32
+                print(f"Adjusted batch_size to {cfg.batch_size} for ViT-L-14")
     
     OmegaConf.set_struct(cfg, True)
     run_ufm_energy(cfg)
