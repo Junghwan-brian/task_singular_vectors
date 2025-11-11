@@ -207,8 +207,12 @@ def process_shot_directory(
         if not filename.endswith('.json'):
             continue
         
-        # Only process energy_results_*.json and atlas_results_*.json
-        if not (filename.startswith('energy_results') or filename.startswith('atlas_results')):
+        # Process energy, atlas, and baseline result files
+        is_energy = filename.startswith('energy_results')
+        is_atlas = filename.startswith('atlas_results')
+        is_baseline = filename.startswith('baseline_results') or (filename.endswith('_results.json') and not (is_energy or is_atlas))
+        
+        if not (is_energy or is_atlas or is_baseline):
             continue
         
         json_path = os.path.join(shot_path, filename)
@@ -254,6 +258,30 @@ def process_shot_directory(
                 'config_tag': config_tag or '',
                 'json_file': filename,
             }
+        elif is_baseline:
+            # Handle baseline methods: linear_probe, tip, lora, lp++
+            method_name = data.get('method', 'Unknown')
+            
+            # Map method names to display names (remove "baseline" prefix)
+            method_display_map = {
+                'linear_probe': 'LinearProbe',
+                'tip': 'TIP',
+                'tip_adapter': 'TIP',
+                'lpp': 'LP++',
+                'lp++': 'LP++',
+                'lp_plus_plus': 'LP++',
+                'lora': 'LoRA',
+            }
+            
+            method = method_display_map.get(method_name, method_name.title())
+            
+            baseline = {
+                'method': method,
+                'adapter': 'none',
+                'accuracy': accuracy,
+                'config_tag': config_tag or '',
+                'json_file': filename,
+            }
         else:
             continue
         
@@ -264,7 +292,7 @@ def process_shot_directory(
 def format_baseline_label(baseline: Dict[str, Any]) -> str:
     """Create a readable label for a baseline."""
     method = baseline['method']
-    adapter = baseline['adapter']
+    adapter = baseline.get('adapter', 'none')
     
     if method == 'Energy':
         lr = baseline.get('lr', '?')
@@ -281,6 +309,9 @@ def format_baseline_label(baseline: Dict[str, Any]) -> str:
         label = f"Atlas(lr={lr})"
         if adapter != 'none':
             label += f" + {adapter.upper()}"
+    elif method in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
+        # Baseline methods - just use method name
+        label = method
     else:
         label = method
         if adapter != 'none':
@@ -374,6 +405,8 @@ def aggregate_across_datasets(all_results: Dict) -> Dict[str, Dict[str, Dict[str
                     'Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0': 85.5,
                     'Atlas_none': 82.3,
                     'Atlas_tip': 87.1,
+                    'LinearProbe': 80.5,
+                    'LoRA': 83.2,
                     ...
                 },
                 ...
@@ -403,6 +436,9 @@ def aggregate_across_datasets(all_results: Dict) -> Dict[str, Dict[str, Dict[str
                     elif method == 'Atlas':
                         # For Atlas, distinguish by adapter
                         key = f"Atlas_{adapter}"
+                    elif method in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
+                        # For baseline methods, use method name directly
+                        key = method
                     else:
                         key = f"{method}_{adapter}"
                     
@@ -468,13 +504,14 @@ def visualize_aggregated_table(
         for shot_name, methods in shots.items():
             all_methods.update(methods.keys())
     
-    # Separate Energy and non-Energy methods
+    # Separate Energy, Atlas, baseline, and other methods
     energy_methods = {m for m in all_methods if m.startswith('Energy_')}
     atlas_methods = {m for m in all_methods if m.startswith('Atlas_')}
-    other_methods = all_methods - energy_methods - atlas_methods
+    baseline_methods = {m for m in all_methods if m in ['LinearProbe', 'TIP', 'LP++', 'LoRA']}
+    other_methods = all_methods - energy_methods - atlas_methods - baseline_methods
     
-    # Prepare method list (Energy as single entry, then Atlas variants, then others)
-    method_list = ['Energy (best config)'] + sorted(atlas_methods) + sorted(other_methods)
+    # Prepare method list (Energy as single entry, then Atlas variants, then baselines, then others)
+    method_list = ['Energy (best config)'] + sorted(atlas_methods) + sorted(baseline_methods) + sorted(other_methods)
     
     # Get models
     models = sorted(averaged_results.keys())
@@ -497,9 +534,11 @@ def visualize_aggregated_table(
                 table_data['Energy (best config)'][model_name][shot_name] = best_acc
                 energy_config_info[model_name][shot_name] = best_config_key
             
-            # Handle Atlas and others
+            # Handle Atlas, baselines, and others
             for method_key, accuracy in methods.items():
                 if method_key.startswith('Atlas_'):
+                    table_data[method_key][model_name][shot_name] = accuracy
+                elif method_key in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
                     table_data[method_key][model_name][shot_name] = accuracy
                 elif not method_key.startswith('Energy_'):
                     table_data[method_key][model_name][shot_name] = accuracy
@@ -645,14 +684,17 @@ def create_comprehensive_table(
                         all_methods.add('Energy (best config)')
                     elif method == 'Atlas':
                         all_methods.add(f'Atlas_{adapter}')
+                    elif method in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
+                        all_methods.add(method)
                     else:
                         all_methods.add(f'{method}_{adapter}')
     
     # Prepare method list
     energy_methods_set = {'Energy (best config)'}
     atlas_methods = {m for m in all_methods if m.startswith('Atlas_')}
-    other_methods = all_methods - energy_methods_set - atlas_methods
-    method_list = sorted(energy_methods_set) + sorted(atlas_methods) + sorted(other_methods)
+    baseline_methods = {m for m in all_methods if m in ['LinearProbe', 'TIP', 'LP++', 'LoRA']}
+    other_methods = all_methods - energy_methods_set - atlas_methods - baseline_methods
+    method_list = sorted(energy_methods_set) + sorted(atlas_methods) + sorted(baseline_methods) + sorted(other_methods)
     
     # Build data structure: [model][shot][method][dataset] = accuracy
     data_structure = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
@@ -668,6 +710,7 @@ def create_comprehensive_table(
                 # Group baselines by method
                 energy_baselines = []
                 atlas_baselines = defaultdict(list)
+                baseline_method_results = defaultdict(list)
                 other_baselines = defaultdict(list)
                 
                 for baseline in baselines:
@@ -679,6 +722,8 @@ def create_comprehensive_table(
                         energy_baselines.append((baseline, accuracy))
                     elif method == 'Atlas':
                         atlas_baselines[f'Atlas_{adapter}'].append(accuracy)
+                    elif method in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
+                        baseline_method_results[method].append(accuracy)
                     else:
                         other_baselines[f'{method}_{adapter}'].append(accuracy)
                 
@@ -688,11 +733,17 @@ def create_comprehensive_table(
                     best_baseline, best_acc = max(energy_baselines, key=lambda x: x[1])
                     data_structure[model_name][shot_name]['Energy (best config)'][dataset_name] = best_acc
                 
-                # For Atlas and others
+                # For Atlas
                 for atlas_key, accuracies in atlas_baselines.items():
                     if accuracies:
                         data_structure[model_name][shot_name][atlas_key][dataset_name] = accuracies[0]
                 
+                # For baseline methods
+                for baseline_key, accuracies in baseline_method_results.items():
+                    if accuracies:
+                        data_structure[model_name][shot_name][baseline_key][dataset_name] = accuracies[0]
+                
+                # For other methods
                 for other_key, accuracies in other_baselines.items():
                     if accuracies:
                         data_structure[model_name][shot_name][other_key][dataset_name] = accuracies[0]
@@ -793,27 +844,7 @@ def create_comprehensive_table(
                 else:  # Method column
                     cell.set_text_props(weight='bold', ha='left')
     
-    # Highlight Energy(best) and Atlas rows with special colors
-    for i in range(len(table_content)):
-        model, shot, method = row_metadata[i]
-        if method:
-            method_label = format_method_label(method)
-            
-            # Energy(best) - light green background
-            if method == 'Energy (best config)':
-                for j in range(3, len(col_labels)):
-                    cell = table[(i+1, j)]
-                    if table_content[i][j] and table_content[i][j] != "-":
-                        cell.set_facecolor('#C8E6C9')
-            
-            # Atlas (without any adapter) - light blue background
-            elif method == 'Atlas_none':
-                for j in range(3, len(col_labels)):
-                    cell = table[(i+1, j)]
-                    if table_content[i][j] and table_content[i][j] != "-":
-                        cell.set_facecolor('#BBDEFB')
-    
-    # Highlight best values per model/shot combination with gold color
+    # Highlight best values per model/shot combination with bold text (no color)
     # Group by model and shot
     current_group_start = 0
     for i in range(len(table_content) + 1):
@@ -835,7 +866,6 @@ def create_comprehensive_table(
                     if values:
                         max_val, max_row_idx = max(values, key=lambda x: x[0])
                         cell = table[(max_row_idx + 1, col_idx)]
-                        cell.set_facecolor('#FFD700')  # Gold color
                         cell.set_text_props(weight='bold')
             
             # Move to next group
@@ -872,6 +902,9 @@ def format_method_label(method_key: str) -> str:
             return 'Atlas'
         else:
             return f'Atlas+{adapter.upper()}'
+    elif method_key in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
+        # Baseline methods - return as-is
+        return method_key
     else:
         return method_key
 
