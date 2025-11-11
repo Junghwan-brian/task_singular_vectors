@@ -141,9 +141,19 @@ class IndexWrapper(torch.utils.data.Dataset):
             result = data.copy()
             result["index"] = idx
             return result
+        elif isinstance(data, tuple) and len(data) == 2:
+            # Handle (data, label) tuple
+            if isinstance(data[0], dict):
+                # Transform returned a dict (e.g., TwoAsymetricTransform)
+                result = data[0].copy()
+                result["labels"] = data[1]
+                result["index"] = idx
+                return result
+            else:
+                # Normal (image, label) tuple
+                return {"images": data[0], "labels": data[1], "index": idx}
         else:
-            # Assume (image, label) tuple
-            return {"images": data[0], "labels": data[1], "index": idx}
+            raise ValueError(f"Unexpected data format: {type(data)}")
     
     def __len__(self):
         return len(self.dataset)
@@ -457,7 +467,7 @@ def run_ufm_atlas(args):
     num_batches = len(train_loader)
     scheduler = cosine_lr(optimizer, args.lr, 0, args.epochs * num_batches)
     
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     loss_fn = ssl_loss_trusted
     
     # Training loop
