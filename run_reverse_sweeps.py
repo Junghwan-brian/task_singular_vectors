@@ -202,14 +202,14 @@ DATASETS_ALL = {
 }
 
 
-GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
-ENERGY_MODELS = ["ViT-B-16"]
-ENERGY_INITIALIZE_SIGMA = ["average", "sum"]
+GPU_IDS = [0,1]  # Default GPU IDs, can be overridden via CLI
+ENERGY_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
+ENERGY_INITIALIZE_SIGMA = ["average"]
 ENERGY_ADAPTERS = ["none"]
-ENERGY_K = [16]
-ENERGY_SVD_KEEP_TOPK = [5]
-ENERGY_SIGMA_LR = [1e-3]
-ENERGY_SIGMA_WD = [0.0, 0.1]
+ENERGY_K = [1,2,4,8,16]
+ENERGY_SVD_KEEP_TOPK = [14, 16]
+ENERGY_SIGMA_LR = [1e-3, 5e-3]
+ENERGY_SIGMA_WD = [0.0]
 ENERGY_WARMUP_RATIO = [0.1]
 
 ATLAS_MODELS = ["ViT-B-16"]
@@ -217,13 +217,13 @@ ATLAS_ADAPTERS = ["none", "lp++", "tip"]
 ATLAS_K = [16]
 
 # Baseline configurations
-BASELINE_MODELS = ["ViT-B-16"]
-BASELINE_METHODS = ["linear_probe", "tip_adapter", "lp++", "lora"]
-BASELINE_K = [16]
+BASELINE_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
+BASELINE_METHODS = ["lp++"]
+BASELINE_K = [1,2,4,8,16]
 BASELINE_LP_LR = [1e-3]
 BASELINE_LP_EPOCHS = [20]
 BASELINE_LP_WD = [0.0]
-BASELINE_ADAPTER_WD = [0.0]
+BASELINE_ADAPTER_WD = [0.0, 0.1, 0.01]
 BASELINE_LORA_R = [8]
 BASELINE_LORA_ALPHA = [16.0]
 BASELINE_LORA_LR = [1e-4]
@@ -410,12 +410,12 @@ def build_baseline_commands(datasets: Sequence[str]) -> List[List[str]]:
                 results_json = _expected_baseline_paths(
                     model=model, dataset=dataset, method=method, k=k, **hparams
                 )
-                if _path_exists(results_json):
-                    print(
-                        f"[skip] baseline {model} {dataset} (method={method}, k={k}) -> {results_json}",
-                        flush=True,
-                    )
-                    continue
+                # if _path_exists(results_json):
+                #     print(
+                #         f"[skip] baseline {model} {dataset} (method={method}, k={k}) -> {results_json}",
+                #         flush=True,
+                #     )
+                #     continue
                 
                 cmd = [
                     sys.executable,
