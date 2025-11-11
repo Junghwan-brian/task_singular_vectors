@@ -70,6 +70,62 @@ def parse_adapter_from_filename(filename: str) -> str:
     return 'none'
 
 
+def parse_baseline_config_tag(config_tag: str, method: str) -> Dict[str, str]:
+    """
+    Parse baseline config tag to extract hyperparameters.
+    
+    LinearProbe format: baseline_lp_{lr}_{epochs}
+    Example: baseline_lp_0p1_100
+    
+    LoRA format: baseline_lora_{r}_{alpha}_{lr}_{epochs}
+    Example: baseline_lora_8_16_0p001_50
+    
+    TIP format: baseline_tip_{alpha}_{beta}_{epochs}
+    Example: baseline_tip_1p0_5p5_20
+    
+    LP++ format: baseline_lpp_{ratio}_{lambda}
+    Example: baseline_lpp_0p2_10
+    """
+    if not config_tag:
+        return {}
+    
+    parts = config_tag.split('_')
+    
+    if config_tag.startswith('baseline_lp_') and method == 'LinearProbe':
+        # baseline_lp_{lr}_{epochs}
+        if len(parts) >= 4:
+            return {
+                'lr': parts[2].replace('p', '.'),
+                'epochs': parts[3],
+            }
+    elif config_tag.startswith('baseline_lora_') and method == 'LoRA':
+        # baseline_lora_{r}_{alpha}_{lr}_{epochs}
+        if len(parts) >= 6:
+            return {
+                'r': parts[2],
+                'alpha': parts[3].replace('p', '.'),
+                'lr': parts[4].replace('p', '.'),
+                'epochs': parts[5] if len(parts) > 5 else 'unknown',
+            }
+    elif config_tag.startswith('baseline_tip_') and method == 'TIP':
+        # baseline_tip_{alpha}_{beta}_{epochs}
+        if len(parts) >= 5:
+            return {
+                'alpha': parts[2].replace('p', '.'),
+                'beta': parts[3].replace('p', '.'),
+                'epochs': parts[4] if len(parts) > 4 else 'unknown',
+            }
+    elif config_tag.startswith('baseline_lpp_') and method == 'LP++':
+        # baseline_lpp_{ratio}_{lambda}
+        if len(parts) >= 4:
+            return {
+                'ratio': parts[2].replace('p', '.'),
+                'lambda': parts[3].replace('p', '.'),
+            }
+    
+    return {}
+
+
 def load_results_from_json(json_path: str) -> Optional[Dict[str, Any]]:
     """Load results from a JSON file."""
     try:
@@ -275,12 +331,17 @@ def process_shot_directory(
             
             method = method_display_map.get(method_name, method_name.title())
             
+            # Parse baseline hyperparameters from config_tag
+            tag_to_parse = config_tag or data.get('config_tag', '')
+            hyperparams = parse_baseline_config_tag(tag_to_parse, method) if tag_to_parse else {}
+            
             baseline = {
                 'method': method,
                 'adapter': 'none',
                 'accuracy': accuracy,
                 'config_tag': config_tag or '',
                 'json_file': filename,
+                'hyperparams': hyperparams,  # Store parsed hyperparameters
             }
         else:
             continue
@@ -310,33 +371,40 @@ def format_baseline_label(baseline: Dict[str, Any]) -> str:
         if adapter != 'none':
             label += f" + {adapter.upper()}"
     elif method == 'LinearProbe':
-        # Show LinearProbe hyperparameters from config_tag
-        config_tag = baseline.get('config_tag', '')
-        if config_tag and config_tag.startswith('baseline_lp_'):
-            parts = config_tag.replace('baseline_lp_', '').split('_')
-            if len(parts) >= 2:
-                lr = parts[0].replace('p', '.')
-                epochs = parts[1]
-                label = f"LinearProbe(lr={lr}, ep={epochs})"
-            else:
-                label = method
+        # Show LinearProbe hyperparameters
+        hyperparams = baseline.get('hyperparams', {})
+        if hyperparams:
+            lr = hyperparams.get('lr', '?')
+            epochs = hyperparams.get('epochs', '?')
+            label = f"LinearProbe(lr={lr}, ep={epochs})"
         else:
             label = method
-    elif method in ['TIP', 'LP++']:
-        # TIP and LP++ usually don't have many hyperparameters shown
-        label = method
+    elif method == 'TIP':
+        # Show TIP hyperparameters
+        hyperparams = baseline.get('hyperparams', {})
+        if hyperparams:
+            alpha = hyperparams.get('alpha', '?')
+            beta = hyperparams.get('beta', '?')
+            label = f"TIP(α={alpha}, β={beta})"
+        else:
+            label = method
+    elif method == 'LP++':
+        # Show LP++ hyperparameters
+        hyperparams = baseline.get('hyperparams', {})
+        if hyperparams:
+            ratio = hyperparams.get('ratio', '?')
+            lambda_val = hyperparams.get('lambda', '?')
+            label = f"LP++(ratio={ratio}, λ={lambda_val})"
+        else:
+            label = method
     elif method == 'LoRA':
-        # Show LoRA hyperparameters from config_tag
-        config_tag = baseline.get('config_tag', '')
-        if config_tag and config_tag.startswith('baseline_lora_'):
-            parts = config_tag.replace('baseline_lora_', '').split('_')
-            if len(parts) >= 3:
-                r = parts[0]
-                alpha = parts[1].replace('p', '.')
-                lr = parts[2].replace('p', '.')
-                label = f"LoRA(r={r}, α={alpha}, lr={lr})"
-            else:
-                label = method
+        # Show LoRA hyperparameters
+        hyperparams = baseline.get('hyperparams', {})
+        if hyperparams:
+            r = hyperparams.get('r', '?')
+            alpha = hyperparams.get('alpha', '?')
+            lr = hyperparams.get('lr', '?')
+            label = f"LoRA(r={r}, α={alpha}, lr={lr})"
         else:
             label = method
     else:
@@ -463,9 +531,43 @@ def aggregate_across_datasets(all_results: Dict) -> Dict[str, Dict[str, Dict[str
                     elif method == 'Atlas':
                         # For Atlas, distinguish by adapter
                         key = f"Atlas_{adapter}"
-                    elif method in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
-                        # For baseline methods, use method name directly
-                        key = method
+                    elif method == 'LinearProbe':
+                        # For LinearProbe, use hyperparameters as key
+                        hyperparams = baseline.get('hyperparams', {})
+                        if hyperparams:
+                            lr = hyperparams.get('lr', 'unknown')
+                            epochs = hyperparams.get('epochs', 'unknown')
+                            key = f"LinearProbe_lr={lr}_ep={epochs}"
+                        else:
+                            key = method
+                    elif method == 'LoRA':
+                        # For LoRA, use hyperparameters as key
+                        hyperparams = baseline.get('hyperparams', {})
+                        if hyperparams:
+                            r = hyperparams.get('r', 'unknown')
+                            alpha = hyperparams.get('alpha', 'unknown')
+                            lr = hyperparams.get('lr', 'unknown')
+                            key = f"LoRA_r={r}_alpha={alpha}_lr={lr}"
+                        else:
+                            key = method
+                    elif method == 'TIP':
+                        # For TIP, use hyperparameters as key
+                        hyperparams = baseline.get('hyperparams', {})
+                        if hyperparams:
+                            alpha = hyperparams.get('alpha', 'unknown')
+                            beta = hyperparams.get('beta', 'unknown')
+                            key = f"TIP_alpha={alpha}_beta={beta}"
+                        else:
+                            key = method
+                    elif method == 'LP++':
+                        # For LP++, use hyperparameters as key
+                        hyperparams = baseline.get('hyperparams', {})
+                        if hyperparams:
+                            ratio = hyperparams.get('ratio', 'unknown')
+                            lambda_val = hyperparams.get('lambda', 'unknown')
+                            key = f"LP++_ratio={ratio}_lambda={lambda_val}"
+                        else:
+                            key = method
                     else:
                         key = f"{method}_{adapter}"
                     
@@ -483,17 +585,22 @@ def aggregate_across_datasets(all_results: Dict) -> Dict[str, Dict[str, Dict[str
     return averaged
 
 
-def select_best_energy_config_per_dataset(
-    all_results: Dict
+def select_best_method_config_per_dataset(
+    all_results: Dict,
+    method_name: str
 ) -> Dict[str, Dict[str, Dict[str, tuple]]]:
     """
-    For each dataset, model, and shot, select the best Energy hyperparameter configuration.
+    For each dataset, model, and shot, select the best hyperparameter configuration for a given method.
+    
+    Args:
+        all_results: Results dictionary
+        method_name: Name of the method (e.g., 'Energy', 'LoRA', 'LinearProbe', 'TIP', 'LP++')
     
     Returns:
         {
             'AID': {
                 'ViT-B-32': {
-                    '16shots': ('Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0', 85.5, 'energy_14_0p001_4_average_0p1_0p0'),
+                    '16shots': (config_key, accuracy, config_tag),
                     ...
                 },
                 ...
@@ -501,48 +608,99 @@ def select_best_energy_config_per_dataset(
             ...
         }
     """
-    best_energy_per_dataset = defaultdict(lambda: defaultdict(dict))
+    best_config_per_dataset = defaultdict(lambda: defaultdict(dict))
     
     for model_name, datasets in all_results.items():
         for dataset_name, shots in datasets.items():
             for shot_name, baselines in shots.items():
-                # Filter Energy baselines
-                energy_baselines = [
-                    b for b in baselines if b['method'] == 'Energy'
+                # Filter baselines for this method
+                method_baselines = [
+                    b for b in baselines if b['method'] == method_name
                 ]
                 
-                if energy_baselines:
-                    # Select best performing Energy configuration
-                    best_baseline = max(energy_baselines, key=lambda b: b['accuracy'])
+                if method_baselines:
+                    # Select best performing configuration
+                    best_baseline = max(method_baselines, key=lambda b: b['accuracy'])
                     
-                    # Build config key
-                    lr = best_baseline.get('lr', 'unknown')
-                    topk = best_baseline.get('svd_keep_topk', 'unknown')
-                    init = best_baseline.get('initialize_sigma', 'unknown')
-                    warmup = best_baseline.get('warmup_ratio', 'unknown')
-                    wd = best_baseline.get('sigma_wd', '0.0')
-                    config_key = f"Energy_lr={lr}_k={topk}_init={init}_w={warmup}_wd={wd}"
+                    # Build config key based on method type
+                    if method_name == 'Energy':
+                        lr = best_baseline.get('lr', 'unknown')
+                        topk = best_baseline.get('svd_keep_topk', 'unknown')
+                        init = best_baseline.get('initialize_sigma', 'unknown')
+                        warmup = best_baseline.get('warmup_ratio', 'unknown')
+                        wd = best_baseline.get('sigma_wd', '0.0')
+                        config_key = f"Energy_lr={lr}_k={topk}_init={init}_w={warmup}_wd={wd}"
+                    elif method_name == 'LinearProbe':
+                        hyperparams = best_baseline.get('hyperparams', {})
+                        if hyperparams:
+                            lr = hyperparams.get('lr', 'unknown')
+                            epochs = hyperparams.get('epochs', 'unknown')
+                            config_key = f"LinearProbe_lr={lr}_ep={epochs}"
+                        else:
+                            config_key = method_name
+                    elif method_name == 'LoRA':
+                        hyperparams = best_baseline.get('hyperparams', {})
+                        if hyperparams:
+                            r = hyperparams.get('r', 'unknown')
+                            alpha = hyperparams.get('alpha', 'unknown')
+                            lr = hyperparams.get('lr', 'unknown')
+                            config_key = f"LoRA_r={r}_alpha={alpha}_lr={lr}"
+                        else:
+                            config_key = method_name
+                    elif method_name == 'TIP':
+                        hyperparams = best_baseline.get('hyperparams', {})
+                        if hyperparams:
+                            alpha = hyperparams.get('alpha', 'unknown')
+                            beta = hyperparams.get('beta', 'unknown')
+                            config_key = f"TIP_alpha={alpha}_beta={beta}"
+                        else:
+                            config_key = method_name
+                    elif method_name == 'LP++':
+                        hyperparams = best_baseline.get('hyperparams', {})
+                        if hyperparams:
+                            ratio = hyperparams.get('ratio', 'unknown')
+                            lambda_val = hyperparams.get('lambda', 'unknown')
+                            config_key = f"LP++_ratio={ratio}_lambda={lambda_val}"
+                        else:
+                            config_key = method_name
+                    else:
+                        config_key = method_name
                     
-                    best_energy_per_dataset[dataset_name][model_name][shot_name] = (
+                    best_config_per_dataset[dataset_name][model_name][shot_name] = (
                         config_key,
                         best_baseline['accuracy'],
                         best_baseline.get('config_tag', '')
                     )
     
-    return dict(best_energy_per_dataset)
+    return dict(best_config_per_dataset)
 
 
-def compute_averaged_best_energy_configs(
-    best_energy_per_dataset: Dict
+def select_best_energy_config_per_dataset(
+    all_results: Dict
+) -> Dict[str, Dict[str, Dict[str, tuple]]]:
+    """
+    For each dataset, model, and shot, select the best Energy hyperparameter configuration.
+    (Wrapper for backward compatibility)
+    """
+    return select_best_method_config_per_dataset(all_results, 'Energy')
+
+
+def compute_averaged_best_configs(
+    best_configs_per_dataset: Dict,
+    method_prefix: str = None
 ) -> Dict[str, Dict[str, tuple]]:
     """
-    Compute averaged best Energy configs across datasets for each model/shot.
+    Compute averaged best configs across datasets for each model/shot.
     Used for the aggregated table visualization.
+    
+    Args:
+        best_configs_per_dataset: Best configs per dataset
+        method_prefix: Optional prefix to filter config keys (e.g., 'Energy', 'LoRA')
     
     Returns:
         {
             'ViT-B-32': {
-                '16shots': ('Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0', 85.5),
+                '16shots': (config_key, avg_accuracy),
                 ...
             },
             ...
@@ -551,10 +709,12 @@ def compute_averaged_best_energy_configs(
     # Group by model and shot, average accuracy across datasets
     grouped = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     
-    for dataset, models in best_energy_per_dataset.items():
+    for dataset, models in best_configs_per_dataset.items():
         for model, shots in models.items():
             for shot, (config_key, accuracy, config_tag) in shots.items():
-                grouped[model][shot][config_key].append(accuracy)
+                # Filter by method prefix if specified
+                if method_prefix is None or config_key.startswith(method_prefix):
+                    grouped[model][shot][config_key].append(accuracy)
     
     # Select best average config for each model/shot
     best_avg = {}
@@ -575,14 +735,31 @@ def compute_averaged_best_energy_configs(
     return best_avg
 
 
+def compute_averaged_best_energy_configs(
+    best_energy_per_dataset: Dict
+) -> Dict[str, Dict[str, tuple]]:
+    """
+    Compute averaged best Energy configs across datasets for each model/shot.
+    (Wrapper for backward compatibility)
+    """
+    return compute_averaged_best_configs(best_energy_per_dataset, 'Energy')
+
+
 def visualize_aggregated_table(
     averaged_results: Dict,
     best_energy_configs: Dict,
+    best_baseline_configs: Dict,
     output_dir: str
 ) -> None:
     """
     Create a table visualization similar to Table 2 in the paper.
     Shows averaged accuracy across all datasets.
+    
+    Args:
+        averaged_results: Averaged accuracy for all methods/configs
+        best_energy_configs: Best Energy configs per model/shot
+        best_baseline_configs: Dict of best configs for baseline methods (LoRA, LinearProbe, TIP, LP++)
+        output_dir: Output directory
     """
     # Define shot order
     shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
@@ -596,11 +773,22 @@ def visualize_aggregated_table(
     # Separate Energy, Atlas, baseline, and other methods
     energy_methods = {m for m in all_methods if m.startswith('Energy_')}
     atlas_methods = {m for m in all_methods if m.startswith('Atlas_')}
-    baseline_methods = {m for m in all_methods if m in ['LinearProbe', 'TIP', 'LP++', 'LoRA']}
-    other_methods = all_methods - energy_methods - atlas_methods - baseline_methods
+    lora_methods = {m for m in all_methods if m.startswith('LoRA')}
+    linearprobe_methods = {m for m in all_methods if m.startswith('LinearProbe')}
+    tip_methods = {m for m in all_methods if m.startswith('TIP')}
+    lpp_methods = {m for m in all_methods if m.startswith('LP++')}
+    other_methods = all_methods - energy_methods - atlas_methods - lora_methods - linearprobe_methods - tip_methods - lpp_methods
     
-    # Prepare method list (Energy as single entry, then Atlas variants, then baselines, then others)
-    method_list = ['Energy (best config)'] + sorted(atlas_methods) + sorted(baseline_methods) + sorted(other_methods)
+    # Prepare method list (best configs for each method type)
+    method_list = (
+        ['Energy (best config)'] +
+        ['LoRA (best config)'] +
+        ['LinearProbe (best config)'] +
+        ['TIP (best config)'] +
+        ['LP++ (best config)'] +
+        sorted(atlas_methods) +
+        sorted(other_methods)
+    )
     
     # Get models
     models = sorted(averaged_results.keys())
@@ -608,7 +796,7 @@ def visualize_aggregated_table(
     # Create data structure for table
     # Structure: method -> model -> shot -> accuracy
     table_data = defaultdict(lambda: defaultdict(dict))
-    energy_config_info = defaultdict(dict)
+    best_config_info = defaultdict(lambda: defaultdict(dict))  # Store all best configs
     
     for model_name in models:
         for shot_name in shot_order:
@@ -621,15 +809,22 @@ def visualize_aggregated_table(
             if model_name in best_energy_configs and shot_name in best_energy_configs[model_name]:
                 best_config_key, best_acc = best_energy_configs[model_name][shot_name]
                 table_data['Energy (best config)'][model_name][shot_name] = best_acc
-                energy_config_info[model_name][shot_name] = best_config_key
+                best_config_info['Energy'][model_name][shot_name] = best_config_key
             
-            # Handle Atlas, baselines, and others
+            # Handle baseline methods - use best configs
+            for method_name in ['LoRA', 'LinearProbe', 'TIP', 'LP++']:
+                if method_name in best_baseline_configs:
+                    method_configs = best_baseline_configs[method_name]
+                    if model_name in method_configs and shot_name in method_configs[model_name]:
+                        best_config_key, best_acc = method_configs[model_name][shot_name]
+                        table_data[f'{method_name} (best config)'][model_name][shot_name] = best_acc
+                        best_config_info[method_name][model_name][shot_name] = best_config_key
+            
+            # Handle Atlas and others
             for method_key, accuracy in methods.items():
                 if method_key.startswith('Atlas_'):
                     table_data[method_key][model_name][shot_name] = accuracy
-                elif method_key in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
-                    table_data[method_key][model_name][shot_name] = accuracy
-                elif not method_key.startswith('Energy_'):
+                elif not any(method_key.startswith(prefix) for prefix in ['Energy_', 'LoRA_', 'LinearProbe_', 'TIP_', 'LP++']):
                     table_data[method_key][model_name][shot_name] = accuracy
     
     # Create table visualization
@@ -721,34 +916,48 @@ def visualize_aggregated_table(
     
     logger.info(f"Saved CSV table: {csv_output_path}")
     
-    # Save best Energy configurations to text file
-    config_output_path = os.path.join(output_dir, 'best_energy_configs.txt')
+    # Save best configurations to text file
+    config_output_path = os.path.join(output_dir, 'best_method_configs.txt')
     with open(config_output_path, 'w') as f:
-        f.write("Best Energy Hyperparameter Configurations\n")
+        f.write("Best Hyperparameter Configurations for All Methods\n")
         f.write("=" * 80 + "\n\n")
-        for model in models:
-            f.write(f"Model: {model}\n")
-            f.write("-" * 80 + "\n")
-            for shot in shot_order:
-                if shot in energy_config_info.get(model, {}):
-                    config_key = energy_config_info[model][shot]
-                    accuracy = table_data['Energy (best config)'][model][shot]
-                    f.write(f"  {shot}: {config_key} (Acc: {accuracy:.2f}%)\n")
-            f.write("\n")
+        
+        for method_name in ['Energy', 'LoRA', 'LinearProbe', 'TIP', 'LP++']:
+            if method_name in best_config_info and best_config_info[method_name]:
+                f.write(f"Method: {method_name}\n")
+                f.write("=" * 80 + "\n")
+                for model in models:
+                    if model in best_config_info[method_name]:
+                        f.write(f"  Model: {model}\n")
+                        f.write("  " + "-" * 78 + "\n")
+                        for shot in shot_order:
+                            if shot in best_config_info[method_name].get(model, {}):
+                                config_key = best_config_info[method_name][model][shot]
+                                accuracy = table_data[f'{method_name} (best config)'][model][shot]
+                                f.write(f"    {shot}: {config_key} (Acc: {accuracy:.2f}%)\n")
+                        f.write("\n")
+                f.write("\n")
     
-    logger.info(f"Saved best Energy configurations: {config_output_path}")
+    logger.info(f"Saved best configurations: {config_output_path}")
 
 
 def create_comprehensive_table(
     all_results: Dict,
     best_energy_per_dataset: Dict,
+    best_baseline_per_dataset: Dict,
     output_dir: str
 ) -> None:
     """
     Create a single comprehensive table with datasets as columns.
     Rows are organized by (Model, Shot, Method).
     Last column shows the average across datasets.
-    Uses dataset-specific best Energy configurations.
+    Uses dataset-specific best configurations for all methods.
+    
+    Args:
+        all_results: All results
+        best_energy_per_dataset: Best Energy configs per dataset
+        best_baseline_per_dataset: Dict of best configs per dataset for baseline methods
+        output_dir: Output directory
     """
     # Define shot order
     shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
@@ -764,6 +973,14 @@ def create_comprehensive_table(
     
     # Collect all unique methods across all datasets
     all_methods = set()
+    has_energy = False
+    has_lora = False
+    has_linearprobe = False
+    has_tip = False
+    has_lpp = False
+    atlas_methods = set()
+    other_methods = set()
+    
     for model_name in models:
         for dataset_name in all_results[model_name]:
             for shot_name in all_results[model_name][dataset_name]:
@@ -771,20 +988,34 @@ def create_comprehensive_table(
                     method = baseline['method']
                     adapter = baseline.get('adapter', 'none')
                     if method == 'Energy':
-                        all_methods.add('Energy (best config)')
+                        has_energy = True
                     elif method == 'Atlas':
-                        all_methods.add(f'Atlas_{adapter}')
-                    elif method in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
-                        all_methods.add(method)
+                        atlas_methods.add(f'Atlas_{adapter}')
+                    elif method == 'LoRA':
+                        has_lora = True
+                    elif method == 'LinearProbe':
+                        has_linearprobe = True
+                    elif method == 'TIP':
+                        has_tip = True
+                    elif method == 'LP++':
+                        has_lpp = True
                     else:
-                        all_methods.add(f'{method}_{adapter}')
+                        other_methods.add(f'{method}_{adapter}')
     
-    # Prepare method list
-    energy_methods_set = {'Energy (best config)'}
-    atlas_methods = {m for m in all_methods if m.startswith('Atlas_')}
-    baseline_methods = {m for m in all_methods if m in ['LinearProbe', 'TIP', 'LP++', 'LoRA']}
-    other_methods = all_methods - energy_methods_set - atlas_methods - baseline_methods
-    method_list = sorted(energy_methods_set) + sorted(atlas_methods) + sorted(baseline_methods) + sorted(other_methods)
+    # Prepare method list with best configs
+    method_list = []
+    if has_energy:
+        method_list.append('Energy (best config)')
+    if has_lora:
+        method_list.append('LoRA (best config)')
+    if has_linearprobe:
+        method_list.append('LinearProbe (best config)')
+    if has_tip:
+        method_list.append('TIP (best config)')
+    if has_lpp:
+        method_list.append('LP++ (best config)')
+    method_list.extend(sorted(atlas_methods))
+    method_list.extend(sorted(other_methods))
     
     # Build data structure: [model][shot][method][dataset] = accuracy
     data_structure = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
@@ -824,15 +1055,19 @@ def create_comprehensive_table(
                             _, best_acc, _ = best_energy_per_dataset[dataset_name][model_name][shot_name]
                             data_structure[model_name][shot_name]['Energy (best config)'][dataset_name] = best_acc
                 
+                # For baseline methods, use dataset-specific best config
+                for method_name in ['LoRA', 'LinearProbe', 'TIP', 'LP++']:
+                    if method_name in best_baseline_per_dataset:
+                        if dataset_name in best_baseline_per_dataset[method_name]:
+                            if model_name in best_baseline_per_dataset[method_name][dataset_name]:
+                                if shot_name in best_baseline_per_dataset[method_name][dataset_name][model_name]:
+                                    _, best_acc, _ = best_baseline_per_dataset[method_name][dataset_name][model_name][shot_name]
+                                    data_structure[model_name][shot_name][f'{method_name} (best config)'][dataset_name] = best_acc
+                
                 # For Atlas
                 for atlas_key, accuracies in atlas_baselines.items():
                     if accuracies:
                         data_structure[model_name][shot_name][atlas_key][dataset_name] = accuracies[0]
-                
-                # For baseline methods
-                for baseline_key, accuracies in baseline_method_results.items():
-                    if accuracies:
-                        data_structure[model_name][shot_name][baseline_key][dataset_name] = accuracies[0]
                 
                 # For other methods
                 for other_key, accuracies in other_baselines.items():
@@ -1072,43 +1307,73 @@ def main():
     
     logger.info(f"\nFound {len(all_results)} models")
     
-    # Select best Energy configurations per dataset
-    logger.info("\nSelecting best Energy configurations per dataset...")
+    # Select best configurations per dataset for all methods
+    logger.info("\nSelecting best configurations per dataset for all methods...")
     best_energy_per_dataset = select_best_energy_config_per_dataset(all_results)
     
-    # Save best Energy configurations to JSON for future use (e.g., adapter training)
-    best_config_path = os.path.join(args.output_dir, 'best_energy_configs_per_dataset.json')
+    # Select best configs for baseline methods
+    best_baseline_per_dataset = {}
+    for method_name in ['LoRA', 'LinearProbe', 'TIP', 'LP++']:
+        logger.info(f"Selecting best {method_name} configurations per dataset...")
+        best_baseline_per_dataset[method_name] = select_best_method_config_per_dataset(all_results, method_name)
+    
+    # Save best configurations to JSON for future use
+    best_config_path = os.path.join(args.output_dir, 'best_configs_per_dataset.json')
     os.makedirs(args.output_dir, exist_ok=True)
     with open(best_config_path, 'w') as f:
         # Convert to serializable format
-        serializable_config = {}
+        serializable_config = {'Energy': {}}
+        
+        # Add Energy configs
         for dataset, models in best_energy_per_dataset.items():
-            serializable_config[dataset] = {}
+            serializable_config['Energy'][dataset] = {}
             for model, shots in models.items():
-                serializable_config[dataset][model] = {}
+                serializable_config['Energy'][dataset][model] = {}
                 for shot, (config_key, accuracy, config_tag) in shots.items():
-                    serializable_config[dataset][model][shot] = {
+                    serializable_config['Energy'][dataset][model][shot] = {
                         'config_key': config_key,
                         'accuracy': accuracy,
                         'config_tag': config_tag
                     }
+        
+        # Add baseline method configs
+        for method_name, method_data in best_baseline_per_dataset.items():
+            serializable_config[method_name] = {}
+            for dataset, models in method_data.items():
+                serializable_config[method_name][dataset] = {}
+                for model, shots in models.items():
+                    serializable_config[method_name][dataset][model] = {}
+                    for shot, (config_key, accuracy, config_tag) in shots.items():
+                        serializable_config[method_name][dataset][model][shot] = {
+                            'config_key': config_key,
+                            'accuracy': accuracy,
+                            'config_tag': config_tag
+                        }
+        
         json.dump(serializable_config, f, indent=2)
-    logger.info(f"Saved best Energy configs per dataset to: {best_config_path}")
+    logger.info(f"Saved best configs per dataset to: {best_config_path}")
     
     # Generate aggregated visualization
     logger.info("\nAggregating results across datasets...")
     averaged_results = aggregate_across_datasets(all_results)
     
-    # For visualization, still compute average best configs
-    logger.info("Computing averaged best Energy configurations...")
+    # Compute average best configs for all methods
+    logger.info("Computing averaged best configurations for all methods...")
     best_energy_configs_avg = compute_averaged_best_energy_configs(best_energy_per_dataset)
+    best_baseline_configs_avg = {}
+    for method_name in ['LoRA', 'LinearProbe', 'TIP', 'LP++']:
+        if method_name in best_baseline_per_dataset and best_baseline_per_dataset[method_name]:
+            logger.info(f"Computing averaged best {method_name} configurations...")
+            best_baseline_configs_avg[method_name] = compute_averaged_best_configs(
+                best_baseline_per_dataset[method_name], method_name
+            )
     
     logger.info("Generating aggregated visualization...")
-    visualize_aggregated_table(averaged_results, best_energy_configs_avg, args.output_dir)
+    visualize_aggregated_table(averaged_results, best_energy_configs_avg, best_baseline_configs_avg, args.output_dir)
     
     # Generate comprehensive table with all datasets as columns
     logger.info("\nGenerating comprehensive table (all datasets + average)...")
-    create_comprehensive_table(all_results, best_energy_per_dataset, args.output_dir)
+    create_comprehensive_table(all_results, best_energy_per_dataset, best_baseline_per_dataset, args.output_dir)
     
     # Generate individual visualizations if not aggregate_only
     if not args.aggregate_only:
