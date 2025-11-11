@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
 from atlas_src.composition import WeightedImageEncoder
 from atlas_src.utils import TIPWrapper, LPPWrapper
