@@ -137,14 +137,44 @@ class IndexWrapper(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = self.dataset[idx]
         if isinstance(data, dict):
-            data["index"] = idx
-            return data
+            # Handle dict returned by TwoAsymetricTransform
+            result = data.copy()
+            result["index"] = idx
+            return result
         else:
             # Assume (image, label) tuple
             return {"images": data[0], "labels": data[1], "index": idx}
     
     def __len__(self):
         return len(self.dataset)
+
+
+def collate_fn(batch):
+    """Custom collate function to handle nested dicts from TwoAsymetricTransform."""
+    result = {}
+    keys = batch[0].keys()
+    
+    for key in keys:
+        if key == "index":
+            result[key] = torch.tensor([item[key] for item in batch])
+        elif key in ["images", "images_"]:
+            # Stack image tensors
+            result[key] = torch.stack([item[key] for item in batch])
+        elif key == "labels":
+            # Handle labels if present
+            labels = [item[key] for item in batch]
+            if isinstance(labels[0], torch.Tensor):
+                result[key] = torch.stack(labels)
+            else:
+                result[key] = torch.tensor(labels)
+        else:
+            # Default: try to stack or keep as list
+            try:
+                result[key] = torch.stack([item[key] for item in batch])
+            except:
+                result[key] = [item[key] for item in batch]
+    
+    return result
 
 
 class TwoStreamBatchSampler(torch.utils.data.Sampler):
@@ -406,7 +436,8 @@ def run_ufm_atlas(args):
     train_loader = torch.utils.data.DataLoader(
         index_dataset, 
         batch_sampler=sampler,
-        num_workers=4
+        num_workers=4,
+        collate_fn=collate_fn
     )
     
     # Prepare validation loader
