@@ -769,10 +769,11 @@ if __name__ == "__main__":
     from src.datasets.registry import registry as DATASET_REGISTRY
     
     parser = argparse.ArgumentParser(
-        description="UFM training for Energy",
+        description="UFM-Energy training for general datasets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
+    # Required arguments
     allowed_test_datasets = sorted(
         [name for name in DATASET_REGISTRY.keys() if not name.endswith("Val")]
     )
@@ -780,37 +781,119 @@ if __name__ == "__main__":
         "--test_dataset",
         type=str,
         required=True,
-        help="Held-out dataset for UFM adaptation"
+        help="Held-out dataset for UFM adaptation (sigma epochs auto-set by dataset size)"
     )
     
-    parser.add_argument("--config_file", type=str, default="config/config_reverse.yaml",
-                       help="Path to configuration YAML file")
-    parser.add_argument("--model", type=str, help="Vision backbone")
-    parser.add_argument("--sigma_epochs", type=int, help="Number of sigma training epochs (auto-set per dataset if not provided)")
-    parser.add_argument("--sigma_lr", type=float, help="Learning rate for sigma")
-    parser.add_argument("--sigma_wd", type=float, help="Weight decay for sigma")
-    parser.add_argument("--batch_size", type=int, help="Training batch size")
-    parser.add_argument("--k", type=int, dest="train_k", help="K-shot samples per class")
-    parser.add_argument("--warmup_ratio", type=float, help="Warmup ratio")
-    parser.add_argument("--svd_keep_topk", type=int, help="Number of singular vectors to keep")
-    parser.add_argument("--initialize_sigma", type=str, choices=["average", "sum"],
-                       help="Initialization strategy for sigma")
-    parser.add_argument("--config_tag", type=str, help="Custom tag for output directory")
-    parser.add_argument("--seed", type=int, default=1, help="Random seed")
+    # Config and model
+    parser.add_argument(
+        "--config_file",
+        type=str,
+        default="config/config_reverse.yaml",
+        help="Path to configuration YAML file"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Vision backbone (e.g., ViT-B-32, ViT-B-16)"
+    )
+    
+    # Training hyperparameters
+    parser.add_argument(
+        "--sigma_epochs",
+        type=int,
+        help="Number of sigma training epochs (auto-set per dataset if not provided)"
+    )
+    parser.add_argument(
+        "--sigma_lr",
+        type=float,
+        help="Learning rate for sigma optimization"
+    )
+    parser.add_argument(
+        "--sigma_wd",
+        type=float,
+        help="Weight decay for sigma optimization"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        help="Training batch size"
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        dest="train_k",
+        help="K-shot samples per class (0=fullshot)"
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        help="Warmup ratio for sigma learning rate"
+    )
+    
+    # SVD and initialization
+    parser.add_argument(
+        "--svd_keep_topk",
+        type=int,
+        help="Number of singular vectors to keep per task"
+    )
+    parser.add_argument(
+        "--initialize_sigma",
+        type=str,
+        choices=["average", "sum", "tsvm"],
+        help="Initialization strategy for sigma basis"
+    )
+    
+    # Other
+    parser.add_argument(
+        "--config_tag",
+        type=str,
+        help="Custom tag for output directory"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed for k-shot sampling"
+    )
+    parser.add_argument(
+        "--data_location",
+        type=str,
+        help="Root directory for datasets"
+    )
+    parser.add_argument(
+        "--model_location",
+        type=str,
+        help="Directory for model checkpoints"
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        help="Cache directory"
+    )
+    parser.add_argument(
+        "--openclip_cachedir",
+        type=str,
+        help="Directory for caching models from OpenCLIP"
+    )
+    parser.add_argument(
+        "--num_grad_accumulation",
+        type=int,
+        help="Gradient accumulation steps"
+    )
     
     args = parser.parse_args()
     
-    # Load config
+    # Load config file
     cfg = load_config(args.config_file)
     
-    # Merge CLI arguments
+    # Merge CLI arguments (only non-None values override config)
     cli_overrides = {k: v for k, v in vars(args).items() 
                      if v is not None and k != "config_file"}
     
     if cli_overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.create(cli_overrides))
     
-    # Validate
+    # Validate required fields
     if not cfg.get("test_dataset"):
         parser.error("--test_dataset is required")
     

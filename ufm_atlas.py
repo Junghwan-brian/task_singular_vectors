@@ -274,13 +274,21 @@ def run_ufm_atlas(args):
     config_path = os.path.join(os.path.dirname(__file__), "config", "config_reverse.yaml")
     config = OmegaConf.load(config_path)
     
-    # Import dataset registry
-    from src.datasets.registry import registry as DATASET_REGISTRY
-    GENERAL_DATASETS = {k: v for k, v in DATASET_REGISTRY.items() if not k.endswith("Val")}
-    
-    test_ds = args.test_dataset
-    pool = [d for d in GENERAL_DATASETS.keys() if d != test_ds]
-    logger.info(f"Using {len(pool)} datasets as basis (excluding {test_ds})")
+    # Use basis_datasets from args if available, otherwise fall back to config.DATASETS_ALL
+    if hasattr(args, 'basis_datasets') and args.basis_datasets:
+        pool = args.basis_datasets
+        logger.info(f"Using {len(pool)} basis datasets from args (excluding {test_ds})")
+    elif hasattr(config, 'DATASETS_ALL') and config.DATASETS_ALL:
+        test_ds = args.test_dataset
+        pool = [d for d in config.DATASETS_ALL if d != test_ds]
+        logger.info(f"Using {len(pool)} datasets from config.DATASETS_ALL (excluding {test_ds})")
+    else:
+        # Fallback to registry
+        from src.datasets.registry import registry as DATASET_REGISTRY
+        GENERAL_DATASETS = {k: v for k, v in DATASET_REGISTRY.items() if not k.endswith("Val")}
+        test_ds = args.test_dataset
+        pool = [d for d in GENERAL_DATASETS.keys() if d != test_ds]
+        logger.info(f"Using {len(pool)} datasets from registry (excluding {test_ds})")
     
     # Load task vectors
     logger.info(f"Loading task vectors for {len(pool)} basis datasets...")
@@ -527,58 +535,241 @@ def run_ufm_atlas(args):
     logger.info(f"✓ Saved results to {results_path}")
 
 
+def create_ufm_atlas_parser(config: OmegaConf) -> argparse.ArgumentParser:
+    """
+    Create argument parser with defaults from config file.
+    Based on atlas_reverse.py's create_atlas_parser.
+    """
+    parser = argparse.ArgumentParser(
+        description="UFM-Atlas task vector composition for general datasets",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        "--test_dataset",
+        type=str,
+        required=True,
+        help="Target dataset for UFM leave-one-out training"
+    )
+    
+    # Config file
+    parser.add_argument(
+        "--config_file",
+        type=str,
+        default="config/config_reverse.yaml",
+        help="Path to configuration YAML file"
+    )
+    
+    # Model and paths
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=config.get("model", "ViT-B-32"),
+        help="Model architecture"
+    )
+    parser.add_argument(
+        "--data_location",
+        type=str,
+        default=config.get("data_location", "./datasets"),
+        help="Root directory for datasets"
+    )
+    parser.add_argument(
+        "--model_location",
+        type=str,
+        default=config.get("model_location", "./models/checkpoints"),
+        help="Directory for model checkpoints"
+    )
+    
+    # Training hyperparameters
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=config.get("batch_size", 128),
+        help="Training batch size"
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,  # UFM default
+        help="Learning rate"
+    )
+    parser.add_argument(
+        "--wd",
+        type=float,
+        default=0.1,  # Atlas default
+        help="Weight decay"
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of training epochs (auto-set per dataset if not provided)"
+    )
+    parser.add_argument(
+        "--num_grad_accumulation",
+        type=int,
+        default=config.get("num_grad_accumulation", 1),
+        help="Gradient accumulation steps"
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=config.get("train_k", 0),
+        help="K-shot samples per class (0=fullshot)"
+    )
+    
+    # Atlas-specific options
+    parser.add_argument(
+        "--blockwise_coef",
+        action="store_true",
+        default=config.get("blockwise_coef", True),
+        help="Learn per-block coefficients"
+    )
+    parser.add_argument(
+        "--partition",
+        type=int,
+        default=None,
+        help="Partition size for fine-grained coefficient learning"
+    )
+    parser.add_argument(
+        "--loss_fn",
+        type=str,
+        default="ufm",
+        help="Loss function (UFM for this script)"
+    )
+    parser.add_argument(
+        "--lp_reg",
+        type=int,
+        default=None,
+        choices=[1, 2],
+        help="Regularization for learned coefficients"
+    )
+    
+    # Other options
+    parser.add_argument(
+        "--epochs_per_task",
+        type=int,
+        default=config.get("epochs_per_task", 10),
+        help="Default epochs per task"
+    )
+    parser.add_argument(
+        "--config_tag",
+        type=str,
+        default=None,
+        help="Custom tag for output directory"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=config.get("seed", 1),
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--print_every",
+        type=int,
+        default=10,
+        help="Print frequency during training"
+    )
+    parser.add_argument(
+        "--logdir",
+        type=str,
+        default="logs/ufm_atlas",
+        help="Directory for logs"
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=config.get("cache_dir", None),
+        help="Cache directory"
+    )
+    parser.add_argument(
+        "--openclip_cachedir",
+        type=str,
+        default=os.path.expanduser("~/openclip-cachedir/open_clip"),
+        help="Directory for caching models from OpenCLIP"
+    )
+    parser.add_argument(
+        "--world_size",
+        type=int,
+        default=config.get("world_size", 1),
+        help="Number of processes for distributed training"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=config.get("port", 12355),
+        help="Port for distributed training"
+    )
+    
+    return parser
+
+
 if __name__ == "__main__":
     # Load config file first
     config_path = os.path.join(os.path.dirname(__file__), "config", "config_reverse.yaml")
     config = OmegaConf.load(config_path)
     
-    parser = argparse.ArgumentParser(
-        description="UFM training for Atlas",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    parser.add_argument("--test_dataset", type=str, required=True,
-                       help="Target dataset for UFM adaptation")
-    parser.add_argument("--model", type=str, default=config.get("model", "ViT-B-16"),
-                       help="Model architecture")
-    parser.add_argument("--data_location", type=str, 
-                       default=config.get("data_location", "./datasets"),
-                       help="Root directory for datasets")
-    parser.add_argument("--model_location", type=str, 
-                       default=config.get("model_location", "./models/checkpoints"),
-                       help="Directory for model checkpoints")
-    parser.add_argument("--batch_size", type=int, 
-                       default=config.get("batch_size", 128),
-                       help="Training batch size")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                       help="Learning rate")
-    parser.add_argument("--wd", type=float, default=0.1,
-                       help="Weight decay")
-    parser.add_argument("--epochs", type=int, default=None,
-                       help="Number of training epochs (auto-set per dataset if not provided)")
-    parser.add_argument("--k", type=int, default=0,
-                       help="K-shot samples per class (0=fullshot)")
-    parser.add_argument("--blockwise_coef", action="store_true", default=True,
-                       help="Learn per-block coefficients")
-    parser.add_argument("--partition", type=int, default=None,
-                       help="Partition size for coefficients")
-    parser.add_argument("--seed", type=int, default=config.get("seed", 1),
-                       help="Random seed")
-    
+    # Create parser with config defaults
+    parser = create_ufm_atlas_parser(config)
     args = parser.parse_args()
     
     # Set device
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Expand paths
-    args.data_location = os.path.expanduser(args.data_location)
-    args.model_location = os.path.expanduser(args.model_location)
-    
     # Model-specific adjustments
     if args.model == "ViT-L-14":
         if args.batch_size == config.get("batch_size", 128):  # If using default
             args.batch_size = 32
-            print(f"Adjusted batch_size to {args.batch_size} for ViT-L-14")
+        if args.num_grad_accumulation == config.get("num_grad_accumulation", 1):
+            args.num_grad_accumulation = 2
+    
+    # Expand paths
+    args.data_location = os.path.expanduser(args.data_location)
+    args.model_location = os.path.expanduser(args.model_location)
+    
+    # Setup save directory
+    if not hasattr(args, 'save_dir') or args.save_dir is None:
+        args.save_dir = os.path.join(args.model_location, args.model)
+    
+    # Initialize zeroshot accuracy dictionary
+    if not hasattr(args, 'zs_acc'):
+        args.zs_acc = {}
+    
+    # Leave-one-out dataset setup: use config.DATASETS_ALL and exclude test_dataset
+    args.basis_datasets = [d for d in config.DATASETS_ALL if d != args.test_dataset]
+    args.target_datasets = {args.test_dataset: args.epochs_per_task}
+    
+    # Setup logging directory
+    args.logdir = os.path.join(args.logdir, args.model)
+    if args.k > 0:
+        args.logdir += f"/{args.k}shots"
+    else:
+        args.logdir += "/fullshot"
+    if args.seed is not None:
+        args.logdir += f"/{args.seed}"
+    
+    os.makedirs(args.logdir, exist_ok=True)
+    
+    # Legacy paths (kept for compatibility)
+    args.head_path = os.path.join(args.logdir, "ufm_atlas_composition.pt")
+    args.log_path = os.path.join(args.logdir, "ufm_atlas_composition.json")
+    
+    # Setup file logging (with timestamps for the log file)
+    log_file_path = os.path.join(args.logdir, "ufm_atlas.log")
+    file_handler = logging.FileHandler(log_file_path)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    # Get root logger and add file handler
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    
+    # Setup clean console logger
+    logger = logging.getLogger(__name__ + "_main")
+    logger.info(f"Leave-one-out mode: Test dataset = {args.test_dataset}")
+    logger.info(f"Basis datasets: {len(args.basis_datasets)} datasets")
     
     run_ufm_atlas(args)
 
