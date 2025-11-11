@@ -685,11 +685,59 @@ def select_best_energy_config_per_dataset(
     return select_best_method_config_per_dataset(all_results, 'Energy')
 
 
+def compute_averaged_best_configs_from_aggregated(
+    averaged_results: Dict,
+    method_prefix: str
+) -> Dict[str, Dict[str, tuple]]:
+    """
+    Select best configs from already-averaged results across all datasets.
+    This ensures we select based on true average performance across ALL datasets,
+    not just the best-per-dataset configs.
+    
+    Args:
+        averaged_results: Already averaged results from aggregate_across_datasets()
+        method_prefix: Method prefix to filter (e.g., 'Energy', 'LoRA', 'LinearProbe')
+    
+    Returns:
+        {
+            'ViT-B-32': {
+                '16shots': (config_key, avg_accuracy),
+                ...
+            },
+            ...
+        }
+    """
+    best_configs = {}
+    
+    for model_name, shots in averaged_results.items():
+        best_configs[model_name] = {}
+        for shot_name, methods in shots.items():
+            # Filter methods matching the prefix
+            matching_configs = {
+                config_key: accuracy
+                for config_key, accuracy in methods.items()
+                if config_key.startswith(method_prefix)
+            }
+            
+            # Select best config based on average accuracy
+            if matching_configs:
+                best_key = max(matching_configs, key=matching_configs.get)
+                best_acc = matching_configs[best_key]
+                best_configs[model_name][shot_name] = (best_key, best_acc)
+    
+    return best_configs
+
+
 def compute_averaged_best_configs(
     best_configs_per_dataset: Dict,
     method_prefix: str = None
 ) -> Dict[str, Dict[str, tuple]]:
     """
+    DEPRECATED: Use compute_averaged_best_configs_from_aggregated instead.
+    
+    This function only averages the best-per-dataset configs, which may not
+    represent the true best average config across all datasets.
+    
     Compute averaged best configs across datasets for each model/shot.
     Used for the aggregated table visualization.
     
@@ -1357,16 +1405,16 @@ def main():
     logger.info("\nAggregating results across datasets...")
     averaged_results = aggregate_across_datasets(all_results)
     
-    # Compute average best configs for all methods
-    logger.info("Computing averaged best configurations for all methods...")
-    best_energy_configs_avg = compute_averaged_best_energy_configs(best_energy_per_dataset)
+    # Compute average best configs for all methods from the averaged results
+    # This ensures we select based on TRUE average across ALL datasets
+    logger.info("Computing best configurations from averaged results (correct method)...")
+    best_energy_configs_avg = compute_averaged_best_configs_from_aggregated(averaged_results, 'Energy')
     best_baseline_configs_avg = {}
     for method_name in ['LoRA', 'LinearProbe', 'TIP', 'LP++']:
-        if method_name in best_baseline_per_dataset and best_baseline_per_dataset[method_name]:
-            logger.info(f"Computing averaged best {method_name} configurations...")
-            best_baseline_configs_avg[method_name] = compute_averaged_best_configs(
-                best_baseline_per_dataset[method_name], method_name
-            )
+        logger.info(f"Computing best {method_name} configuration from averaged results...")
+        best_baseline_configs_avg[method_name] = compute_averaged_best_configs_from_aggregated(
+            averaged_results, method_name
+        )
     
     logger.info("Generating aggregated visualization...")
     visualize_aggregated_table(averaged_results, best_energy_configs_avg, best_baseline_configs_avg, args.output_dir)
