@@ -353,17 +353,22 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
     adapter_model = ddp_model
     if adapter == 'lpp':
         shots = int(cfg.k_shot) if int(cfg.k_shot) > 0 else 0
+        logger.info(f"[adapter:lp++] Initializing LP++ with shots={shots}")
         adapter_model = LPPWrapper(
             adapter_model, features_cache, labels, shots)
         epochs = 20
         adapter_model = adapter_model.to(cfg.device)
-        try:
-            if hasattr(adapter_model, 'alpha_vec') and getattr(adapter_model.alpha_vec, 'requires_grad', None) is not False:
-                adapter_model.alpha_vec.requires_grad = False
-        except Exception:
-            pass
+        
+        # LP++ requires training both adapter (classifier) and alpha_vec with different learning rates
+        # Use data-driven learning rates from init_lp
+        lr_temp = float(getattr(adapter_model, 'lr_temp', 1e-1))
+        lr_alpha = float(getattr(adapter_model, 'lr_alpha', 1e-3))
+        
+        logger.info(f"[adapter:lp++] Using data-driven learning rates: lr_temp={lr_temp:.6f}, lr_alpha={lr_alpha:.6f}")
+        
         param_groups = [
-            {'params': adapter_model.adapter.parameters(), 'lr': 1e-1}
+            {'params': adapter_model.adapter.parameters(), 'lr': lr_temp},
+            {'params': [adapter_model.alpha_vec], 'lr': lr_alpha}
         ]
     elif adapter == 'tip':
         adapter_model = TIPWrapper(adapter_model, features_cache, labels)
