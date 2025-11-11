@@ -363,7 +363,7 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
         except Exception:
             pass
         param_groups = [
-            {'params': adapter_model.adapter.parameters(), 'lr': adapter_model.lr_temp}
+            {'params': adapter_model.adapter.parameters(), 'lr': 1e-1}
         ]
     elif adapter == 'tip':
         adapter_model = TIPWrapper(adapter_model, features_cache, labels)
