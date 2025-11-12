@@ -264,7 +264,71 @@ def discover_results(model_location: str) -> Dict[str, Dict[str, Dict[str, List[
                                 results, model_name, dataset_name, shot_name, shot_path, config_tag
                             )
     
+    # Propagate ZeroShot results from 1shots to all other shots
+    # (ZeroShot is independent of k-shot)
+    results = propagate_zeroshot_results(results)
+    
     return dict(results)
+
+
+def propagate_zeroshot_results(results: Dict) -> Dict:
+    """
+    Propagate ZeroShot results from 1shots to all other shot settings.
+    ZeroShot doesn't use training data, so results are independent of k-shot.
+    """
+    shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
+    total_propagated = 0
+    
+    for model_name in results:
+        for dataset_name in results[model_name]:
+            # Check if 1shots exists and has ZeroShot results
+            if '1shots' not in results[model_name][dataset_name]:
+                continue
+            
+            # Find ZeroShot baselines in 1shots
+            zeroshot_baselines = [
+                baseline for baseline in results[model_name][dataset_name]['1shots']
+                if baseline.get('method') == 'ZeroShot'
+            ]
+            
+            if not zeroshot_baselines:
+                continue
+            
+            accuracies_str = ', '.join([f"{b['accuracy']:.2f}%" for b in zeroshot_baselines])
+            logger.info(
+                f"Found {len(zeroshot_baselines)} ZeroShot baseline(s) in 1shots for "
+                f"{model_name}/{dataset_name} (accuracy: {accuracies_str})"
+            )
+            
+            # Propagate to all other shots
+            for shot_name in shot_order:
+                if shot_name == '1shots':
+                    continue
+                
+                # Initialize shot if it doesn't exist
+                if shot_name not in results[model_name][dataset_name]:
+                    results[model_name][dataset_name][shot_name] = []
+                
+                # Check if ZeroShot already exists in this shot
+                has_zeroshot = any(
+                    baseline.get('method') == 'ZeroShot'
+                    for baseline in results[model_name][dataset_name][shot_name]
+                )
+                
+                # Add ZeroShot if not present
+                if not has_zeroshot:
+                    for zeroshot_baseline in zeroshot_baselines:
+                        # Create a copy with updated k_shot info
+                        baseline_copy = zeroshot_baseline.copy()
+                        # Update k_shot in the baseline data if it exists
+                        # (Note: this is just metadata, actual accuracy is same)
+                        results[model_name][dataset_name][shot_name].append(baseline_copy)
+                        total_propagated += 1
+    
+    if total_propagated > 0:
+        logger.info(f"✓ Propagated ZeroShot results to {total_propagated} shot settings")
+    
+    return results
 
 
 def process_shot_directory(
@@ -1391,6 +1455,8 @@ def create_comprehensive_table(
                                         break
                             if config_key:
                                 break
+                elif method_key == 'ZeroShot':
+                    config_key = 'ZeroShot'
                 else:
                     config_key = method_key
                 
@@ -1562,6 +1628,8 @@ def create_aggregated_by_shot_table_from_comprehensive(
         method_list.append('TIP (best config)')
     if 'LP++ (best config)' in all_methods:
         method_list.append('LP++ (best config)')
+    if 'ZeroShot' in all_methods:
+        method_list.append('ZeroShot')
     
     # Add Atlas and other methods
     atlas_methods = sorted([m for m in all_methods if m.startswith('Atlas_')])
@@ -1630,6 +1698,8 @@ def create_aggregated_by_shot_table_from_comprehensive(
                                         break
                             if config_key:
                                 break
+                elif method == 'ZeroShot':
+                    config_key = 'ZeroShot'
                 else:
                     config_key = method
                 
