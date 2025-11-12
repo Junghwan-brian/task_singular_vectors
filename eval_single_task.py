@@ -1112,9 +1112,9 @@ def visualize_aggregated_table(
             if params_found is not None or memory_found is not None:
                 break
         
-        # Format params in millions
+        # Format params in millions (3 decimal places)
         if params_found is not None:
-            row.append(f"{params_found / 1e6:.2f}")
+            row.append(f"{params_found / 1e6:.3f}")
         else:
             row.append("-")
         
@@ -1403,9 +1403,9 @@ def create_comprehensive_table(
                         params_found = params
                         memory_found = memory
                 
-                # Format params in millions
+                # Format params in millions (3 decimal places)
                 if params_found is not None:
-                    row.append(f"{params_found / 1e6:.2f}")
+                    row.append(f"{params_found / 1e6:.3f}")
                 else:
                     row.append("-")
                 
@@ -1645,9 +1645,9 @@ def create_aggregated_by_shot_table_from_comprehensive(
             if params_found is not None or memory_found is not None:
                 break
         
-        # Format params in millions
+        # Format params in millions (3 decimal places)
         if params_found is not None:
-            row.append(f"{params_found / 1e6:.2f}")
+            row.append(f"{params_found / 1e6:.3f}")
         else:
             row.append("-")
         

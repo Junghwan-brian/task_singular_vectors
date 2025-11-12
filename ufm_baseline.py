@@ -26,11 +26,11 @@ from torch.cuda.amp import GradScaler
 # Fix for H100 cuDNN compatibility
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
-# torch.backends.cuda.enable_cudnn_sdp(False)
-# torch.backends.cudnn.allow_tf32 = False
-# torch.backends.cuda.matmul.allow_tf32 = False
-# torch.backends.cudnn.benchmark = False
-# torch.backends.cudnn.deterministic = True
+torch.backends.cuda.enable_cudnn_sdp(False)
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
 
 def setup_simple_logger(name: str = __name__) -> logging.Logger:
