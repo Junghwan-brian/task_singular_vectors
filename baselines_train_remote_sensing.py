@@ -372,8 +372,8 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
         logger.info(f"[adapter:lp++] Using data-driven learning rates: lr_temp={lr_temp:.6f}, lr_alpha={lr_alpha:.6f}")
         
         param_groups = [
-            {'params': adapter_model.adapter.parameters(), 'lr': lr_temp},
-            {'params': [adapter_model.alpha_vec], 'lr': lr_alpha}
+            {'params': adapter_model.adapter.parameters(), 'lr': lr_temp * 0.1},
+            {'params': [adapter_model.alpha_vec], 'lr': lr_alpha * 0.1}
         ]
     elif adapter == 'tip':
         adapter_model = TIPWrapper(adapter_model, features_cache, labels)

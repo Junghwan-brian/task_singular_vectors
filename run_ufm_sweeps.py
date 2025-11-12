@@ -188,8 +188,8 @@ UFM_ATLAS_EPOCHS = [None]  # Will auto-set per dataset
 UFM_ENERGY_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
 UFM_ENERGY_K = [0]  # fullshot only for test-time adaptation
 UFM_ENERGY_INITIALIZE_SIGMA = ["average"]
-UFM_ENERGY_SVD_KEEP_TOPK = [16]
-UFM_ENERGY_SIGMA_LR = [1e-2]
+UFM_ENERGY_SVD_KEEP_TOPK = [12]
+UFM_ENERGY_SIGMA_LR = [1e-3]
 UFM_ENERGY_SIGMA_WD = [0.0]
 UFM_ENERGY_WARMUP_RATIO = [0.1]
 
