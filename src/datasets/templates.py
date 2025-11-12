@@ -399,6 +399,7 @@ dataset_to_template = {
     "ImageNetR": imagenet_template,
     "ImageNetSketch": imagenet_template,
     "ImageNetV2MFVal": imagenet_template,
+    "ImageNetV2MF": imagenet_template,
     "RESISC45": resisc45_template,
     "STL10": cifar10_stl10_template,
     "SUN397": sun397_template,

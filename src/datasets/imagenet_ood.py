@@ -12,8 +12,12 @@ from .imagenet import imagenet_classnames
 
 def _read_synset_to_index(base_dir: str) -> Dict[str, int]:
     """
-    Read synset -> index mapping (0..999) in ImageNet order.
-    Preferred: {base_dir}/imagenet/LOC_synset_mapping.txt (wnid per line in 1000-class order)
+    Read synset -> alphabetical index mapping (0..999).
+    
+    Note: ImageNet classnames are in alphabetical synset order, so we must map
+    each synset (WNID) to its alphabetical index, NOT to ILSVRC2012_ID.
+    
+    Preferred: {base_dir}/imagenet/LOC_synset_mapping.txt (wnid per line in alphabetical order)
     Fallback:  {base_dir}/imagenet/imagenet-1k/data/meta.mat (requires scipy)
     """
     txt_mapping = os.path.join(base_dir, "imagenet", "LOC_synset_mapping.txt")
@@ -30,7 +34,7 @@ def _read_synset_to_index(base_dir: str) -> Dict[str, int]:
             print(f"[warn] Expected 1000 synsets, found {len(synset_to_idx)} in {txt_mapping}")
         return synset_to_idx
 
-    # Fallback to meta.mat
+    # Fallback to meta.mat: build alphabetical mapping
     meta_mat_path = os.path.join(base_dir, "imagenet", "imagenet-1k", "data", "meta.mat")
     if not os.path.exists(meta_mat_path):
         raise FileNotFoundError(
@@ -45,25 +49,31 @@ def _read_synset_to_index(base_dir: str) -> Dict[str, int]:
         ) from e
 
     meta = sio.loadmat(meta_mat_path, squeeze_me=True, struct_as_record=False)
-    # meta['synsets'] is an array of structs; leaf nodes have ILSVRC2012_ID in [1..1000]
     synsets = meta.get("synsets", None)
     if synsets is None:
         raise RuntimeError(f"meta.mat at {meta_mat_path} missing 'synsets'")
-    # Build wnid -> index where index = ILSVRC2012_ID - 1
-    synset_to_idx: Dict[str, int] = {}
+    
+    # Collect all leaf synsets (those with ILSVRC2012_ID)
+    all_wnids = []
     for s in synsets:
         try:
             wnid = str(s.WNID)
             ilsvrc2012_id = int(s.ILSVRC2012_ID)
-        except Exception:
-            # Some entries might be non-leaf; skip those without proper fields
+        except AttributeError:
+            # Some entries might be non-leaf nodes; skip those
             continue
         if 1 <= ilsvrc2012_id <= 1000:
-            synset_to_idx[wnid] = ilsvrc2012_id - 1
-    if len(synset_to_idx) != 1000:
+            all_wnids.append(wnid)
+    
+    if len(all_wnids) != 1000:
         raise RuntimeError(
-            f"Expected 1000 leaf synsets in meta.mat, found {len(synset_to_idx)}."
+            f"Expected 1000 leaf synsets in meta.mat, found {len(all_wnids)}."
         )
+    
+    # Sort alphabetically to get the correct index order
+    sorted_wnids = sorted(all_wnids)
+    synset_to_idx: Dict[str, int] = {wnid: idx for idx, wnid in enumerate(sorted_wnids)}
+    
     return synset_to_idx
 
 
@@ -97,7 +107,10 @@ class _ImageNetValFromTxt(Dataset):
     Expects:
       - images at {base_dir}/imagenet/imagenet-1k/*.JPEG
       - labels at  {base_dir}/imagenet/imagenet-1k/data/ILSVRC2012_validation_ground_truth.txt
-      - optional meta at {base_dir}/imagenet/imagenet-1k/data/meta.mat (for consistency checks)
+      - meta at {base_dir}/imagenet/imagenet-1k/data/meta.mat (required for ILSVRC ID -> synset mapping)
+    
+    Note: The ground truth file contains ILSVRC2012_ID (1..1000), which must be mapped
+    to the alphabetical synset index (0..999) used by classnames.
     """
 
     def __init__(self, base_dir: str, transform=None):
@@ -107,23 +120,34 @@ class _ImageNetValFromTxt(Dataset):
         self.gt_path = os.path.join(
             base_dir, "imagenet", "imagenet-1k", "data", "ILSVRC2012_validation_ground_truth.txt"
         )
+        self.meta_path = os.path.join(
+            base_dir, "imagenet", "imagenet-1k", "data", "meta.mat"
+        )
 
         if not os.path.isdir(self.img_dir):
             raise FileNotFoundError(f"ImageNet-1k directory not found: {self.img_dir}")
         if not os.path.exists(self.gt_path):
             raise FileNotFoundError(f"Validation ground truth not found: {self.gt_path}")
+        if not os.path.exists(self.meta_path):
+            raise FileNotFoundError(f"Meta file not found: {self.meta_path} (required for label mapping)")
 
-        # Read labels (1..1000) -> convert to 0..999
+        # Build mapping: ILSVRC2012_ID (1..1000) -> alphabetical synset index (0..999)
+        ilsvrc_to_synset_idx = self._build_ilsvrc_to_synset_mapping()
+
+        # Read labels (ILSVRC2012_ID: 1..1000) and convert to synset index (0..999)
         labels: List[int] = []
         with open(self.gt_path, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                lab = int(line)
-                if not (1 <= lab <= 1000):
-                    raise ValueError(f"Invalid label {lab} in {self.gt_path}")
-                labels.append(lab - 1)
+                ilsvrc_id = int(line)
+                if not (1 <= ilsvrc_id <= 1000):
+                    raise ValueError(f"Invalid ILSVRC ID {ilsvrc_id} in {self.gt_path}")
+                synset_idx = ilsvrc_to_synset_idx.get(ilsvrc_id)
+                if synset_idx is None:
+                    raise ValueError(f"No synset mapping found for ILSVRC ID {ilsvrc_id}")
+                labels.append(synset_idx)
 
         # Gather image names sorted by numeric id to align with labels file
         fnames = [fn for fn in os.listdir(self.img_dir) if fn.lower().endswith((".jpg", ".jpeg", ".png"))]
@@ -151,6 +175,62 @@ class _ImageNetValFromTxt(Dataset):
             (os.path.join(self.img_dir, fname), labels[i]) for i, fname in enumerate(fnames_sorted)
         ]
 
+    def _build_ilsvrc_to_synset_mapping(self) -> Dict[int, int]:
+        """
+        Build mapping from ILSVRC2012_ID (1..1000) to alphabetical synset index (0..999).
+        
+        Returns:
+            Dict mapping ILSVRC2012_ID -> synset_index
+        """
+        try:
+            import scipy.io as sio  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "scipy is required to read meta.mat for ImageNet label mapping. "
+                "Please install scipy: pip install scipy"
+            ) from e
+
+        meta = sio.loadmat(self.meta_path, squeeze_me=True, struct_as_record=False)
+        synsets = meta.get("synsets", None)
+        if synsets is None:
+            raise RuntimeError(f"meta.mat at {self.meta_path} missing 'synsets' field")
+
+        # Build two mappings:
+        # 1. ILSVRC2012_ID -> WNID (synset string)
+        # 2. WNID (synset) -> alphabetical index (0..999)
+        
+        ilsvrc_to_wnid = {}
+        all_wnids = []
+        
+        for s in synsets:
+            try:
+                wnid = str(s.WNID)
+                ilsvrc2012_id = int(s.ILSVRC2012_ID)
+            except AttributeError:
+                # Some entries might be non-leaf nodes; skip those
+                continue
+            
+            if 1 <= ilsvrc2012_id <= 1000:
+                ilsvrc_to_wnid[ilsvrc2012_id] = wnid
+                all_wnids.append(wnid)
+        
+        if len(ilsvrc_to_wnid) != 1000:
+            raise RuntimeError(
+                f"Expected 1000 leaf synsets in meta.mat, found {len(ilsvrc_to_wnid)}"
+            )
+        
+        # Sort WNIDs alphabetically to get synset index (0..999)
+        sorted_wnids = sorted(set(all_wnids))
+        wnid_to_synset_idx = {wnid: idx for idx, wnid in enumerate(sorted_wnids)}
+        
+        # Combine: ILSVRC2012_ID -> synset_index
+        ilsvrc_to_synset_idx = {}
+        for ilsvrc_id, wnid in ilsvrc_to_wnid.items():
+            synset_idx = wnid_to_synset_idx[wnid]
+            ilsvrc_to_synset_idx[ilsvrc_id] = synset_idx
+        
+        return ilsvrc_to_synset_idx
+
     def __len__(self):
         return len(self.samples)
 
@@ -166,14 +246,14 @@ class _ImageNetV2MFVal(Dataset):
     """
     ImageNetV2 matched-frequency format validation set.
     Expects directories 0..999 each containing images at:
-      {base_dir}/imagenetv2-matched-frequency-format-val/{class_idx}/*.jpeg
+      {base_dir}/ImageNetV2MFVal/{class_idx}/*.jpeg
     Labels are numeric directory names (0..999), matching ImageNet order.
     """
 
     def __init__(self, base_dir: str, transform=None):
         self.transform = transform
         self.root = os.path.join(
-            base_dir, "imagenetv2-matched-frequency-format-val")
+            base_dir, "ImageNetV2MFVal")
         if not os.path.isdir(self.root):
             raise FileNotFoundError(
                 f"ImageNetV2-MF root not found: {self.root}")
@@ -281,7 +361,7 @@ class ImageNetA:
         self.num_workers = num_workers
         self.classnames = imagenet_classnames
 
-        root = os.path.join(location, "imagenet", "imagenet-a")
+        root = os.path.join(location, "imagenet", "ImageNetA")
         if not os.path.isdir(root):
             raise FileNotFoundError(f"ImageNet-A root not found: {root}")
         synset_to_idx = _read_synset_to_index(location)
@@ -316,7 +396,7 @@ class ImageNetR:
         self.num_workers = num_workers
         self.classnames = imagenet_classnames
 
-        root = os.path.join(location, "imagenet", "imagenet-r")
+        root = os.path.join(location, "imagenet", "ImageNetR")
         if not os.path.isdir(root):
             raise FileNotFoundError(f"ImageNet-R root not found: {root}")
         synset_to_idx = _read_synset_to_index(location)
@@ -351,7 +431,7 @@ class ImageNetSketch:
         self.num_workers = num_workers
         self.classnames = imagenet_classnames
 
-        root = os.path.join(location, "imagenet", "ImageNet-Sketch", "sketch")
+        root = os.path.join(location, "imagenet", "ImageNetSketch")
         if not os.path.isdir(root):
             raise FileNotFoundError(f"ImageNet-Sketch root not found: {root}")
         synset_to_idx = _read_synset_to_index(location)

@@ -988,6 +988,75 @@ def visualize_aggregated_table(
     
     logger.info(f"Saved best configurations: {config_output_path}")
 
+    # ------------------------------------------------------------------
+    # Additionally, create a k-shot averaged table across models
+    # Columns: Method, 1-shot, 2-shot, 4-shot, 8-shot, 16-shot
+    # ------------------------------------------------------------------
+    shot_avg_col_labels = ['Method'] + [s.replace('shots', '-shot') for s in shot_order]
+    shot_avg_table_content = []
+    
+    for method in method_list:
+        row = [format_method_label(method)]
+        for shot in shot_order:
+            # Gather accuracies for this method/shot across models
+            shot_vals = []
+            for model in models:
+                acc = table_data[method].get(model, {}).get(shot, None)
+                if acc is not None:
+                    shot_vals.append(acc)
+            if shot_vals:
+                row.append(f"{(sum(shot_vals) / len(shot_vals)):.2f}")
+            else:
+                row.append("-")
+        shot_avg_table_content.append(row)
+    
+    # Create figure for shot-averaged table
+    fig2 = plt.figure(figsize=(12, max(6, len(method_list) * 0.5 + 2)))
+    ax2 = fig2.add_subplot(111)
+    ax2.axis('tight')
+    ax2.axis('off')
+    
+    table2 = ax2.table(
+        cellText=shot_avg_table_content,
+        colLabels=shot_avg_col_labels,
+        cellLoc='center',
+        loc='center',
+        bbox=[0, 0, 1, 1]
+    )
+    table2.auto_set_font_size(False)
+    table2.set_fontsize(9)
+    table2.scale(1, 2)
+    
+    # Header styling
+    for i in range(len(shot_avg_col_labels)):
+        cell = table2[(0, i)]
+        cell.set_facecolor('#4CAF50')
+        cell.set_text_props(weight='bold', color='white')
+    
+    # Method column styling
+    for i in range(len(shot_avg_table_content)):
+        cell = table2[(i+1, 0)]
+        cell.set_facecolor('#E8F5E9')
+        cell.set_text_props(weight='bold', ha='left')
+    
+    plt.title('Few-Shot Remote Sensing Results - Model-Averaged per k-shot (%)',
+              fontsize=14, fontweight='bold', pad=20)
+    
+    # Save figure
+    os.makedirs(output_dir, exist_ok=True)
+    shot_avg_png = os.path.join(output_dir, 'aggregated_results_by_shot_table.png')
+    plt.savefig(shot_avg_png, dpi=300, bbox_inches='tight')
+    plt.close(fig2)
+    logger.info(f"Saved shot-averaged table: {shot_avg_png}")
+    
+    # Save CSV for shot-averaged table
+    shot_avg_csv = os.path.join(output_dir, 'aggregated_results_by_shot_table.csv')
+    with open(shot_avg_csv, 'w') as f:
+        f.write(','.join(shot_avg_col_labels) + '\n')
+        for row in shot_avg_table_content:
+            f.write(','.join(row) + '\n')
+    logger.info(f"Saved shot-averaged CSV: {shot_avg_csv}")
+
 
 def create_comprehensive_table(
     all_results: Dict,

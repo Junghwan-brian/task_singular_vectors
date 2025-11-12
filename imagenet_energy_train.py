@@ -3,7 +3,7 @@ import time
 import json
 import logging
 import argparse
-from typing import Optional, cast, Sized
+from typing import Optional, cast, Sized, Dict, List
 
 import torch
 import torchvision
@@ -333,11 +333,11 @@ def run_imagenet_energy(cfg) -> None:
 
     # Build two dataset objects pointing to the same files but with different transforms
     _train_val_obj = ImageNetILSVRCVal(train_preprocess, location=cfg.data_location, batch_size=cfg.batch_size,
-                                       num_workers=int(getattr(cfg, "num_workers", 8)))
+                                       num_workers=int(getattr(cfg, "num_workers", 2)))
     base_train_dataset = _train_val_obj.test_dataset  # use training augmentations
 
     _eval_val_obj = ImageNetILSVRCVal(ImageEncoder(cfg.model).val_preprocess, location=cfg.data_location,
-                                      batch_size=cfg.batch_size, num_workers=int(getattr(cfg, "num_workers", 8)))
+                                      batch_size=cfg.batch_size, num_workers=int(getattr(cfg, "num_workers", 2)))
     base_val_dataset = _eval_val_obj.test_dataset  # use eval transforms
 
     classification_head = get_classification_head(cfg, test_ds)
@@ -514,10 +514,10 @@ def run_imagenet_energy(cfg) -> None:
     model.eval()
     with torch.no_grad():
         # Evaluate on our validation split instead of registry dataset to reflect k-shot split
-        pretrained_acc = _eval_on_loader(pretrained_encoder, val_full_loader)
-        logger.info(
-            f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
-        record_validation("pretrained", -2, pretrained_acc)
+        # pretrained_acc = _eval_on_loader(pretrained_encoder, val_full_loader)
+        # logger.info(
+        #     f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
+        # record_validation("pretrained", -2, pretrained_acc)
 
         eval_params = {name: p.clone() for name, p in base_params.items()}
         for safe_key, module in sigma_modules.items():
@@ -528,15 +528,15 @@ def run_imagenet_energy(cfg) -> None:
                 if eval_params[orig_key].shape == delta.shape:
                     eval_params[orig_key] = eval_params[orig_key] + delta
         model.image_encoder.load_state_dict(eval_params, strict=False)
-        zeroshot_acc = _eval_on_loader(model.image_encoder, val_full_loader)
-        logger.info(
-            f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
-        record_validation("zeroshot", -1, zeroshot_acc)
+        # zeroshot_acc = _eval_on_loader(model.image_encoder, val_full_loader)
+        # logger.info(
+        #     f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
+        # record_validation("zeroshot", -1, zeroshot_acc)
         model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
     # Alpha grid search for Sigma scaling (pre-train)
     try:
-        alphas = getattr(cfg, "alpha_grid_alphas", None)
+        alphas = getattr(cfg, "alpha_grid_alphas", [1, 3, 5, 7, 10])
         max_batches = getattr(cfg, "alpha_grid_max_batches", 50)
         if isinstance(max_batches, (int, float)):
             max_batches = int(max(0, max_batches))
@@ -632,27 +632,27 @@ def run_imagenet_energy(cfg) -> None:
         epoch_train_time = time.time() - epoch_start
         epoch_times.append(epoch_train_time)
 
-        if epoch in eval_epochs:
-            model.eval()
-            with torch.no_grad():
-                eval_params = {name: p.clone()
-                               for name, p in base_params.items()}
-                for safe_key, module in sigma_modules.items():
-                    orig_key = sigma_key_map.get(safe_key, safe_key)
-                    if orig_key in eval_params and module.sigma.numel() > 0:
-                        sigma_mod = cast(SigmaParametrization, module)
-                        delta = sigma_mod.forward().to(
-                            eval_params[orig_key].device)
-                        if eval_params[orig_key].shape == delta.shape:
-                            eval_params[orig_key] = eval_params[orig_key] + delta
-                model.image_encoder.load_state_dict(eval_params, strict=False)
-                val_acc = _eval_on_loader(model.image_encoder, val_full_loader)
-                logger.info(
-                    f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
-                record_validation("epoch", epoch, val_acc)
-                model.image_encoder.load_state_dict(
-                    base_state_dict, strict=False)
-            model.train()
+        # if epoch in eval_epochs:
+        #     model.eval()
+        #     with torch.no_grad():
+        #         eval_params = {name: p.clone()
+        #                        for name, p in base_params.items()}
+        #         for safe_key, module in sigma_modules.items():
+        #             orig_key = sigma_key_map.get(safe_key, safe_key)
+        #             if orig_key in eval_params and module.sigma.numel() > 0:
+        #                 sigma_mod = cast(SigmaParametrization, module)
+        #                 delta = sigma_mod.forward().to(
+        #                     eval_params[orig_key].device)
+        #                 if eval_params[orig_key].shape == delta.shape:
+        #                     eval_params[orig_key] = eval_params[orig_key] + delta
+        #         model.image_encoder.load_state_dict(eval_params, strict=False)
+        #         val_acc = _eval_on_loader(model.image_encoder, val_full_loader)
+        #         logger.info(
+        #             f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
+        #         record_validation("epoch", epoch, val_acc)
+        #         model.image_encoder.load_state_dict(
+        #             base_state_dict, strict=False)
+        #     model.train()
 
     # Materialize deltas and save
     with torch.no_grad():
@@ -733,8 +733,8 @@ def run_imagenet_energy(cfg) -> None:
         "loss_history": loss_history,
         "validation_history": val_history,
         "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
-        "pretrained_accuracy": float(pretrained_acc),
-        "zeroshot_accuracy": float(zeroshot_acc),
+        # "pretrained_accuracy": float(pretrained_acc),
+        # "zeroshot_accuracy": float(zeroshot_acc),
         "config_tag": cfg.config_tag,
         "ood_accuracies": ood_results,
         "all_eval_accuracies": all_eval_accuracies,
