@@ -70,6 +70,24 @@ def parse_ufm_atlas_config_tag(config_tag: str) -> Dict[str, str]:
     return result
 
 
+def parse_ufm_ln_config_tag(config_tag: str) -> Dict[str, str]:
+    """
+    Parse UFM-LN config tag to extract hyperparameters.
+    Format: ufm_ln_{lr}_{epochs}
+    Example: ufm_ln_0p001_1
+    """
+    parts = config_tag.split('_')
+    if len(parts) < 4 or not config_tag.startswith('ufm_ln_'):
+        return {}
+    
+    result = {
+        'lr': parts[2].replace('p', '.'),
+        'epochs': parts[3],
+    }
+    
+    return result
+
+
 def load_results_from_json(json_path: str) -> Optional[Dict[str, Any]]:
     """Load results from a JSON file."""
     try:
@@ -184,11 +202,13 @@ def process_ufm_shot_directory(
         if not filename.endswith('.json'):
             continue
         
-        # Process UFM energy and atlas result files
+        # Process UFM energy, atlas, zeroshot, and ln result files
         is_ufm_energy = filename == 'ufm_energy_results_none.json'
         is_ufm_atlas = filename == 'ufm_atlas_results_none.json'
+        is_ufm_zeroshot = filename == 'ufm_zeroshot_results_none.json'
+        is_ufm_ln = filename == 'ufm_ln_results_none.json'
         
-        if not (is_ufm_energy or is_ufm_atlas):
+        if not (is_ufm_energy or is_ufm_atlas or is_ufm_zeroshot or is_ufm_ln):
             continue
         
         json_path = os.path.join(shot_path, filename)
@@ -232,6 +252,28 @@ def process_ufm_shot_directory(
                 'config_tag': config_tag,
                 'json_file': filename,
             }
+        elif is_ufm_zeroshot:
+            method = 'UFM-Zeroshot'
+            
+            baseline = {
+                'method': method,
+                'accuracy': accuracy,
+                'config_tag': config_tag,
+                'json_file': filename,
+            }
+        elif is_ufm_ln:
+            method = 'UFM-LN'
+            hyperparams = parse_ufm_ln_config_tag(config_tag)
+            
+            baseline = {
+                'method': method,
+                'lr': hyperparams.get('lr', 'unknown'),
+                'epochs': hyperparams.get('epochs', 'unknown'),
+                'accuracy': accuracy,
+                'config_tag': config_tag,
+                'json_file': filename,
+                'trainable_params': data.get('trainable_params', None),
+            }
         else:
             return
         
@@ -253,6 +295,12 @@ def format_baseline_label(baseline: Dict[str, Any]) -> str:
     elif method == 'UFM-Atlas':
         lr = baseline.get('lr', '?')
         label = f"UFM-Atlas(lr={lr})"
+    elif method == 'UFM-Zeroshot':
+        label = "Zeroshot"
+    elif method == 'UFM-LN':
+        lr = baseline.get('lr', '?')
+        epochs = baseline.get('epochs', '?')
+        label = f"Linear Norm(lr={lr}, ep={epochs})"
     else:
         label = method
     
@@ -285,6 +333,10 @@ def visualize_shot_results(
             colors.append('steelblue')
         elif b['method'] == 'UFM-Atlas':
             colors.append('coral')
+        elif b['method'] == 'UFM-Zeroshot':
+            colors.append('lightgreen')
+        elif b['method'] == 'UFM-LN':
+            colors.append('skyblue')
         else:
             colors.append('gray')
     
@@ -328,7 +380,9 @@ def visualize_shot_results(
     # Legend
     energy_patch = mpatches.Patch(color='steelblue', label='UFM-Energy')
     atlas_patch = mpatches.Patch(color='coral', label='UFM-Atlas')
-    ax.legend(handles=[energy_patch, atlas_patch], loc='lower right', fontsize=10)
+    zeroshot_patch = mpatches.Patch(color='lightgreen', label='Zeroshot')
+    ln_patch = mpatches.Patch(color='skyblue', label='Linear Norm')
+    ax.legend(handles=[energy_patch, atlas_patch, zeroshot_patch, ln_patch], loc='lower right', fontsize=10)
     
     plt.tight_layout()
     
@@ -379,6 +433,12 @@ def aggregate_across_datasets(all_results: Dict) -> Dict[str, Dict[str, Dict[str
                     elif method == 'UFM-Atlas':
                         lr = baseline.get('lr', 'unknown')
                         key = f"UFM-Atlas_lr={lr}"
+                    elif method == 'UFM-Zeroshot':
+                        key = "Zeroshot"
+                    elif method == 'UFM-LN':
+                        lr = baseline.get('lr', 'unknown')
+                        epochs = baseline.get('epochs', 'unknown')
+                        key = f"Linear Norm_lr={lr}_ep={epochs}"
                     else:
                         key = method
                     
@@ -444,6 +504,12 @@ def select_best_method_config_per_dataset(
                     elif method_name == 'UFM-Atlas':
                         lr = best_baseline.get('lr', 'unknown')
                         config_key = f"UFM-Atlas_lr={lr}"
+                    elif method_name == 'UFM-Zeroshot':
+                        config_key = "Zeroshot"
+                    elif method_name == 'UFM-LN':
+                        lr = best_baseline.get('lr', 'unknown')
+                        epochs = best_baseline.get('epochs', 'unknown')
+                        config_key = f"Linear Norm_lr={lr}_ep={epochs}"
                     else:
                         config_key = method_name
                     
@@ -501,6 +567,8 @@ def visualize_aggregated_table(
     averaged_results: Dict,
     best_ufm_energy_configs: Dict,
     best_ufm_atlas_configs: Dict,
+    best_ufm_ln_configs: Dict,
+    best_ufm_zeroshot_configs: Dict,
     output_dir: str
 ) -> None:
     """
@@ -510,6 +578,8 @@ def visualize_aggregated_table(
         averaged_results: Averaged accuracy for all methods/configs
         best_ufm_energy_configs: Best UFM-Energy configs per model/shot
         best_ufm_atlas_configs: Best UFM-Atlas configs per model/shot
+        best_ufm_ln_configs: Best UFM-LN configs per model/shot
+        best_ufm_zeroshot_configs: Best UFM-Zeroshot configs per model/shot
         output_dir: Output directory
     """
     # Define shot order
@@ -541,9 +611,21 @@ def visualize_aggregated_table(
                 best_config_key, best_acc = best_ufm_atlas_configs[model_name][shot_name]
                 table_data['UFM-Atlas (best config)'][model_name][shot_name] = best_acc
                 best_config_info['UFM-Atlas'][model_name][shot_name] = best_config_key
+            
+            # Handle UFM-LN - use best config
+            if model_name in best_ufm_ln_configs and shot_name in best_ufm_ln_configs[model_name]:
+                best_config_key, best_acc = best_ufm_ln_configs[model_name][shot_name]
+                table_data['Linear Norm (best config)'][model_name][shot_name] = best_acc
+                best_config_info['Linear Norm'][model_name][shot_name] = best_config_key
+            
+            # Handle Zeroshot
+            if model_name in best_ufm_zeroshot_configs and shot_name in best_ufm_zeroshot_configs[model_name]:
+                best_config_key, best_acc = best_ufm_zeroshot_configs[model_name][shot_name]
+                table_data['Zeroshot'][model_name][shot_name] = best_acc
+                best_config_info['Zeroshot'][model_name][shot_name] = best_config_key
     
     # Method list
-    method_list = ['UFM-Energy (best config)', 'UFM-Atlas (best config)']
+    method_list = ['UFM-Energy (best config)', 'UFM-Atlas (best config)', 'Linear Norm (best config)', 'Zeroshot']
     
     # Create table visualization
     fig = plt.figure(figsize=(14, 6))
@@ -643,7 +725,7 @@ def visualize_aggregated_table(
         f.write("Best Hyperparameter Configurations for UFM Methods\n")
         f.write("=" * 80 + "\n\n")
         
-        for method_name in ['UFM-Energy', 'UFM-Atlas']:
+        for method_name in ['UFM-Energy', 'UFM-Atlas', 'Linear Norm', 'Zeroshot']:
             if method_name in best_config_info and best_config_info[method_name]:
                 f.write(f"Method: {method_name}\n")
                 f.write("=" * 80 + "\n")
@@ -654,7 +736,14 @@ def visualize_aggregated_table(
                         for shot in shot_order:
                             if shot in best_config_info[method_name].get(model, {}):
                                 config_key = best_config_info[method_name][model][shot]
-                                accuracy = table_data[f'{method_name} (best config)'][model][shot]
+                                # Different methods have different table data keys
+                                if method_name in ['Linear Norm', 'Zeroshot']:
+                                    table_key = method_name
+                                    if method_name == 'Linear Norm':
+                                        table_key = 'Linear Norm (best config)'
+                                else:
+                                    table_key = f'{method_name} (best config)'
+                                accuracy = table_data[table_key][model][shot]
                                 f.write(f"    {shot}: {config_key} (Acc: {accuracy:.2f}%)\n")
                         f.write("\n")
                 f.write("\n")
@@ -666,6 +755,8 @@ def create_comprehensive_table(
     all_results: Dict,
     best_ufm_energy_per_dataset: Dict,
     best_ufm_atlas_per_dataset: Dict,
+    best_ufm_ln_per_dataset: Dict,
+    best_ufm_zeroshot_per_dataset: Dict,
     output_dir: str
 ) -> None:
     """
@@ -675,6 +766,8 @@ def create_comprehensive_table(
         all_results: All results
         best_ufm_energy_per_dataset: Best UFM-Energy configs per dataset
         best_ufm_atlas_per_dataset: Best UFM-Atlas configs per dataset
+        best_ufm_ln_per_dataset: Best UFM-LN configs per dataset
+        best_ufm_zeroshot_per_dataset: Best UFM-Zeroshot configs per dataset
         output_dir: Output directory
     """
     # Define shot order
@@ -711,13 +804,27 @@ def create_comprehensive_table(
                         if shot_name in best_ufm_atlas_per_dataset[dataset_name][model_name]:
                             _, best_acc, _ = best_ufm_atlas_per_dataset[dataset_name][model_name][shot_name]
                             data_structure[model_name][shot_name]['UFM-Atlas (best)'][dataset_name] = best_acc
+                
+                # For UFM-LN, use dataset-specific best config
+                if dataset_name in best_ufm_ln_per_dataset:
+                    if model_name in best_ufm_ln_per_dataset[dataset_name]:
+                        if shot_name in best_ufm_ln_per_dataset[dataset_name][model_name]:
+                            _, best_acc, _ = best_ufm_ln_per_dataset[dataset_name][model_name][shot_name]
+                            data_structure[model_name][shot_name]['Linear Norm'][dataset_name] = best_acc
+                
+                # For Zeroshot, use dataset-specific result
+                if dataset_name in best_ufm_zeroshot_per_dataset:
+                    if model_name in best_ufm_zeroshot_per_dataset[dataset_name]:
+                        if shot_name in best_ufm_zeroshot_per_dataset[dataset_name][model_name]:
+                            _, best_acc, _ = best_ufm_zeroshot_per_dataset[dataset_name][model_name][shot_name]
+                            data_structure[model_name][shot_name]['Zeroshot'][dataset_name] = best_acc
     
     # Create table
     col_labels = ['Model', 'Shot', 'Method'] + all_datasets + ['Average']
     
     # Prepare table content
     table_content = []
-    method_list = ['UFM-Energy (best)', 'UFM-Atlas (best)']
+    method_list = ['UFM-Energy (best)', 'UFM-Atlas (best)', 'Linear Norm', 'Zeroshot']
     
     for model_idx, model_name in enumerate(models):
         for shot_idx, shot_name in enumerate(shot_order):
@@ -914,6 +1021,12 @@ def main():
     logger.info("Selecting best UFM-Atlas configurations per dataset...")
     best_ufm_atlas_per_dataset = select_best_method_config_per_dataset(all_results, 'UFM-Atlas')
     
+    logger.info("Selecting best UFM-LN configurations per dataset...")
+    best_ufm_ln_per_dataset = select_best_method_config_per_dataset(all_results, 'UFM-LN')
+    
+    # Zeroshot doesn't need "best" selection as there's only one config
+    best_ufm_zeroshot_per_dataset = select_best_method_config_per_dataset(all_results, 'UFM-Zeroshot')
+    
     # Save best configurations to JSON
     best_config_path = os.path.join(args.output_dir, 'ufm_best_configs_per_dataset.json')
     os.makedirs(args.output_dir, exist_ok=True)
@@ -946,6 +1059,32 @@ def main():
                         'config_tag': config_tag
                     }
         
+        # Add UFM-LN configs
+        serializable_config['UFM-LN'] = {}
+        for dataset, models in best_ufm_ln_per_dataset.items():
+            serializable_config['UFM-LN'][dataset] = {}
+            for model, shots in models.items():
+                serializable_config['UFM-LN'][dataset][model] = {}
+                for shot, (config_key, accuracy, config_tag) in shots.items():
+                    serializable_config['UFM-LN'][dataset][model][shot] = {
+                        'config_key': config_key,
+                        'accuracy': accuracy,
+                        'config_tag': config_tag
+                    }
+        
+        # Add UFM-Zeroshot configs
+        serializable_config['UFM-Zeroshot'] = {}
+        for dataset, models in best_ufm_zeroshot_per_dataset.items():
+            serializable_config['UFM-Zeroshot'][dataset] = {}
+            for model, shots in models.items():
+                serializable_config['UFM-Zeroshot'][dataset][model] = {}
+                for shot, (config_key, accuracy, config_tag) in shots.items():
+                    serializable_config['UFM-Zeroshot'][dataset][model][shot] = {
+                        'config_key': config_key,
+                        'accuracy': accuracy,
+                        'config_tag': config_tag
+                    }
+        
         json.dump(serializable_config, f, indent=2)
     logger.info(f"Saved best configs per dataset to: {best_config_path}")
     
@@ -960,11 +1099,19 @@ def main():
     logger.info("Computing best UFM-Atlas configuration from averaged results...")
     best_ufm_atlas_configs_avg = compute_averaged_best_configs_from_aggregated(averaged_results, 'UFM-Atlas')
     
+    logger.info("Computing best UFM-LN configuration from averaged results...")
+    best_ufm_ln_configs_avg = compute_averaged_best_configs_from_aggregated(averaged_results, 'Linear Norm')
+    
+    # Zeroshot doesn't need averaging since there's only one config
+    best_ufm_zeroshot_configs_avg = compute_averaged_best_configs_from_aggregated(averaged_results, 'Zeroshot')
+    
     logger.info("Generating aggregated visualization...")
     visualize_aggregated_table(
         averaged_results,
         best_ufm_energy_configs_avg,
         best_ufm_atlas_configs_avg,
+        best_ufm_ln_configs_avg,
+        best_ufm_zeroshot_configs_avg,
         args.output_dir
     )
     
@@ -974,6 +1121,8 @@ def main():
         all_results,
         best_ufm_energy_per_dataset,
         best_ufm_atlas_per_dataset,
+        best_ufm_ln_per_dataset,
+        best_ufm_zeroshot_per_dataset,
         args.output_dir
     )
     

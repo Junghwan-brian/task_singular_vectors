@@ -339,7 +339,7 @@ def process_shot_directory(
                 'gpu_memory': gpu_memory,
             }
         elif is_baseline:
-            # Handle baseline methods: linear_probe, tip, lora, lp++
+            # Handle baseline methods: linear_probe, tip, lora, lp++, zeroshot
             method_name = data.get('method', 'Unknown')
             
             # Map method names to display names (remove "baseline" prefix)
@@ -351,6 +351,7 @@ def process_shot_directory(
                 'lp++': 'LP++',
                 'lp_plus_plus': 'LP++',
                 'lora': 'LoRA',
+                'zeroshot': 'ZeroShot',
             }
             
             method = method_display_map.get(method_name, method_name.title())
@@ -433,6 +434,9 @@ def format_baseline_label(baseline: Dict[str, Any]) -> str:
             label = f"LoRA(r={r}, α={alpha}, lr={lr})"
         else:
             label = method
+    elif method == 'ZeroShot':
+        # ZeroShot has no hyperparameters
+        label = 'ZeroShot'
     else:
         label = method
         if adapter != 'none':
@@ -613,6 +617,9 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
                             key = f"LP++_ratio={ratio}_lambda={lambda_val}"
                         else:
                             key = method
+                    elif method == 'ZeroShot':
+                        # ZeroShot has no hyperparameters
+                        key = 'ZeroShot'
                     else:
                         key = f"{method}_{adapter}"
                     
@@ -876,7 +883,8 @@ def visualize_aggregated_table(
     linearprobe_methods = {m for m in all_methods if m.startswith('LinearProbe')}
     tip_methods = {m for m in all_methods if m.startswith('TIP')}
     lpp_methods = {m for m in all_methods if m.startswith('LP++')}
-    other_methods = all_methods - energy_methods - atlas_methods - lora_methods - linearprobe_methods - tip_methods - lpp_methods
+    zeroshot_methods = {m for m in all_methods if m == 'ZeroShot'}
+    other_methods = all_methods - energy_methods - atlas_methods - lora_methods - linearprobe_methods - tip_methods - lpp_methods - zeroshot_methods
     
     # Prepare method list (best configs for each method type)
     method_list = (
@@ -885,6 +893,7 @@ def visualize_aggregated_table(
         ['LinearProbe (best config)'] +
         ['TIP (best config)'] +
         ['LP++ (best config)'] +
+        sorted(zeroshot_methods) +
         sorted(atlas_methods) +
         sorted(other_methods)
     )
@@ -919,9 +928,11 @@ def visualize_aggregated_table(
                         table_data[f'{method_name} (best config)'][model_name][shot_name] = best_acc
                         best_config_info[method_name][model_name][shot_name] = best_config_key
             
-            # Handle Atlas and others
+            # Handle Atlas, ZeroShot, and others
             for method_key, accuracy in methods.items():
                 if method_key.startswith('Atlas_'):
+                    table_data[method_key][model_name][shot_name] = accuracy
+                elif method_key == 'ZeroShot':
                     table_data[method_key][model_name][shot_name] = accuracy
                 elif not any(method_key.startswith(prefix) for prefix in ['Energy_', 'LoRA_', 'LinearProbe_', 'TIP_', 'LP++']):
                     table_data[method_key][model_name][shot_name] = accuracy
@@ -1202,6 +1213,7 @@ def create_comprehensive_table(
     has_linearprobe = False
     has_tip = False
     has_lpp = False
+    has_zeroshot = False
     atlas_methods = set()
     other_methods = set()
     
@@ -1223,6 +1235,8 @@ def create_comprehensive_table(
                         has_tip = True
                     elif method == 'LP++':
                         has_lpp = True
+                    elif method == 'ZeroShot':
+                        has_zeroshot = True
                     else:
                         other_methods.add(f'{method}_{adapter}')
     
@@ -1238,6 +1252,8 @@ def create_comprehensive_table(
         method_list.append('TIP (best config)')
     if has_lpp:
         method_list.append('LP++ (best config)')
+    if has_zeroshot:
+        method_list.append('ZeroShot')
     method_list.extend(sorted(atlas_methods))
     method_list.extend(sorted(other_methods))
     
@@ -1269,6 +1285,8 @@ def create_comprehensive_table(
                         atlas_baselines[f'Atlas_{adapter}'].append(accuracy)
                     elif method in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
                         baseline_method_results[method].append(accuracy)
+                    elif method == 'ZeroShot':
+                        baseline_method_results['ZeroShot'].append(accuracy)
                     else:
                         other_baselines[f'{method}_{adapter}'].append(accuracy)
                 
@@ -1287,6 +1305,10 @@ def create_comprehensive_table(
                                 if shot_name in best_baseline_per_dataset[method_name][dataset_name][model_name]:
                                     _, best_acc, _ = best_baseline_per_dataset[method_name][dataset_name][model_name][shot_name]
                                     data_structure[model_name][shot_name][f'{method_name} (best config)'][dataset_name] = best_acc
+                
+                # For ZeroShot (no hyperparameters, just take first result)
+                if 'ZeroShot' in baseline_method_results and baseline_method_results['ZeroShot']:
+                    data_structure[model_name][shot_name]['ZeroShot'][dataset_name] = baseline_method_results['ZeroShot'][0]
                 
                 # For Atlas
                 for atlas_key, accuracies in atlas_baselines.items():
@@ -1500,7 +1522,7 @@ def format_method_label(method_key: str) -> str:
             return 'Atlas'
         else:
             return f'Atlas+{adapter.upper()}'
-    elif method_key in ['LinearProbe', 'TIP', 'LP++', 'LoRA']:
+    elif method_key in ['LinearProbe', 'TIP', 'LP++', 'LoRA', 'ZeroShot']:
         # Baseline methods - return as-is
         return method_key
     else:
