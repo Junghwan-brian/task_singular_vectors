@@ -212,7 +212,7 @@ ATLAS_K = [1,2,4,8,16]
 
 # Baseline configurations
 BASELINE_MODELS = ["ViT-L-14", "ViT-B-16", "ViT-B-32"]
-BASELINE_METHODS = ["lp++", "lora"]
+BASELINE_METHODS = ["lp++"]
 BASELINE_K = [1,2,4,8,16]
 BASELINE_LP_LR = [1e-3, 1e-4]
 BASELINE_LP_EPOCHS = [20]
