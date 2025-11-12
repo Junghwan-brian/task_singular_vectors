@@ -840,7 +840,7 @@ def main():
         description='Aggregate and visualize UFM (test-time adaptation) experiment results'
     )
     parser.add_argument(
-        '--tta_model_location',
+        '--model_location',
         type=str,
         default='./models/checkpoints_tta',
         help='Root directory containing TTA model checkpoints'
