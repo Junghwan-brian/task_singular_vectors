@@ -880,12 +880,12 @@ def main():
     logger.info("=" * 80)
     logger.info("UFM Test-Time Adaptation Results Aggregation")
     logger.info("=" * 80)
-    logger.info(f"TTA model location: {args.tta_model_location}")
+    logger.info(f"TTA model location: {args.model_location}")
     logger.info(f"Output directory: {args.output_dir}")
     
     # Discover all UFM results
     logger.info("\nDiscovering UFM results...")
-    all_results = discover_ufm_results(args.tta_model_location)
+    all_results = discover_ufm_results(args.model_location)
     
     if not all_results:
         logger.error("No UFM results found!")
