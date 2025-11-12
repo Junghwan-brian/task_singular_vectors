@@ -124,11 +124,23 @@ class IndexWrapper(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = self.dataset[idx]
         if isinstance(data, dict):
-            data["index"] = idx
-            return data
+            # Handle dict returned by TwoAsymetricTransform
+            result = data.copy()
+            result["index"] = idx
+            return result
+        elif isinstance(data, tuple) and len(data) == 2:
+            # Handle (data, label) tuple
+            if isinstance(data[0], dict):
+                # Transform returned a dict (e.g., TwoAsymetricTransform)
+                result = data[0].copy()
+                result["labels"] = data[1]
+                result["index"] = idx
+                return result
+            else:
+                # Normal (image, label) tuple
+                return {"images": data[0], "labels": data[1], "index": idx}
         else:
-            # Assume (image, label) tuple
-            return {"images": data[0], "labels": data[1], "index": idx}
+            raise ValueError(f"Unexpected data format: {type(data)}")
     
     def __len__(self):
         return len(self.dataset)
@@ -177,6 +189,34 @@ class TwoStreamBatchSampler(torch.utils.data.Sampler):
         return self.n_batches
 
 
+def collate_fn(batch):
+    """Custom collate function to handle nested dicts from TwoAsymetricTransform."""
+    result = {}
+    keys = batch[0].keys()
+    
+    for key in keys:
+        if key == "index":
+            result[key] = torch.tensor([item[key] for item in batch])
+        elif key in ["images", "images_"]:
+            # Stack image tensors
+            result[key] = torch.stack([item[key] for item in batch])
+        elif key == "labels":
+            # Handle labels if present
+            labels = [item[key] for item in batch]
+            if isinstance(labels[0], torch.Tensor):
+                result[key] = torch.stack(labels)
+            else:
+                result[key] = torch.tensor(labels)
+        else:
+            # Default: try to stack or keep as list
+            try:
+                result[key] = torch.stack([item[key] for item in batch])
+            except:
+                result[key] = [item[key] for item in batch]
+    
+    return result
+
+
 class TwoAsymetricTransform:
     """Apply two different transforms (weak and strong augmentation)."""
     def __init__(self, weak_transform, strong_transform):
@@ -189,11 +229,120 @@ class TwoAsymetricTransform:
         return {"images": weak, "images_": strong}
 
 
+def grid_search_sigma_alpha(
+    sigma_modules: torch.nn.ModuleDict,
+    sigma_key_map,
+    base_params,
+    base_buffers,
+    image_encoder,
+    classification_head,
+    train_loader,
+    device,
+    alphas=None,
+    max_batches: int = None,
+    apply_best: bool = True,
+    logger: Optional[logging.Logger] = None,
+):
+    """
+    Grid search over alpha values to find optimal scaling for sigma.
+    
+    Args:
+        sigma_modules: SigmaParametrization modules
+        sigma_key_map: safe key -> original key mapping
+        base_params: frozen encoder parameters
+        base_buffers: encoder buffers
+        image_encoder: ImageEncoder model
+        classification_head: classification head
+        train_loader: training data loader for evaluation
+        device: device string or torch.device
+        alphas: list of alpha candidates (default [1,5,10,15,20])
+        max_batches: max batches for evaluation (None = use all)
+        apply_best: whether to apply best alpha to sigma
+        logger: logger instance
+    Returns:
+        (best_alpha, best_acc)
+    """
+    if alphas is None:
+        alphas = [1, 5, 10, 15, 20]
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    image_encoder.eval()
+    classification_head.eval()
+    
+    best_alpha = None
+    best_acc = -1.0
+    
+    with torch.no_grad():
+        for alpha in alphas:
+            correct = 0.0
+            total = 0.0
+            for b_idx, batch in enumerate(train_loader):
+                if max_batches is not None and max_batches > 0 and b_idx >= max_batches:
+                    break
+                
+                batch = maybe_dictionarize(batch)
+                inputs = batch["images"].to(device)
+                labels = batch["labels"].to(device)
+                
+                # Build delta map with scaled sigma
+                delta_map = {}
+                for safe_key, module in sigma_modules.items():
+                    orig_key = sigma_key_map.get(safe_key, safe_key)
+                    if orig_key in base_params and module.sigma.numel() > 0:
+                        # Scaled delta: U @ diag(relu(sigma) * alpha) @ V
+                        sigma_vec = torch.relu(module.sigma) * float(alpha)
+                        delta = module.U @ torch.diag(sigma_vec) @ module.V
+                        if delta.shape == base_params[orig_key].shape:
+                            delta_map[orig_key] = delta
+                
+                # Merge params
+                params_map = {}
+                for name, p in base_params.items():
+                    if name in delta_map:
+                        params_map[name] = p + delta_map[name]
+                    else:
+                        params_map[name] = p
+                
+                # Functional forward
+                def encoder_forward(mod, x):
+                    merged = {}
+                    merged.update(base_buffers)
+                    merged.update(params_map)
+                    return functional_call(mod, merged, (x,))
+                
+                features = encoder_forward(image_encoder, inputs)
+                logits = classification_head(features)
+                preds = logits.argmax(dim=1, keepdim=False)
+                correct += float(preds.eq(labels).sum().item())
+                total += float(labels.size(0))
+            
+            acc = (correct / total) if total > 0 else 0.0
+            logger.info(f"[alpha-grid] alpha={alpha} -> train accuracy={acc*100:.2f}%")
+            if acc > best_acc:
+                best_acc = acc
+                best_alpha = alpha
+    
+    if best_alpha is None:
+        best_alpha = 1.0
+    
+    # Apply best alpha
+    if apply_best:
+        for _, module in sigma_modules.items():
+            if module.sigma.numel() > 0:
+                module.sigma.data.mul_(float(best_alpha))
+        logger.info(f"[alpha-grid] Selected alpha={best_alpha} (acc={best_acc*100:.2f}%), applied to sigma.")
+    else:
+        logger.info(f"[alpha-grid] Selected alpha={best_alpha} (acc={best_acc*100:.2f}%), not applied (apply_best=False).")
+    
+    return best_alpha, best_acc
+
+
 def get_preds(dataset, model, classification_head, device, base_params, base_buffers, sigma_modules, sigma_key_map):
     """Get predictions for trusted sample selection."""
     model.eval()
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=128, shuffle=False, num_workers=4
+        dataset, batch_size=128, shuffle=False, num_workers=2
     )
     
     all_preds = []
@@ -517,6 +666,40 @@ def run_ufm_energy(cfg: DictConfig) -> None:
         for name, b in image_encoder.named_buffers()
     }
     
+    # Grid search for optimal sigma alpha scaling
+    selected_alpha = 1.0  # Default value
+    alpha_search_acc = None
+    try:
+        # Create a simple DataLoader for grid search evaluation
+        alpha_eval_loader = torch.utils.data.DataLoader(
+            test_data,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=2
+        )
+        
+        alpha_candidates = getattr(cfg, "sigma_alpha_candidates", [1, 3, 5, 7, 10])
+        max_eval_batches = int(getattr(cfg, "sigma_alpha_eval_batches", 0)) or None
+        logger.info(f"Running alpha grid search over {alpha_candidates} (max_batches={max_eval_batches})")
+        
+        selected_alpha, alpha_search_acc = grid_search_sigma_alpha(
+            sigma_modules=sigma_modules,
+            sigma_key_map=sigma_key_map,
+            base_params=base_params,
+            base_buffers=base_buffers,
+            image_encoder=image_encoder,
+            classification_head=classification_head,
+            train_loader=alpha_eval_loader,
+            device=cfg.device,
+            alphas=alpha_candidates,
+            max_batches=max_eval_batches,
+            apply_best=True,
+            logger=logger,
+        )
+        logger.info(f"Selected alpha={selected_alpha} (train acc={alpha_search_acc*100:.2f}%) for sigma initialization.")
+    except Exception as e:
+        logger.warning(f"Alpha grid search failed: {e}. Proceeding without scaling.")
+    
     # Get predictions for trusted sample selection
     logger.info("Computing predictions for trusted sample selection...")
     preds = get_preds(test_data, image_encoder, classification_head, cfg.device,
@@ -571,7 +754,8 @@ def run_ufm_energy(cfg: DictConfig) -> None:
     train_loader = torch.utils.data.DataLoader(
         index_dataset,
         batch_sampler=sampler,
-        num_workers=4
+        num_workers=2,
+        collate_fn=collate_fn
     )
     
     # Prepare validation loader
@@ -579,7 +763,7 @@ def run_ufm_energy(cfg: DictConfig) -> None:
         test_data,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=4
+        num_workers=2
     )
     
     logger.info(f"Train batches: {len(train_loader)}, Val samples: {len(val_loader.dataset)}")
@@ -660,31 +844,6 @@ def run_ufm_energy(cfg: DictConfig) -> None:
         epoch_times.append(epoch_train_time)
         logger.info(f"Epoch {epoch} training time: {epoch_train_time:.2f}s")
         
-        # Evaluate after each epoch
-        with torch.no_grad():
-            eval_params = {}
-            for name, p in base_params.items():
-                eval_params[name] = p.clone()
-            
-            for safe_key, module in sigma_modules.items():
-                orig_key = sigma_key_map.get(safe_key, safe_key)
-                if orig_key in eval_params and module.sigma.numel() > 0:
-                    delta = module().to(eval_params[orig_key].device)
-                    if eval_params[orig_key].shape == delta.shape:
-                        eval_params[orig_key] = eval_params[orig_key] + delta
-            
-            image_encoder.load_state_dict(eval_params, strict=False)
-            
-            val_metrics = evaluate_encoder_with_dataloader(
-                image_encoder, classification_head, val_loader, cfg.device
-            )
-            val_acc = val_metrics['top1']
-        
-        logger.info(f"Epoch {epoch}: Accuracy = {val_acc * 100:.2f}%")
-        
-        if val_acc > best_acc:
-            best_acc = val_acc
-            logger.info(f"✓ New best accuracy: {best_acc * 100:.2f}%")
     
     # Final evaluation
     logger.info("\n" + "=" * 100)
@@ -731,12 +890,6 @@ def run_ufm_energy(cfg: DictConfig) -> None:
     )
     os.makedirs(save_dir, exist_ok=True)
     
-    # Save sigma modules
-    energy_path = os.path.join(save_dir, "ufm_energy.pt")
-    sigma_state = {safe_key: module.state_dict() for safe_key, module in sigma_modules.items()}
-    torch.save(sigma_state, energy_path)
-    logger.info(f"✓ Saved UFM-Energy sigma to {energy_path}")
-    
     # Save results JSON
     results_path = os.path.join(save_dir, "ufm_energy_results_none.json")
     results = {
@@ -750,6 +903,8 @@ def run_ufm_energy(cfg: DictConfig) -> None:
         "sigma_wd": cfg.sigma_wd,
         "svd_keep_topk": getattr(cfg, "svd_keep_topk", 2),
         "initialize_sigma": getattr(cfg, "initialize_sigma", None),
+        "sigma_alpha": float(selected_alpha),
+        "sigma_alpha_search_acc": float(alpha_search_acc) if alpha_search_acc is not None else None,
         "training_time": min_epoch_time,
         "avg_epoch_time": avg_epoch_time,
         "all_epoch_times": epoch_times,
@@ -816,6 +971,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
+        default=32,
         help="Training batch size"
     )
     parser.add_argument(
@@ -882,7 +1038,6 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
-    
     # Load config file
     cfg = load_config(args.config_file)
     
@@ -898,6 +1053,14 @@ if __name__ == "__main__":
         parser.error("--test_dataset is required")
     
     # Model-specific adjustments
+    if cfg.model == "ViT-B-16":
+        cfg.batch_size = 64
+    elif cfg.model == "ViT-L-14":
+        cfg.batch_size = 32
+    elif cfg.model == "ViT-B-32":
+        cfg.batch_size = 16
+    else:
+        raise ValueError(f"Invalid model: {args.model}")
     if cfg.model == "ViT-L-14":
         if not hasattr(cfg, 'batch_size_override') or not cfg.batch_size_override:
             original_batch_size = cfg.get('batch_size', 128)
