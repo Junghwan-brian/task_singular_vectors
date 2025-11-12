@@ -1569,15 +1569,17 @@ def create_aggregated_by_shot_table_from_comprehensive(
     method_list.extend(atlas_methods)
     method_list.extend(other_methods)
     
-    # Create table: columns are shots, rows are methods
+    # Create table: columns are shots + Average + Params + Memory, rows are methods
     # For each method/shot, average across all models
-    shot_avg_col_labels = ['Method'] + [s.replace('shots', '-shot') for s in shot_order]
+    shot_avg_col_labels = ['Method'] + [s.replace('shots', '-shot') for s in shot_order] + ['Average', 'Params (M)', 'GPU Mem (MB)']
     shot_avg_table_content = []
     
     models = list(comprehensive_averaged_results.keys())
     
     for method in method_list:
         row = [format_method_label(method)]
+        all_shot_vals = []  # For computing overall average
+        
         for shot in shot_order:
             # Gather accuracies for this method/shot across models
             shot_vals = []
@@ -1587,13 +1589,78 @@ def create_aggregated_by_shot_table_from_comprehensive(
                     if acc is not None:
                         shot_vals.append(acc)
             if shot_vals:
-                row.append(f"{(sum(shot_vals) / len(shot_vals)):.2f}")
+                avg_acc = sum(shot_vals) / len(shot_vals)
+                row.append(f"{avg_acc:.2f}")
+                all_shot_vals.extend(shot_vals)
             else:
                 row.append("-")
+        
+        # Add overall average across all shots and models
+        if all_shot_vals:
+            row.append(f"{(sum(all_shot_vals) / len(all_shot_vals)):.2f}")
+        else:
+            row.append("-")
+        
+        # Add params and memory info
+        # Get from the best config for this method (use first model and shot where available)
+        params_found = None
+        memory_found = None
+        for model in models:
+            for shot in shot_order:
+                # Get the config key for this method
+                config_key = None
+                if method == 'Energy (best config)':
+                    # Find in best_energy_per_dataset
+                    for dataset_name in best_energy_configs.keys():
+                        if dataset_name in best_energy_configs:
+                            if model in best_energy_configs[dataset_name]:
+                                if shot in best_energy_configs[dataset_name][model]:
+                                    config_key, _, _ = best_energy_configs[dataset_name][model][shot]
+                                    break
+                        if config_key:
+                            break
+                elif method.endswith(' (best config)'):
+                    method_name = method.replace(' (best config)', '')
+                    if method_name in best_baseline_configs:
+                        for dataset_name in best_baseline_configs[method_name].keys():
+                            if dataset_name in best_baseline_configs[method_name]:
+                                if model in best_baseline_configs[method_name][dataset_name]:
+                                    if shot in best_baseline_configs[method_name][dataset_name][model]:
+                                        config_key, _, _ = best_baseline_configs[method_name][dataset_name][model][shot]
+                                        break
+                            if config_key:
+                                break
+                else:
+                    config_key = method
+                
+                # Get params and memory from params_memory_info
+                if config_key and model in params_memory_info and shot in params_memory_info[model]:
+                    if config_key in params_memory_info[model][shot]:
+                        params, memory = params_memory_info[model][shot][config_key]
+                        if params is not None:
+                            params_found = params
+                        if memory is not None:
+                            memory_found = memory
+                        break
+            if params_found is not None or memory_found is not None:
+                break
+        
+        # Format params in millions
+        if params_found is not None:
+            row.append(f"{params_found / 1e6:.2f}")
+        else:
+            row.append("-")
+        
+        # Format memory
+        if memory_found is not None:
+            row.append(f"{memory_found:.1f}")
+        else:
+            row.append("-")
+        
         shot_avg_table_content.append(row)
     
-    # Create figure for shot-averaged table
-    fig = plt.figure(figsize=(12, max(6, len(method_list) * 0.5 + 2)))
+    # Create figure for shot-averaged table (wider to accommodate new columns)
+    fig = plt.figure(figsize=(16, max(6, len(method_list) * 0.5 + 2)))
     ax = fig.add_subplot(111)
     ax.axis('tight')
     ax.axis('off')
@@ -1606,7 +1673,7 @@ def create_aggregated_by_shot_table_from_comprehensive(
         bbox=[0, 0, 1, 1]
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(9)
+    table.set_fontsize(8)
     table.scale(1, 2)
     
     # Header styling
@@ -1792,7 +1859,10 @@ def main():
     # Generate aggregated by shot table using results from comprehensive table
     # This ensures consistency - both tables use the same dataset-specific best configs
     logger.info("\nGenerating aggregated by shot table (using comprehensive table results)...")
-    create_aggregated_by_shot_table_from_comprehensive(comprehensive_averaged_results, args.output_dir)
+    create_aggregated_by_shot_table_from_comprehensive(
+        comprehensive_averaged_results, params_memory_info, 
+        best_energy_per_dataset, best_baseline_per_dataset, args.output_dir
+    )
     
     # Generate individual visualizations if not aggregate_only
     if not args.aggregate_only:
