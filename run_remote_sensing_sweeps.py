@@ -212,7 +212,7 @@ ATLAS_K = [1,2,4,8,16]
 
 # Baseline configurations
 BASELINE_MODELS = ["ViT-L-14", "ViT-B-16", "ViT-B-32"]
-BASELINE_METHODS = ["lp++"]
+BASELINE_METHODS = ["lp++", "zeroshot"]
 BASELINE_K = [1,2,4,8,16]
 BASELINE_LP_LR = [1e-3, 1e-4]
 BASELINE_LP_EPOCHS = [20]
@@ -338,6 +338,8 @@ def _baseline_config_tag(method: str, **kwargs) -> str:
         epochs = _sanitize_value(kwargs.get('lora_epochs', 20))
         wd = _sanitize_value(kwargs.get('lora_wd', 0.0))
         return f"baseline_lora_{r}_{alpha}_{lr}_{epochs}_{wd}"
+    elif method == 'zeroshot':
+        return f"baseline_zeroshot"
     else:
         return f"baseline_{method}"
 
@@ -458,6 +460,29 @@ def build_baseline_commands(datasets: Sequence[str]) -> List[List[str]]:
                     "--lora_wd", f"{lora_wd:.6g}",
                 ]
                 commands.append(cmd)
+        
+        elif method == 'zeroshot':
+            # ZeroShot has no hyperparameters, just one config per model/dataset/k
+            hparams = {}
+            results_json = _expected_baseline_paths(
+                model=model, dataset=dataset, method=method, k=k, **hparams
+            )
+            if _path_exists(results_json):
+                print(
+                    f"[skip] baseline {model} {dataset} (method={method}, k={k}) -> {results_json}",
+                    flush=True,
+                )
+                continue
+            
+            cmd = [
+                sys.executable,
+                "baselines_train_remote_sensing.py",
+                "--model", model,
+                "--baseline_method", method,
+                "--k", str(k),
+                "--target_dataset", dataset,
+            ]
+            commands.append(cmd)
     
     return commands
 
