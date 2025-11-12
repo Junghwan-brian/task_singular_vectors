@@ -79,6 +79,9 @@ def build_baseline_config_tag(cfg) -> str:
         wd = _sanitize_value(cfg.lora_wd)
         return f"baseline_lora_{r}_{alpha}_{lr}_{epochs}_{wd}"
     
+    elif method == 'zeroshot':
+        return f"baseline_zeroshot"
+    
     else:
         return f"baseline_{method}"
 
@@ -372,8 +375,8 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
         logger.info(f"[adapter:lp++] Using data-driven learning rates: lr_temp={lr_temp:.6f}, lr_alpha={lr_alpha:.6f}")
         
         param_groups = [
-            {'params': adapter_model.adapter.parameters(), 'lr': lr_temp},
-            {'params': [adapter_model.alpha_vec], 'lr': lr_alpha}
+            {'params': adapter_model.adapter.parameters(), 'lr': lr_temp * 0.1},
+            {'params': [adapter_model.alpha_vec], 'lr': lr_alpha * 0.1}
         ]
     elif adapter == 'tip':
         adapter_model = TIPWrapper(adapter_model, features_cache, labels)
@@ -500,6 +503,70 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
         "gpu_peak_mem_mb": gpu_peak_mem_mb,
         "loss_history": loss_history,
         "cache_build_time": cache_time,
+        "config_tag": config_tag,
+    }
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=4)
+    logger.info(f"✓ Saved results to {results_path}")
+    
+    return results
+
+
+def eval_zeroshot(model, val_loader, cfg, train_dataset_name, logger):
+    """Evaluate zero-shot performance (no training)"""
+    logger.info("Evaluating zero-shot performance (no training required)...")
+    
+    device = cfg.device
+    model = model.to(device)
+    model.eval()
+    
+    # Track GPU memory during evaluation
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    
+    # Evaluate on validation set
+    eval_start = time.time()
+    with torch.no_grad():
+        final_metrics = evaluate_encoder_with_dataloader(
+            model.image_encoder, model.classification_head, val_loader, cfg.device
+        )
+        final_acc = final_metrics['top1']
+    eval_time = time.time() - eval_start
+    
+    logger.info(f"Zero-shot validation accuracy: {final_acc * 100:.2f}%")
+    logger.info(f"Evaluation time: {eval_time:.2f}s")
+    
+    gpu_peak_mem_mb = None
+    if torch.cuda.is_available():
+        gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        logger.info(f"Peak GPU memory during evaluation: {gpu_peak_mem_mb:.2f} MB")
+    
+    # Zero-shot has 0 trainable parameters
+    trainable_params = 0
+    logger.info(f"Number of trainable parameters: {trainable_params:,}")
+    
+    # Save results
+    save_dir = cfg.save_dir
+    k = int(cfg.k_shot)
+    shot_folder = f"{k}shots" if k > 0 else "fullshots"
+    config_tag = getattr(cfg, 'config_tag', 'baseline_zeroshot')
+    
+    result_dir = os.path.join(save_dir, train_dataset_name, config_tag, shot_folder)
+    os.makedirs(result_dir, exist_ok=True)
+    
+    # Save results to JSON (use baseline naming convention)
+    results_path = os.path.join(result_dir, f"baseline_results_none.json")
+    results = {
+        "method": "zeroshot",
+        "target_dataset": train_dataset_name.replace("Val", ""),
+        "final_accuracy": float(final_acc),
+        "k_shot": k,
+        "model": cfg.model,
+        "epochs": 0,
+        "evaluation_time": eval_time,
+        "trainable_params": trainable_params,
+        "batch_size": cfg.batch_size,
+        "gpu_peak_mem_mb": gpu_peak_mem_mb,
         "config_tag": config_tag,
     }
     with open(results_path, 'w') as f:
@@ -804,8 +871,8 @@ def run_baseline_training_remote(cfg: DictConfig) -> None:
     )
     logger.info(f"✓ Validation loader ready ({len(val_loader.dataset)} samples)")
     
-    # Train baseline
-    logger.info(f"\nTraining baseline '{cfg.baseline_method}' on {train_dataset_name}")
+    # Train baseline (or evaluate zero-shot)
+    logger.info(f"\nProcessing baseline '{cfg.baseline_method}' on {train_dataset_name}")
     if cfg.baseline_method == 'linear_probe':
         results = train_linear_probe(model, train_loader, val_loader, cfg,
                            train_dataset_name, logger)
@@ -817,6 +884,8 @@ def run_baseline_training_remote(cfg: DictConfig) -> None:
                          train_dataset_name, logger, adapter='lpp')
     elif cfg.baseline_method == 'lora':
         results = train_lora(model, train_loader, val_loader, cfg, train_dataset_name, logger)
+    elif cfg.baseline_method == 'zeroshot':
+        results = eval_zeroshot(model, val_loader, cfg, train_dataset_name, logger)
     else:
         raise NotImplementedError(
             f"Unknown baseline method: {cfg.baseline_method}")
@@ -860,9 +929,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--baseline_method",
         type=str,
-        choices=["linear_probe", "tip_adapter", "lp++", "lora"],
+        choices=["linear_probe", "tip_adapter", "lp++", "lora", "zeroshot"],
         default="linear_probe",
-        help="Baseline to train",
+        help="Baseline to train or evaluate",
     )
     
     # Training hyperparameters

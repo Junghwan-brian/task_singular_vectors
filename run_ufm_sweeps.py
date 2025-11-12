@@ -2,17 +2,23 @@
 """
 Utility to launch UFM (Unsupervised FixMatch) experiments for test-time adaptation.
 
-This script runs ufm_atlas.py and ufm_energy.py across multiple datasets in parallel.
+This script runs ufm_atlas.py, ufm_energy.py, and ufm_baseline.py across multiple datasets in parallel.
 
 Usage:
     python run_ufm_sweeps.py
-        Launch the full sweep.
+        Launch the full sweep (Atlas, Energy, and Baselines).
 
     python run_ufm_sweeps.py --dry-run
         Print the commands that would run, without executing them.
 
     python run_ufm_sweeps.py --skip-ufm-energy
-        Only run UFM-Atlas sweeps.
+        Skip UFM-Energy sweeps.
+
+    python run_ufm_sweeps.py --skip-ufm-atlas
+        Skip UFM-Atlas sweeps.
+
+    python run_ufm_sweeps.py --skip-ufm-baselines
+        Skip UFM-Baseline (Zeroshot + Linear Norm) sweeps.
 
     python run_ufm_sweeps.py --limit 10
         Run only the first 10 commands (after optional shuffling).
@@ -188,10 +194,16 @@ UFM_ATLAS_EPOCHS = [None]  # Will auto-set per dataset
 UFM_ENERGY_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
 UFM_ENERGY_K = [0]  # fullshot only for test-time adaptation
 UFM_ENERGY_INITIALIZE_SIGMA = ["average"]
-UFM_ENERGY_SVD_KEEP_TOPK = [16]
-UFM_ENERGY_SIGMA_LR = [1e-2]
+UFM_ENERGY_SVD_KEEP_TOPK = [12]
+UFM_ENERGY_SIGMA_LR = [1e-3]
 UFM_ENERGY_SIGMA_WD = [0.0]
 UFM_ENERGY_WARMUP_RATIO = [0.1]
+
+# UFM-Baseline configurations (Zeroshot and Linear Norm)
+UFM_BASELINE_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
+UFM_BASELINE_K = [0]  # fullshot only for test-time adaptation
+UFM_BASELINE_LN_LR = [1e-3]
+UFM_BASELINE_LN_EPOCHS = [1]  # Will be auto-set per dataset
 
 
 def build_ufm_atlas_commands(datasets: Sequence[str]) -> List[List[str]]:
@@ -233,6 +245,109 @@ def build_ufm_atlas_commands(datasets: Sequence[str]) -> List[List[str]]:
             f"{wd:.6g}",
         ]
         commands.append(cmd)
+    
+    return commands
+
+
+def _expected_ufm_baseline_paths(
+    model: str,
+    dataset: str,
+    k: int,
+    mode: str,  # 'zeroshot' or 'ln'
+    ln_lr: float = None,
+    ln_epochs: int = None,
+) -> tuple[str, str]:
+    """Return expected UFM baseline paths."""
+    k = int(k)
+    
+    if mode == 'zeroshot':
+        config_tag = "ufm_zeroshot_0"
+        results_json_name = "ufm_zeroshot_results_none.json"
+    elif mode == 'ln':
+        lr_part = _sanitize_value(ln_lr if ln_lr is not None else 0.001)
+        epochs_part = _sanitize_value(ln_epochs if ln_epochs is not None else 1)
+        config_tag = f"ufm_ln_{lr_part}_{epochs_part}"
+        results_json_name = "ufm_ln_results_none.json"
+    else:
+        raise ValueError(f"Unknown baseline mode: {mode}")
+    
+    dataset_dir = f"{dataset}Val"
+    base_dir = os.path.join(MODEL_ROOT, model, dataset_dir, config_tag, _shot_folder(k))
+    baseline_pt = os.path.join(base_dir, f"ufm_{mode}.pt")
+    results_json = os.path.join(base_dir, results_json_name)
+    return baseline_pt, results_json
+
+
+def build_ufm_baseline_commands(datasets: Sequence[str]) -> List[List[str]]:
+    """Build UFM-Baseline (Zeroshot + Linear Norm) commands."""
+    commands: List[List[str]] = []
+    
+    for model, dataset, k in itertools.product(
+        UFM_BASELINE_MODELS,
+        datasets,
+        UFM_BASELINE_K,
+    ):
+        # Zeroshot command
+        _, zeroshot_results_json = _expected_ufm_baseline_paths(
+            model=model,
+            dataset=dataset,
+            k=int(k),
+            mode='zeroshot',
+        )
+        if not _path_exists(zeroshot_results_json):
+            cmd_zeroshot = [
+                sys.executable,
+                "ufm_baseline.py",
+                "--model",
+                model,
+                "--test_dataset",
+                dataset,
+                "--k",
+                str(k),
+                "--skip_ln",  # Only run zeroshot
+            ]
+            commands.append(cmd_zeroshot)
+        else:
+            print(
+                f"[skip] ufm-zeroshot {model} {dataset} (k={k}) -> {zeroshot_results_json}",
+                flush=True,
+            )
+        
+        # Linear Norm commands (for each LR and epochs combination)
+        for ln_lr, ln_epochs in itertools.product(
+            UFM_BASELINE_LN_LR,
+            UFM_BASELINE_LN_EPOCHS,
+        ):
+            _, ln_results_json = _expected_ufm_baseline_paths(
+                model=model,
+                dataset=dataset,
+                k=int(k),
+                mode='ln',
+                ln_lr=ln_lr,
+                ln_epochs=ln_epochs,
+            )
+            if not _path_exists(ln_results_json):
+                cmd_ln = [
+                    sys.executable,
+                    "ufm_baseline.py",
+                    "--model",
+                    model,
+                    "--test_dataset",
+                    dataset,
+                    "--k",
+                    str(k),
+                    "--ln_lr",
+                    f"{ln_lr:.6g}",
+                    "--ln_epochs",
+                    str(ln_epochs),
+                    "--skip_zeroshot",  # Only run Linear Norm
+                ]
+                commands.append(cmd_ln)
+            else:
+                print(
+                    f"[skip] ufm-ln {model} {dataset} (k={k}, lr={ln_lr}, ep={ln_epochs}) -> {ln_results_json}",
+                    flush=True,
+                )
     
     return commands
 
@@ -360,6 +475,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-ufm-energy", action="store_true", help="Skip UFM-Energy sweeps")
     parser.add_argument("--skip-ufm-atlas", action="store_true", help="Skip UFM-Atlas sweeps")
+    parser.add_argument("--skip-ufm-baselines", action="store_true", help="Skip UFM-Baseline (Zeroshot + Linear Norm) sweeps")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -402,6 +518,11 @@ def main() -> None:
         ufm_energy_cmds = build_ufm_energy_commands(datasets)
         commands.extend(ufm_energy_cmds)
         print(f"Added {len(ufm_energy_cmds)} UFM-Energy commands")
+    
+    if not args.skip_ufm_baselines:
+        ufm_baseline_cmds = build_ufm_baseline_commands(datasets)
+        commands.extend(ufm_baseline_cmds)
+        print(f"Added {len(ufm_baseline_cmds)} UFM-Baseline commands")
 
     if not commands:
         print("Nothing to run (all sweeps skipped).", file=sys.stderr)
