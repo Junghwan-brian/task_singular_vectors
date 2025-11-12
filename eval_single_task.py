@@ -1180,7 +1180,7 @@ def create_comprehensive_table(
     best_baseline_per_dataset: Dict,
     params_memory_info: Dict,
     output_dir: str
-) -> None:
+) -> Dict[str, Dict[str, Dict[str, float]]]:
     """
     Create a single comprehensive table with datasets as columns.
     Rows are organized by (Model, Shot, Method).
@@ -1193,6 +1193,9 @@ def create_comprehensive_table(
         best_baseline_per_dataset: Dict of best configs per dataset for baseline methods
         params_memory_info: Params and memory info for each method/config
         output_dir: Output directory
+        
+    Returns:
+        averaged_per_shot: {model -> shot -> method -> average_accuracy}
     """
     # Define shot order
     shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
@@ -1328,6 +1331,9 @@ def create_comprehensive_table(
     table_content = []
     row_metadata = []  # Store (model, shot, method) for each row
     
+    # Store averaged results to return: {model -> shot -> method -> average}
+    averaged_per_shot = defaultdict(lambda: defaultdict(dict))
+    
     for model_name in models:
         for shot_idx, shot_name in enumerate(shot_order):
             shot_display = shot_name.replace('shots', '')
@@ -1356,6 +1362,8 @@ def create_comprehensive_table(
                 if accuracies:
                     avg = sum(accuracies) / len(accuracies)
                     row.append(f"{avg:.2f}")
+                    # Store averaged result
+                    averaged_per_shot[model_name][shot_name][method_key] = avg
                 else:
                     row.append("-")
                 
@@ -1510,6 +1518,126 @@ def create_comprehensive_table(
             f.write(','.join(row) + '\n')
     
     logger.info(f"Saved CSV: {csv_output_path}")
+    
+    # Return averaged results for use in aggregated_results_by_shot_table
+    return dict(averaged_per_shot)
+
+
+def create_aggregated_by_shot_table_from_comprehensive(
+    comprehensive_averaged_results: Dict[str, Dict[str, Dict[str, float]]],
+    params_memory_info: Dict,
+    best_energy_configs: Dict,
+    best_baseline_configs: Dict,
+    output_dir: str
+) -> None:
+    """
+    Create aggregated by shot table using results from comprehensive table.
+    This ensures consistency - uses the same dataset-specific best configs.
+    
+    Args:
+        comprehensive_averaged_results: {model -> shot -> method -> average_accuracy}
+            (returned from create_comprehensive_table)
+        params_memory_info: Params and memory info for each method/config
+        best_energy_configs: Best Energy configs per dataset
+        best_baseline_configs: Best baseline configs per dataset
+        output_dir: Output directory
+    """
+    shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
+    
+    # Collect all unique methods
+    all_methods = set()
+    for model_data in comprehensive_averaged_results.values():
+        for shot_data in model_data.values():
+            all_methods.update(shot_data.keys())
+    
+    # Sort methods (same order as comprehensive table)
+    method_list = []
+    if 'Energy (best config)' in all_methods:
+        method_list.append('Energy (best config)')
+    if 'LoRA (best config)' in all_methods:
+        method_list.append('LoRA (best config)')
+    if 'LinearProbe (best config)' in all_methods:
+        method_list.append('LinearProbe (best config)')
+    if 'TIP (best config)' in all_methods:
+        method_list.append('TIP (best config)')
+    if 'LP++ (best config)' in all_methods:
+        method_list.append('LP++ (best config)')
+    
+    # Add Atlas and other methods
+    atlas_methods = sorted([m for m in all_methods if m.startswith('Atlas_')])
+    other_methods = sorted([m for m in all_methods if m not in method_list and not m.startswith('Atlas_')])
+    method_list.extend(atlas_methods)
+    method_list.extend(other_methods)
+    
+    # Create table: columns are shots, rows are methods
+    # For each method/shot, average across all models
+    shot_avg_col_labels = ['Method'] + [s.replace('shots', '-shot') for s in shot_order]
+    shot_avg_table_content = []
+    
+    models = list(comprehensive_averaged_results.keys())
+    
+    for method in method_list:
+        row = [format_method_label(method)]
+        for shot in shot_order:
+            # Gather accuracies for this method/shot across models
+            shot_vals = []
+            for model in models:
+                if shot in comprehensive_averaged_results[model]:
+                    acc = comprehensive_averaged_results[model][shot].get(method, None)
+                    if acc is not None:
+                        shot_vals.append(acc)
+            if shot_vals:
+                row.append(f"{(sum(shot_vals) / len(shot_vals)):.2f}")
+            else:
+                row.append("-")
+        shot_avg_table_content.append(row)
+    
+    # Create figure for shot-averaged table
+    fig = plt.figure(figsize=(12, max(6, len(method_list) * 0.5 + 2)))
+    ax = fig.add_subplot(111)
+    ax.axis('tight')
+    ax.axis('off')
+    
+    table = ax.table(
+        cellText=shot_avg_table_content,
+        colLabels=shot_avg_col_labels,
+        cellLoc='center',
+        loc='center',
+        bbox=[0, 0, 1, 1]
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 2)
+    
+    # Header styling
+    for i in range(len(shot_avg_col_labels)):
+        cell = table[(0, i)]
+        cell.set_facecolor('#4CAF50')
+        cell.set_text_props(weight='bold', color='white')
+    
+    # Method column styling
+    for i in range(len(shot_avg_table_content)):
+        cell = table[(i+1, 0)]
+        cell.set_facecolor('#E8F5E9')
+        cell.set_text_props(weight='bold', ha='left')
+    
+    plt.title('Few-Shot Remote Sensing Results - Model-Averaged per k-shot (%)',
+              fontsize=14, fontweight='bold', pad=20)
+    
+    # Save figure
+    os.makedirs(output_dir, exist_ok=True)
+    shot_avg_png = os.path.join(output_dir, 'aggregated_results_by_shot_table.png')
+    plt.savefig(shot_avg_png, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved shot-averaged table: {shot_avg_png}")
+    
+    # Save CSV for shot-averaged table
+    shot_avg_csv = os.path.join(output_dir, 'aggregated_results_by_shot_table.csv')
+    with open(shot_avg_csv, 'w') as f:
+        f.write(','.join(shot_avg_col_labels) + '\n')
+        for row in shot_avg_table_content:
+            f.write(','.join(row) + '\n')
+    logger.info(f"Saved shot-averaged CSV: {shot_avg_csv}")
 
 
 def format_method_label(method_key: str) -> str:
@@ -1525,6 +1653,10 @@ def format_method_label(method_key: str) -> str:
     elif method_key in ['LinearProbe', 'TIP', 'LP++', 'LoRA', 'ZeroShot']:
         # Baseline methods - return as-is
         return method_key
+    elif method_key.endswith('(best config)'):
+        # Handle "LoRA (best config)" -> "LoRA (best)"
+        base_name = method_key.replace(' (best config)', '')
+        return f'{base_name} (best)'
     else:
         return method_key
 
@@ -1647,27 +1779,20 @@ def main():
         json.dump(serializable_config, f, indent=2)
     logger.info(f"Saved best configs per dataset to: {best_config_path}")
     
-    # Generate aggregated visualization
+    # Aggregate results across datasets to get params_memory_info
     logger.info("\nAggregating results across datasets...")
     averaged_results, params_memory_info = aggregate_across_datasets(all_results)
     
-    # Compute average best configs for all methods from the averaged results
-    # This ensures we select based on TRUE average across ALL datasets
-    logger.info("Computing best configurations from averaged results (correct method)...")
-    best_energy_configs_avg = compute_averaged_best_configs_from_aggregated(averaged_results, 'Energy')
-    best_baseline_configs_avg = {}
-    for method_name in ['LoRA', 'LinearProbe', 'TIP', 'LP++']:
-        logger.info(f"Computing best {method_name} configuration from averaged results...")
-        best_baseline_configs_avg[method_name] = compute_averaged_best_configs_from_aggregated(
-            averaged_results, method_name
-        )
-    
-    logger.info("Generating aggregated visualization...")
-    visualize_aggregated_table(averaged_results, best_energy_configs_avg, best_baseline_configs_avg, params_memory_info, args.output_dir)
-    
     # Generate comprehensive table with all datasets as columns
     logger.info("\nGenerating comprehensive table (all datasets + average)...")
-    create_comprehensive_table(all_results, best_energy_per_dataset, best_baseline_per_dataset, params_memory_info, args.output_dir)
+    comprehensive_averaged_results = create_comprehensive_table(
+        all_results, best_energy_per_dataset, best_baseline_per_dataset, params_memory_info, args.output_dir
+    )
+    
+    # Generate aggregated by shot table using results from comprehensive table
+    # This ensures consistency - both tables use the same dataset-specific best configs
+    logger.info("\nGenerating aggregated by shot table (using comprehensive table results)...")
+    create_aggregated_by_shot_table_from_comprehensive(comprehensive_averaged_results, args.output_dir)
     
     # Generate individual visualizations if not aggregate_only
     if not args.aggregate_only:
