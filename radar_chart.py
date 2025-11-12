@@ -32,7 +32,7 @@ non_dataset_cols = {"Model", "Shot", "Method", "Average"}
 dataset_cols = [c for c in df.columns if c not in non_dataset_cols]
 # 이름이 너무 길면 원이랑 겹치므로 직접 설정함.
 if 'CIFAR10' in dataset_cols:
-    dataset_cols = ['CIFAR10', 'RenderedSST2', 'Country211', 'CIFAR100', 'CUB200', 'DTD', 'EMNIST', 'FGVCAircraft', 'FashionMNIST', 'Flowers102', 'OxfordIIITPet', 'Food101', 'GTSRB', 'MNIST', 'PCAM', 'STL10', 'SVHN']
+    dataset_cols = ['CIFAR10','DTD','RenderedSST2', 'CIFAR100', 'CUB200','EMNIST', 'Country211', 'FGVCAircraft', 'STL10', 'SVHN', 'OxfordIIITPet', 'Food101', 'GTSRB', 'MNIST', 'Flowers102', 'FashionMNIST', 'PCAM']
 # ------------------------------------------------------------
 # 메서드 목록(번호 포함)
 # ------------------------------------------------------------
@@ -92,8 +92,8 @@ def plot_radar_for_selection(model: str, shot: int,
                              methods_to_show=None, method_idx=None,
                              color_list=None,
                              # ▼ 새 파라미터들 (원하는 대로 조절)
-                             label_fs_min: float = 8.0,
-                             label_fs_max: float = 12.0,
+                             label_fs_min: float = 10.0,
+                             label_fs_max: float = 15.0,
                              label_fs_gamma: float = 1.0,
                              value_sim_thresh: float = 0.10,   # 값이 이 이내로 같으면 하나만 표기
                              label_min_rad_gap: float = 0.035, # 같은 각도 내 레이블 간 최소 간격
@@ -301,14 +301,14 @@ def plot_radar_for_selection(model: str, shot: int,
                 angle_registry[angle_idx].append({"text": text_str, "raw": raw, "angle": a, "r": r_text - 0.02})
 
     # 데이터셋 라벨(원 밖)
-    label_radius = 1.10
+    label_radius = 1.2
     for angle, label in zip(angles[:-1], labels):
-        ax.text(angle, label_radius, label, fontsize=11, fontweight="bold",
+        ax.text(angle, label_radius, label, fontsize=18, fontweight="bold",
                 ha="center", va="center", zorder=6)
 
     # (중앙부 회색 최솟값 텍스트는 제거된 상태)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig("figures/radar_chart.png", bbox_inches="tight", dpi=300)
+    plt.savefig(f"figures/{model}_{shot}.png", bbox_inches="tight", dpi=1200)
     plt.show()
 
     return used_methods, used_colors
@@ -321,7 +321,7 @@ if __name__ == "__main__":
     methods_to_use = ["Energy (best)", "LinearProbe (best config)", "TIP (best config)", "Atlas"]
     custom_colors   = plt.cm.tab20(np.linspace(0, 1, 28))[::3]
     used_methods, used_colors = plot_radar_for_selection(
-        "ViT-B-32", 16,
+        "ViT-B-32", 4,
         methods_to_show=methods_to_use,
         color_list=custom_colors
     )
