@@ -20,6 +20,14 @@ from tqdm.auto import tqdm
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 
+torch.backends.cuda.enable_cudnn_sdp(False)
+# Additional cuDNN settings for H100 compatibility
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+# Set cuDNN benchmark to False for stability
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
 from torch.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
 from atlas_src.composition import WeightedImageEncoder
@@ -60,29 +68,29 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for UFM-Atlas training (general datasets)
 UFM_ATLAS_EPOCHS_PER_DATASET = {
-    # "Cars": 20,
-    "DTD": 20,
-    # "EuroSAT": 20,
-    "GTSRB": 20,
-    "MNIST": 20,
-    # "RESISC45": 20,
-    # "SUN397": 20,
-    "SVHN": 20,
-    "CIFAR10": 20,
-    "CIFAR100": 20,
-    "STL10": 20,
-    "Food101": 20,
-    "Flowers102": 20,
-    # "FER2013": 20,
-    "PCAM": 20,
-    "OxfordIIITPet": 20,
-    "RenderedSST2": 20,
-    "EMNIST": 20,
-    "FashionMNIST": 20,
-    # "KMNIST": 20,
-    "FGVCAircraft": 20,
-    "CUB200": 20,
-    "Country211": 20,
+    # "Cars": 1,
+    "DTD": 1,
+    # "EuroSAT": 1,
+    "GTSRB": 1,
+    "MNIST": 1,
+    # "RESISC45": 1,
+    # "SUN397": 1,
+    "SVHN": 1,
+    "CIFAR10": 1,
+    "CIFAR100": 1,
+    "STL10": 1,
+    "Food101": 1,
+    "Flowers102": 1,
+    # "FER2013": 1,
+    "PCAM": 1,
+    "OxfordIIITPet": 1,
+    "RenderedSST2": 1,
+    "EMNIST": 1,
+    "FashionMNIST": 1,
+    # "KMNIST": 1,
+    "FGVCAircraft": 1,
+    "CUB200": 1,
+    "Country211": 1,
 }
 
 
@@ -246,7 +254,7 @@ def get_preds(dataset, model, device):
     """Get predictions for trusted sample selection."""
     model.eval()
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=128, shuffle=False, num_workers=4
+        dataset, batch_size=128, shuffle=False, num_workers=2
     )
     
     all_preds = []
@@ -446,7 +454,7 @@ def run_ufm_atlas(args):
     train_loader = torch.utils.data.DataLoader(
         index_dataset, 
         batch_sampler=sampler,
-        num_workers=4,
+        num_workers=2,
         collate_fn=collate_fn
     )
     
@@ -455,7 +463,7 @@ def run_ufm_atlas(args):
         test_data,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4
+        num_workers=2
     )
     
     logger.info(f"Train batches: {len(train_loader)}, Val samples: {len(val_loader.dataset)}")
@@ -507,21 +515,6 @@ def run_ufm_atlas(args):
                     f"Epoch {epoch} [{i}/{num_batches}] Loss: {loss.item():.4f}"
                 )
         
-        # Evaluate after each epoch
-        model.eval()
-        with torch.no_grad():
-            metrics = evaluate_encoder_with_dataloader(
-                model.image_encoder, classification_head, val_loader, args.device
-            )
-            acc = metrics['top1']
-        
-        logger.info(f"Epoch {epoch}: Accuracy = {acc * 100:.2f}%")
-        
-        if acc > best_acc:
-            best_acc = acc
-            best_coef = model.image_encoder.coef.data.clone()
-            logger.info(f"✓ New best accuracy: {best_acc * 100:.2f}%")
-        
         model.train()
     
     # Load best coefficients
@@ -550,10 +543,6 @@ def run_ufm_atlas(args):
     )
     os.makedirs(save_dir, exist_ok=True)
     
-    # Save coefficients
-    atlas_path = os.path.join(save_dir, "ufm_atlas.pt")
-    torch.save(best_coef, atlas_path)
-    logger.info(f"✓ Saved UFM-Atlas coefficients to {atlas_path}")
     
     # Save results JSON
     results_path = os.path.join(save_dir, "ufm_atlas_results_none.json")
@@ -626,7 +615,7 @@ def create_ufm_atlas_parser(config: OmegaConf) -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=config.get("batch_size", 128),
+        default=32,
         help="Training batch size"
     )
     parser.add_argument(
@@ -754,6 +743,14 @@ if __name__ == "__main__":
     # Create parser with config defaults
     parser = create_ufm_atlas_parser(config)
     args = parser.parse_args()
+    if args.model == "ViT-B-16":
+        args.batch_size = 64
+    elif args.model == "ViT-L-14":
+        args.batch_size = 32
+    elif args.model == "ViT-B-32":
+        args.batch_size = 16
+    else:
+        raise ValueError(f"Invalid model: {args.model}")
     
     # Set device
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -812,5 +809,6 @@ if __name__ == "__main__":
     logger.info(f"Leave-one-out mode: Test dataset = {args.test_dataset}")
     logger.info(f"Basis datasets: {len(args.basis_datasets)} datasets")
     
+    print(args.batch_size)
     run_ufm_atlas(args)
 

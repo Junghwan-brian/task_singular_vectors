@@ -175,12 +175,12 @@ DATASETS_ALL = {
 }
 
 
-GPU_IDS = [0, 1]  # Default GPU IDs, can be overridden via CLI
+GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
 
 # UFM-Atlas configurations
 UFM_ATLAS_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
 UFM_ATLAS_K = [0]  # fullshot only for test-time adaptation
-UFM_ATLAS_LR = [1e-3, 5e-3, 1e-2, 1e-4]
+UFM_ATLAS_LR = [1e-1]
 UFM_ATLAS_WD = [0.1]
 UFM_ATLAS_EPOCHS = [None]  # Will auto-set per dataset
 
@@ -188,8 +188,8 @@ UFM_ATLAS_EPOCHS = [None]  # Will auto-set per dataset
 UFM_ENERGY_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
 UFM_ENERGY_K = [0]  # fullshot only for test-time adaptation
 UFM_ENERGY_INITIALIZE_SIGMA = ["average"]
-UFM_ENERGY_SVD_KEEP_TOPK = [10, 12, 14, 16]
-UFM_ENERGY_SIGMA_LR = [1e-3, 5e-3, 1e-4, 1e-2]
+UFM_ENERGY_SVD_KEEP_TOPK = [16]
+UFM_ENERGY_SIGMA_LR = [1e-2]
 UFM_ENERGY_SIGMA_WD = [0.0]
 UFM_ENERGY_WARMUP_RATIO = [0.1]
 
@@ -385,7 +385,7 @@ def main() -> None:
     parser.add_argument(
         "--per-gpu",
         type=int,
-        default=8,
+        default=2,
         help="Number of commands to run concurrently on each GPU",
     )
     args = parser.parse_args()
