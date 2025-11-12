@@ -1525,6 +1525,9 @@ def create_comprehensive_table(
 
 def create_aggregated_by_shot_table_from_comprehensive(
     comprehensive_averaged_results: Dict[str, Dict[str, Dict[str, float]]],
+    params_memory_info: Dict,
+    best_energy_configs: Dict,
+    best_baseline_configs: Dict,
     output_dir: str
 ) -> None:
     """
@@ -1534,6 +1537,9 @@ def create_aggregated_by_shot_table_from_comprehensive(
     Args:
         comprehensive_averaged_results: {model -> shot -> method -> average_accuracy}
             (returned from create_comprehensive_table)
+        params_memory_info: Params and memory info for each method/config
+        best_energy_configs: Best Energy configs per dataset
+        best_baseline_configs: Best baseline configs per dataset
         output_dir: Output directory
     """
     shot_order = ['1shots', '2shots', '4shots', '8shots', '16shots']
@@ -1773,10 +1779,14 @@ def main():
         json.dump(serializable_config, f, indent=2)
     logger.info(f"Saved best configs per dataset to: {best_config_path}")
     
+    # Aggregate results across datasets to get params_memory_info
+    logger.info("\nAggregating results across datasets...")
+    averaged_results, params_memory_info = aggregate_across_datasets(all_results)
+    
     # Generate comprehensive table with all datasets as columns
     logger.info("\nGenerating comprehensive table (all datasets + average)...")
     comprehensive_averaged_results = create_comprehensive_table(
-        all_results, best_energy_per_dataset, best_baseline_per_dataset, args.output_dir
+        all_results, best_energy_per_dataset, best_baseline_per_dataset, params_memory_info, args.output_dir
     )
     
     # Generate aggregated by shot table using results from comprehensive table
