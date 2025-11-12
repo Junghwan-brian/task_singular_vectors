@@ -149,13 +149,14 @@ class IndexWrapper(torch.utils.data.Dataset):
 class TwoStreamBatchSampler(torch.utils.data.Sampler):
     """Sample unlabeled and labeled (trusted) data in each batch."""
     def __init__(self, unlabeled_indices, labeled_indices, batch_size):
-        self.unlabeled_indices = unlabeled_indices
-        self.labeled_indices = labeled_indices
+        # Convert to Python list to avoid torch.Tensor indexing issues
+        self.unlabeled_indices = unlabeled_indices.tolist() if torch.is_tensor(unlabeled_indices) else list(unlabeled_indices)
+        self.labeled_indices = labeled_indices.tolist() if torch.is_tensor(labeled_indices) else list(labeled_indices)
         self.batch_size = batch_size
         
         # Compute batch counts
-        self.n_unlabeled = len(unlabeled_indices)
-        self.n_labeled = len(labeled_indices)
+        self.n_unlabeled = len(self.unlabeled_indices)
+        self.n_labeled = len(self.labeled_indices)
         self.n_batches = max(self.n_unlabeled, self.n_labeled) // batch_size
     
     def __iter__(self):
@@ -172,7 +173,8 @@ class TwoStreamBatchSampler(torch.utils.data.Sampler):
                 except StopIteration:
                     unlabeled_iter = iter(torch.randperm(self.n_unlabeled))
                     idx = next(unlabeled_iter)
-                batch.append(self.unlabeled_indices[idx])
+                # Convert idx to Python int to ensure compatibility with all datasets
+                batch.append(self.unlabeled_indices[int(idx)])
             
             # Sample from labeled
             for _ in range(self.batch_size // 2):
@@ -181,7 +183,8 @@ class TwoStreamBatchSampler(torch.utils.data.Sampler):
                 except StopIteration:
                     labeled_iter = iter(torch.randperm(self.n_labeled))
                     idx = next(labeled_iter)
-                batch.append(self.labeled_indices[idx])
+                # Convert idx to Python int to ensure compatibility with all datasets
+                batch.append(self.labeled_indices[int(idx)])
             
             yield batch
     
