@@ -478,7 +478,7 @@ def run_ufm_atlas(args):
     num_batches = len(train_loader)
     scheduler = cosine_lr(optimizer, args.lr, 0, args.epochs * num_batches)
     
-    scaler = GradScaler('cuda')
+    scaler = GradScaler()
     loss_fn = ssl_loss_trusted
     
     # Training loop

@@ -938,13 +938,17 @@ def plot_bubble_chart(results: List[Dict], args) -> str:
         trainable_params.append(result.get('trainable_params', 0))
     
     # Create figure
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig, ax = plt.subplots(figsize=(12, 8))
     
     # Normalize bubble sizes (trainable params)
-    # Use log scale for better visualization
+    # Find max params (likely LoRA) and scale relative to that
     sizes = np.array(trainable_params)
-    sizes_normalized = np.sqrt(sizes) / 50  # Scale down for reasonable bubble sizes
-    sizes_normalized = np.clip(sizes_normalized, 10, 1000)  # Min and max bubble sizes
+    max_params = max(sizes) if len(sizes) > 0 and max(sizes) > 0 else 1
+    
+    # Scale: LoRA (max) should be around 3000-4000 points, others proportionally smaller
+    # Using square root for better visual differentiation
+    sizes_normalized = np.sqrt(sizes / max_params) * 3500
+    sizes_normalized = np.clip(sizes_normalized, 50, 5000)  # Min 50, max 5000
     
     # Plot bubbles (without accuracy, we'll just plot at a fixed y-position)
     # This is a placeholder - in real use, y would be accuracy
@@ -971,7 +975,7 @@ def plot_bubble_chart(results: List[Dict], args) -> str:
     scatter = ax.scatter(gpu_memory, y_positions, s=sizes_normalized, 
                         c=colors, alpha=0.6, edgecolors='black', linewidth=1.5)
     
-    # Add method labels
+    # Add method labels (inside bubble if large enough, outside if too small)
     for i, (x, y, method, params) in enumerate(zip(gpu_memory, y_positions, methods, trainable_params)):
         # Determine model info from method name
         if 'B/32' in method or 'B-32' in args.model:
@@ -993,15 +997,41 @@ def plot_bubble_chart(results: List[Dict], args) -> str:
         else:
             label = f"{method.upper()} {model_info}"
         
-        ax.annotate(label, (x, y), xytext=(5, 5), textcoords='offset points',
-                   fontsize=9, bbox=dict(boxstyle='round,pad=0.3', facecolor=colors[i], alpha=0.3))
+        # Decide label position based on bubble size
+        # Threshold: if normalized size > 800, put label inside
+        bubble_size = sizes_normalized[i]
+        
+        if bubble_size > 800:
+            # Large bubble: put label inside
+            ax.text(x, y, label, 
+                   ha='center', va='center',
+                   fontsize=10, fontweight='bold',
+                   color='white' if method.lower() in ['atlas', 'lora'] else 'black')
+        else:
+            # Small bubble: put label outside with arrow
+            ax.annotate(label, (x, y), 
+                       xytext=(15, 15), textcoords='offset points',
+                       fontsize=9,
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor=colors[i], alpha=0.7, edgecolor='black'),
+                       arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.3', 
+                                     color='black', lw=1.5))
     
-    # Set labels and title
-    ax.set_xlabel('Memory (GB)', fontsize=12)
-    ax.set_ylabel('Accuracy (%)', fontsize=12)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
+    # Set labels and grid
+    ax.set_xlabel('Memory (GB)', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Accuracy (%)', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    
+    # Invert x-axis so lower memory is on the right (better performance direction)
+    ax.invert_xaxis()
+    
+    # Set axis limits
+    max_mem = max(gpu_memory) if gpu_memory else 12
+    ax.set_xlim(max_mem * 1.1, 0)  # Inverted: high to low
     ax.set_ylim(50, 80)
+    
+    # Add subtle background shading to show "better" region (top-right = low memory + high accuracy)
+    ax.axhspan(65, 80, alpha=0.05, color='green', zorder=0)
+    ax.axvspan(0, max_mem * 0.3, alpha=0.05, color='green', zorder=0)
     
     # Save figure
     os.makedirs("results/gpu_memory/figures", exist_ok=True)
@@ -1016,7 +1046,10 @@ def plot_bubble_chart(results: List[Dict], args) -> str:
     plt.close()
     
     print(f"\n📊 Bubble chart saved to: {save_path}")
-    print(f"   Note: Y-axis (accuracy) uses placeholder values - update with real accuracy data")
+    print(f"   📈 X-axis: Memory (GB) - inverted (lower is better → right side)")
+    print(f"   📈 Y-axis: Accuracy (%) - placeholder values (update with real data)")
+    print(f"   📈 Bubble size: Trainable parameters (scaled relative to max)")
+    print(f"   📈 Best region: Top-right corner (low memory + high accuracy)")
     
     return save_path
 
