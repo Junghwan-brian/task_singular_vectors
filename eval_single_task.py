@@ -620,35 +620,19 @@ def visualize_shot_results(
     logger.info(f"Saved: {output_path}")
 
 
-def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Dict[str, float]]], Dict[str, Dict[str, Dict[str, tuple]]]]:
+def collect_params_and_memory(all_results: Dict) -> Dict[str, Dict[str, Dict[str, tuple]]]:
     """
-    Aggregate results across all datasets to get average accuracy.
-    Also collect params and memory info (which should be same across datasets).
+    Collect params and memory info from the first dataset for each model/shot/method.
+    For each method, select the config with the MAXIMUM trainable parameters.
+    For Energy, prefer configs with svd_keep_topk=12.
     
     Returns:
-        (averaged_results, params_memory_info)
-        
-        averaged_results:
-        {
-            'ViT-B-32': {
-                '16shots': {
-                    'Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0': 85.5,
-                    'Atlas_none': 82.3,
-                    'Atlas_tip': 87.1,
-                    'LinearProbe': 80.5,
-                    'LoRA': 83.2,
-                    ...
-                },
-                ...
-            },
-            ...
-        }
-        
         params_memory_info:
         {
             'ViT-B-32': {
                 '16shots': {
-                    'Energy_lr=0.001_k=4_init=average_w=0.1_wd=0.0': (trainable_params, gpu_memory),
+                    'Energy (best config)': (trainable_params, gpu_memory),
+                    'Atlas_none': (trainable_params, gpu_memory),
                     ...
                 },
                 ...
@@ -656,8 +640,102 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
             ...
         }
     """
-    aggregated = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     params_memory = defaultdict(lambda: defaultdict(dict))
+    
+    for model_name, datasets in all_results.items():
+        # Use first dataset only (params are same across datasets, differ by shot)
+        first_dataset = next(iter(datasets.keys()))
+        shots = datasets[first_dataset]
+        
+        logger.info(f"Collecting params/memory from {model_name}/{first_dataset}")
+        
+        for shot_name, baselines in shots.items():
+            # Group baselines by method type
+            method_groups = defaultdict(list)
+            
+            for baseline in baselines:
+                method = baseline['method']
+                trainable_params = baseline.get('trainable_params')
+                gpu_memory = baseline.get('gpu_memory')
+                
+                # Skip if no params info
+                if trainable_params is None:
+                    continue
+                
+                # Store baseline with params/memory info
+                method_groups[method].append({
+                    'baseline': baseline,
+                    'params': trainable_params,
+                    'memory': gpu_memory
+                })
+            
+            # For each method, select the one with maximum params
+            for method, configs in method_groups.items():
+                if not configs:
+                    continue
+                
+                # Special handling for Energy: prefer k=12
+                if method == 'Energy':
+                    # Try to find k=12 config
+                    k12_configs = [c for c in configs if c['baseline'].get('svd_keep_topk') == '12']
+                    if k12_configs:
+                        # Among k=12 configs, select max params
+                        best_config = max(k12_configs, key=lambda x: x['params'])
+                        logger.info(f"  {shot_name}/Energy: Using k=12 config with {best_config['params']:,} params")
+                    else:
+                        # Fallback to max params
+                        best_config = max(configs, key=lambda x: x['params'])
+                        k_val = best_config['baseline'].get('svd_keep_topk', '?')
+                        logger.info(f"  {shot_name}/Energy: No k=12 found, using k={k_val} with {best_config['params']:,} params")
+                    
+                    params_memory[model_name][shot_name]['Energy (best config)'] = (
+                        best_config['params'], best_config['memory']
+                    )
+                
+                # For other methods, simply select max params
+                elif method in ['LinearProbe', 'LoRA', 'TIP', 'LP++']:
+                    best_config = max(configs, key=lambda x: x['params'])
+                    logger.info(f"  {shot_name}/{method}: Max params = {best_config['params']:,}")
+                    params_memory[model_name][shot_name][f'{method} (best config)'] = (
+                        best_config['params'], best_config['memory']
+                    )
+                
+                # For Atlas, store by adapter type
+                elif method == 'Atlas':
+                    # Group by adapter
+                    adapter_configs = defaultdict(list)
+                    for c in configs:
+                        adapter = c['baseline'].get('adapter', 'none')
+                        adapter_configs[adapter].append(c)
+                    
+                    for adapter, adapter_cfgs in adapter_configs.items():
+                        best_config = max(adapter_cfgs, key=lambda x: x['params'])
+                        key = f'Atlas_{adapter}'
+                        logger.info(f"  {shot_name}/Atlas_{adapter}: Max params = {best_config['params']:,}")
+                        params_memory[model_name][shot_name][key] = (
+                            best_config['params'], best_config['memory']
+                        )
+                
+                # For ZeroShot (0 params)
+                elif method == 'ZeroShot':
+                    best_config = configs[0]  # Should be only one
+                    logger.info(f"  {shot_name}/ZeroShot: params = {best_config['params']:,}")
+                    params_memory[model_name][shot_name]['ZeroShot'] = (
+                        best_config['params'], best_config['memory']
+                    )
+    
+    return dict(params_memory)
+
+
+def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Dict[str, float]]], Dict[str, Dict[str, Dict[str, tuple]]]]:
+    """
+    Aggregate results across all datasets to get average accuracy.
+    Params and memory are collected separately using collect_params_and_memory().
+    
+    Returns:
+        (averaged_results, params_memory_info)
+    """
+    aggregated = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     
     for model_name, datasets in all_results.items():
         for dataset_name, shots in datasets.items():
@@ -666,12 +744,9 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
                     method = baseline['method']
                     adapter = baseline.get('adapter', 'none')
                     accuracy = baseline['accuracy']
-                    trainable_params = baseline.get('trainable_params')
-                    gpu_memory = baseline.get('gpu_memory')
                     
                     # Create unique key based on method type
                     if method == 'Energy':
-                        # For Energy, use hyperparameters as key
                         lr = baseline.get('lr', 'unknown')
                         topk = baseline.get('svd_keep_topk', 'unknown')
                         init = baseline.get('initialize_sigma', 'unknown')
@@ -679,10 +754,8 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
                         wd = baseline.get('sigma_wd', '0.0')
                         key = f"Energy_lr={lr}_k={topk}_init={init}_w={warmup}_wd={wd}"
                     elif method == 'Atlas':
-                        # For Atlas, distinguish by adapter
                         key = f"Atlas_{adapter}"
                     elif method == 'LinearProbe':
-                        # For LinearProbe, use hyperparameters as key
                         hyperparams = baseline.get('hyperparams', {})
                         if hyperparams:
                             lr = hyperparams.get('lr', 'unknown')
@@ -691,7 +764,6 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
                         else:
                             key = method
                     elif method == 'LoRA':
-                        # For LoRA, use hyperparameters as key
                         hyperparams = baseline.get('hyperparams', {})
                         if hyperparams:
                             r = hyperparams.get('r', 'unknown')
@@ -701,7 +773,6 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
                         else:
                             key = method
                     elif method == 'TIP':
-                        # For TIP, use hyperparameters as key
                         hyperparams = baseline.get('hyperparams', {})
                         if hyperparams:
                             alpha = hyperparams.get('alpha', 'unknown')
@@ -710,7 +781,6 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
                         else:
                             key = method
                     elif method == 'LP++':
-                        # For LP++, use hyperparameters as key
                         hyperparams = baseline.get('hyperparams', {})
                         if hyperparams:
                             ratio = hyperparams.get('ratio', 'unknown')
@@ -719,16 +789,11 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
                         else:
                             key = method
                     elif method == 'ZeroShot':
-                        # ZeroShot has no hyperparameters
                         key = 'ZeroShot'
                     else:
                         key = f"{method}_{adapter}"
                     
                     aggregated[model_name][shot_name][key].append(accuracy)
-                    
-                    # Store params and memory (should be same across datasets, so we just keep the first one)
-                    if key not in params_memory[model_name][shot_name]:
-                        params_memory[model_name][shot_name][key] = (trainable_params, gpu_memory)
     
     # Average the accuracies
     averaged = {}
@@ -739,7 +804,10 @@ def aggregate_across_datasets(all_results: Dict) -> tuple[Dict[str, Dict[str, Di
             for method_key, accuracies in methods.items():
                 averaged[model_name][shot_name][method_key] = sum(accuracies) / len(accuracies)
     
-    return averaged, dict(params_memory)
+    # Collect params and memory separately (from first dataset, max params per method)
+    params_memory = collect_params_and_memory(all_results)
+    
+    return averaged, params_memory
 
 
 def select_best_method_config_per_dataset(
