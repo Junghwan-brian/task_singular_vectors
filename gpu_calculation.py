@@ -412,6 +412,30 @@ def measure_baseline_remote_sensing(args, cfg, all_datasets) -> Dict:
         print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
         print(f"   Alpha vec: {avg_num_classes} params")
         print(f"   Adapter: {feature_dim * avg_num_classes:,} params")
+        
+    elif args.baseline_method == 'lora':
+        print(f"\n2️⃣  LoRA: Applying LoRA modules (r={args.lora_r}, alpha={args.lora_alpha})...")
+        from baselines_train_remote_sensing import LoRALinear, apply_lora_to_module
+        
+        apply_lora_to_module(
+            image_encoder, 
+            r=args.lora_r, 
+            alpha=args.lora_alpha, 
+            dropout=args.lora_dropout
+        )
+        
+        mem_after_lora = get_gpu_memory_mb()
+        additional_mem = mem_after_lora - mem_after_encoder
+        
+        # Count LoRA parameters
+        for name, module in image_encoder.named_modules():
+            if isinstance(module, LoRALinear):
+                additional_params += module.lora_A.numel() + module.lora_B.numel()
+                trainable_params += module.lora_A.numel() + module.lora_B.numel()
+        
+        print(f"   LoRA modules: {additional_mem:.2f} MB")
+        print(f"   LoRA A+B params: {trainable_params:,}")
+        print(f"   Total: {mem_after_lora:.2f} MB")
     
     else:
         raise ValueError(f"Unknown baseline method: {args.baseline_method}")
@@ -801,6 +825,30 @@ def measure_baseline_reverse(args, cfg, all_datasets) -> Dict:
         print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
         print(f"   Alpha vec: {avg_num_classes} params")
         print(f"   Adapter: {feature_dim * avg_num_classes:,} params")
+        
+    elif args.baseline_method == 'lora':
+        print(f"\n2️⃣  LoRA: Applying LoRA modules (r={args.lora_r}, alpha={args.lora_alpha})...")
+        from baselines_train_remote_sensing import LoRALinear, apply_lora_to_module
+        
+        apply_lora_to_module(
+            image_encoder, 
+            r=args.lora_r, 
+            alpha=args.lora_alpha, 
+            dropout=args.lora_dropout
+        )
+        
+        mem_after_lora = get_gpu_memory_mb()
+        additional_mem = mem_after_lora - mem_after_encoder
+        
+        # Count LoRA parameters
+        for name, module in image_encoder.named_modules():
+            if isinstance(module, LoRALinear):
+                additional_params += module.lora_A.numel() + module.lora_B.numel()
+                trainable_params += module.lora_A.numel() + module.lora_B.numel()
+        
+        print(f"   LoRA modules: {additional_mem:.2f} MB")
+        print(f"   LoRA A+B params: {trainable_params:,}")
+        print(f"   Total: {mem_after_lora:.2f} MB")
     
     else:
         raise ValueError(f"Unknown baseline method for reverse: {args.baseline_method}")
@@ -862,6 +910,117 @@ def generate_save_path(args, method: str, baseline_method: Optional[str] = None)
     return os.path.join("results/gpu_memory", filename)
 
 
+def plot_bubble_chart(results: List[Dict], args) -> str:
+    """Create bubble chart: x=GPU memory, y=accuracy, bubble size=trainable params
+    
+    Note: Since we don't have accuracy data, this function saves the structure
+    for future use when accuracy data becomes available.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("⚠️  matplotlib not available, skipping visualization")
+        return None
+    
+    # Prepare data
+    methods = []
+    gpu_memory = []
+    trainable_params = []
+    
+    for result in results:
+        method_name = result.get('method', 'unknown')
+        if method_name == 'baseline':
+            method_name = result.get('baseline_method', 'unknown')
+        
+        methods.append(method_name.upper())
+        gpu_memory.append(result.get('total_gpu_mb', 0) / 1024)  # Convert to GB
+        trainable_params.append(result.get('trainable_params', 0))
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 7))
+    
+    # Normalize bubble sizes (trainable params)
+    # Use log scale for better visualization
+    sizes = np.array(trainable_params)
+    sizes_normalized = np.sqrt(sizes) / 50  # Scale down for reasonable bubble sizes
+    sizes_normalized = np.clip(sizes_normalized, 10, 1000)  # Min and max bubble sizes
+    
+    # Plot bubbles (without accuracy, we'll just plot at a fixed y-position)
+    # This is a placeholder - in real use, y would be accuracy
+    y_positions = [65, 67, 57, 73, 66, 72][:len(methods)]  # Dummy positions based on typical values
+    
+    # Color map for different methods
+    colors = []
+    for method in methods:
+        if method in ['ATLAS', 'atlas']:
+            colors.append('#FF6B6B')
+        elif method in ['ENERGY', 'energy']:
+            colors.append('#4ECDC4')
+        elif method in ['LINEAR_PROBE', 'linear_probe']:
+            colors.append('#95E1D3')
+        elif method in ['TIP', 'tip']:
+            colors.append('#F38181')
+        elif method in ['LP++', 'lp++']:
+            colors.append('#AA96DA')
+        elif method in ['LORA', 'lora']:
+            colors.append('#FCBAD3')
+        else:
+            colors.append('#A8D8EA')
+    
+    scatter = ax.scatter(gpu_memory, y_positions, s=sizes_normalized, 
+                        c=colors, alpha=0.6, edgecolors='black', linewidth=1.5)
+    
+    # Add method labels
+    for i, (x, y, method, params) in enumerate(zip(gpu_memory, y_positions, methods, trainable_params)):
+        # Determine model info from method name
+        if 'B/32' in method or 'B-32' in args.model:
+            model_info = '(B/32)'
+        elif 'B/16' in method or 'B-16' in args.model:
+            model_info = '(B/16)'
+        elif 'L/14' in method or 'L-14' in args.model:
+            model_info = '(L/14)'
+        else:
+            model_info = ''
+        
+        # Format method name
+        if method.lower() in ['atlas', 'energy']:
+            label = f"{method.upper()} {model_info}"
+        elif method.lower() == 'linear_probe':
+            label = f"LN {model_info}"
+        elif method.lower() == 'lora':
+            label = f"LORA {model_info}"
+        else:
+            label = f"{method.upper()} {model_info}"
+        
+        ax.annotate(label, (x, y), xytext=(5, 5), textcoords='offset points',
+                   fontsize=9, bbox=dict(boxstyle='round,pad=0.3', facecolor=colors[i], alpha=0.3))
+    
+    # Set labels and title
+    ax.set_xlabel('Memory (GB)', fontsize=12)
+    ax.set_ylabel('Accuracy (%)', fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+    ax.set_ylim(50, 80)
+    
+    # Save figure
+    os.makedirs("results/gpu_memory/figures", exist_ok=True)
+    model_safe = args.model.replace("/", "-").replace(":", "-")
+    figure_name = f"{args.mode}_{model_safe}_k{args.k_shot}_bubble_chart.png"
+    if args.test_dataset:
+        figure_name = f"{args.test_dataset}_{figure_name}"
+    
+    save_path = os.path.join("results/gpu_memory/figures", figure_name)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\n📊 Bubble chart saved to: {save_path}")
+    print(f"   Note: Y-axis (accuracy) uses placeholder values - update with real accuracy data")
+    
+    return save_path
+
+
 def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
     """Run all methods sequentially and collect results"""
     results = []
@@ -917,7 +1076,7 @@ def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
         traceback.print_exc()
     
     # 3. Baselines - same for both modes now
-    baseline_methods = ["linear_probe", "tip", "lp++"]
+    baseline_methods = ["linear_probe", "tip", "lp++", "lora"]
     
     for baseline_method in baseline_methods:
         try:
@@ -967,6 +1126,9 @@ def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
         print(f"{method_name:<25} {gpu_mem:<20.2f} {trainable:<20,}")
     
     print("="*100)
+    
+    # Generate bubble chart visualization
+    plot_bubble_chart(results, args)
     
     return results
 
@@ -1018,8 +1180,28 @@ def main():
     parser.add_argument(
         "--baseline_method",
         type=str,
-        choices=["linear_probe", "tip", "lp++"],
+        choices=["linear_probe", "tip", "lp++", "lora"],
         help="Baseline method (optional, will run all if not specified with --all or method=baseline)"
+    )
+    
+    # LoRA-specific
+    parser.add_argument(
+        "--lora_r",
+        type=int,
+        default=8,
+        help="LoRA rank"
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=float,
+        default=32.0,
+        help="LoRA alpha"
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.0,
+        help="LoRA dropout"
     )
     
     # K-shot
@@ -1146,7 +1328,7 @@ def main():
             print("="*100)
             
             results_list = []
-            baseline_methods = ["linear_probe", "tip", "lp++"]
+            baseline_methods = ["linear_probe", "tip", "lp++", "lora"]
             
             for baseline_method in baseline_methods:
                 try:
@@ -1187,6 +1369,10 @@ def main():
                 print(f"{method_name:<25} {gpu_mem:<20.2f} {trainable:<20,}")
             
             print("="*100)
+            
+            # Generate bubble chart visualization
+            plot_bubble_chart(results_list, args)
+            
             print(f"\n✅ All baseline results saved to: results/gpu_memory/")
         
         else:
