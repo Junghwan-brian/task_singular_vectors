@@ -978,6 +978,13 @@ def main():
         default=os.path.expanduser("~/openclip-cachedir/open_clip"),
         help="Directory for caching models from OpenCLIP"
     )
+
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Directory for caching features and encoder"
+    )
     
     args = parser.parse_args()
     
