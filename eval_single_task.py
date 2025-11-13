@@ -254,12 +254,22 @@ def discover_results(model_location: str) -> Dict[str, Dict[str, Dict[str, List[
                 else:
                     # Config directory (new structure: energy_14_0p001_4_average_0p1/16shots/)
                     config_tag = config_or_shot
+                    
+                    # Debug log for ZeroShot config detection
+                    if 'zeroshot' in config_tag.lower():
+                        logger.info(f"Found ZeroShot config directory: {config_path}")
+                    
                     for shot_entry in sorted(os.listdir(config_path)):
                         shot_path = os.path.join(config_path, shot_entry)
                         if not os.path.isdir(shot_path):
                             continue
                         if shot_entry.endswith('shots') or shot_entry.endswith('shot'):
                             shot_name = shot_entry if shot_entry.endswith('shots') else f"{shot_entry}s"
+                            
+                            # Debug log for ZeroShot shot directory
+                            if 'zeroshot' in config_tag.lower():
+                                logger.info(f"Processing ZeroShot shot directory: {shot_path}")
+                            
                             process_shot_directory(
                                 results, model_name, dataset_name, shot_name, shot_path, config_tag
                             )
@@ -357,11 +367,25 @@ def process_shot_directory(
         if not data:
             continue
         
+        # Debug log for ZeroShot detection
+        if config_tag and 'zeroshot' in config_tag.lower():
+            method_in_data = data.get('method', 'Unknown')
+            logger.info(f"Processing ZeroShot file: {json_path}")
+            logger.info(f"  - method in JSON: {method_in_data}")
+            logger.info(f"  - config_tag: {config_tag}")
+            logger.info(f"  - is_baseline: {is_baseline}")
+        
         # Extract adapter
         adapter = parse_adapter_from_filename(filename)
         
         # Extract accuracy
         accuracy = get_accuracy_from_data(data, adapter)
+        
+        # Debug log for ZeroShot accuracy
+        if config_tag and 'zeroshot' in config_tag.lower():
+            logger.info(f"  - extracted accuracy: {accuracy}")
+            logger.info(f"  - final_accuracy in JSON: {data.get('final_accuracy')}")
+        
         if accuracy is None:
             logger.warning(f"No accuracy found in {json_path}")
             continue
@@ -406,6 +430,10 @@ def process_shot_directory(
             # Handle baseline methods: linear_probe, tip, lora, lp++, zeroshot
             method_name = data.get('method', 'Unknown')
             
+            # Debug log for ZeroShot method mapping
+            if config_tag and 'zeroshot' in config_tag.lower():
+                logger.info(f"  - method_name from JSON: '{method_name}'")
+            
             # Map method names to display names (remove "baseline" prefix)
             method_display_map = {
                 'linear_probe': 'LinearProbe',
@@ -419,6 +447,10 @@ def process_shot_directory(
             }
             
             method = method_display_map.get(method_name, method_name.title())
+            
+            # Debug log for mapped method
+            if config_tag and 'zeroshot' in config_tag.lower():
+                logger.info(f"  - mapped method: '{method}'")
             
             # Parse baseline hyperparameters from config_tag
             tag_to_parse = config_tag or data.get('config_tag', '')
@@ -438,7 +470,12 @@ def process_shot_directory(
             continue
         
         results[model_name][dataset_name][shot_name].append(baseline)
-        logger.debug(f"Added baseline: {model_name}/{dataset_name}/{shot_name} - {method} - {accuracy:.2f}%")
+        
+        # Always log ZeroShot additions
+        if method == 'ZeroShot':
+            logger.info(f"✓ Added ZeroShot: {model_name}/{dataset_name}/{shot_name} - {accuracy:.2f}%")
+        else:
+            logger.debug(f"Added baseline: {model_name}/{dataset_name}/{shot_name} - {method} - {accuracy:.2f}%")
 
 
 def format_baseline_label(baseline: Dict[str, Any]) -> str:
