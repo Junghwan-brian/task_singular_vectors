@@ -972,6 +972,12 @@ def main():
         default=None,
         help="Partition size for Atlas"
     )
+    parser.add_argument(
+        "--openclip_cachedir",
+        type=str,
+        default=os.path.expanduser("~/openclip-cachedir/open_clip"),
+        help="Directory for caching models from OpenCLIP"
+    )
     
     args = parser.parse_args()
     
