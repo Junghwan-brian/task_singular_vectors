@@ -28,7 +28,7 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
 from atlas_src.composition import WeightedImageEncoder
 from atlas_src.utils import TIPWrapper, LPPWrapper
