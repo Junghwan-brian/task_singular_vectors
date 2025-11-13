@@ -33,18 +33,20 @@ class EMNIST:
     ):
         # EMNIST-specific transforms must be applied FIRST (on PIL Image)
         # before any other transforms that might return a dict
-        preprocess1 = emnist_preprocess()
+        emnist_transforms = [rotate_img, flip_img]
         
         # Check if preprocess is a TwoAsymetricTransform or similar
-        from atlas_src.utils import TIPWrapper, LPPWrapper
         if hasattr(preprocess, 'weak_transform') and hasattr(preprocess, 'strong_transform'):
             # Apply EMNIST transforms inside both weak and strong transforms
             weak_transform = preprocess.weak_transform
             strong_transform = preprocess.strong_transform
             
-            # Prepend EMNIST transforms to both
-            new_weak = torchvision.transforms.Compose([preprocess1, weak_transform])
-            new_strong = torchvision.transforms.Compose([preprocess1, strong_transform])
+            # Extract transforms from weak and strong, and prepend EMNIST transforms
+            weak_transforms = weak_transform.transforms if hasattr(weak_transform, 'transforms') else [weak_transform]
+            strong_transforms = strong_transform.transforms if hasattr(strong_transform, 'transforms') else [strong_transform]
+            
+            new_weak = torchvision.transforms.Compose(emnist_transforms + list(weak_transforms))
+            new_strong = torchvision.transforms.Compose(emnist_transforms + list(strong_transforms))
             
             # Recreate the asymmetric transform with modified transforms
             class TwoAsymetricTransform:
@@ -57,7 +59,12 @@ class EMNIST:
             preprocess = TwoAsymetricTransform(new_weak, new_strong)
         else:
             # Normal case: prepend EMNIST transforms
-            preprocess = torchvision.transforms.Compose([preprocess1, preprocess])
+            if hasattr(preprocess, 'transforms'):
+                # preprocess is a Compose, extract its transforms
+                preprocess = torchvision.transforms.Compose(emnist_transforms + list(preprocess.transforms))
+            else:
+                # preprocess is a single transform
+                preprocess = torchvision.transforms.Compose(emnist_transforms + [preprocess])
         # location = os.path.join(location, "EMNIST")
         self.train_dataset = datasets.EMNIST(
             root=location,
