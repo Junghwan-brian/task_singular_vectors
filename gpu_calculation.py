@@ -29,6 +29,29 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
+# ============================================================================
+# 📊 ACCURACY DATA - Fill in your actual accuracy values here!
+# ============================================================================
+# Format: "method_name": accuracy_percentage
+# Example: "lora": 66.66 means 66.66% accuracy
+# Set to None if you don't have the data yet (will use placeholder in plot)
+# ============================================================================
+
+ACCURACIES = {
+    # ===== MAIN METHODS =====
+    "atlas": None,      # e.g., 70.5
+    "energy": None,     # e.g., 68.3
+    
+    # ===== BASELINE METHODS =====
+    "linear_probe": None,  # e.g., 65.2
+    "tip": None,           # e.g., 67.8
+    "lp++": None,          # e.g., 69.1
+    "lora": None,          # e.g., 66.66
+}
+
+# ============================================================================
+
+
 def get_gpu_memory_mb() -> float:
     """Get current GPU memory usage in MB"""
     if torch.cuda.is_available():
@@ -324,7 +347,7 @@ def measure_energy_remote_sensing(args, cfg, all_datasets) -> Dict:
 
 def measure_baseline_remote_sensing(args, cfg, all_datasets) -> Dict:
     """Measure GPU memory for baseline methods on remote sensing datasets"""
-    from src.models import ImageEncoder
+    from src.models import ImageEncoder, ImageClassifier, get_classification_head
     
     print("\n" + "="*80)
     print(f"📊 Baseline: {args.baseline_method} (Remote Sensing) GPU Memory Calculation")
@@ -349,30 +372,60 @@ def measure_baseline_remote_sensing(args, cfg, all_datasets) -> Dict:
     cache_info = None
     
     if args.baseline_method == 'linear_probe':
-        print("\n2️⃣  Linear probe: Only classification head (trainable)")
-        # Classification head is small, typically ~1-5MB depending on num_classes
-        # We'll estimate based on typical remote sensing datasets (10-50 classes)
+        print("\n2️⃣  Linear probe: Creating classification head...")
+        # Create actual classification head to count real parameters
         avg_num_classes = 30  # Average for remote sensing
-        feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
-        head_params = feature_dim * avg_num_classes + avg_num_classes  # weight + bias
-        trainable_params = head_params
-        additional_mem = head_params * 4 / (1024 ** 2)  # Convert to MB
+        classification_head = get_classification_head(args, args.model.replace('/', ''))
+        if classification_head is None:
+            # Fallback to manual creation
+            feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
+            classification_head = torch.nn.Linear(feature_dim, avg_num_classes)
+        
+        classification_head = classification_head.cuda()
+        
+        # Count actual trainable parameters
+        trainable_params = sum(p.numel() for p in classification_head.parameters() if p.requires_grad)
+        additional_mem = trainable_params * 4 / (1024 ** 2)  # Convert to MB
+        
+        print(f"   Classification head: {trainable_params:,} parameters")
+        print(f"   Memory: {additional_mem:.2f} MB")
+        
+        del classification_head
         
     elif args.baseline_method == 'tip':
-        print(f"\n2️⃣  TIP Adapter: Feature cache + beta parameter (k={args.k_shot} shot)")
-        # Feature cache size: k × num_classes × feature_dim × 4 bytes
+        print(f"\n2️⃣  TIP Adapter: Creating real TIP wrapper (k={args.k_shot} shot)...")
+        from atlas_src.utils import TIPWrapper
+        from baselines_train_remote_sensing import ReturnFeaturesClassifier
+        
+        # Create dummy feature cache
         k = args.k_shot
         avg_num_classes = 30
         feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
-        
         cache_samples = k * avg_num_classes
-        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
-        # TIP has beta_alpha (scalar), cache_keys and cache_values
-        tip_params = cache_samples * feature_dim * 2 + 1  # keys + values + beta
-        trainable_params = 1  # Only beta_alpha is trainable
-        additional_params = tip_params
-        additional_mem = cache_size_mb
+        # Create dummy classification head
+        classification_head = torch.nn.Linear(feature_dim, avg_num_classes).cuda()
+        base_model = ImageClassifier(image_encoder, classification_head)
+        wrapper_model = ReturnFeaturesClassifier(base_model)
+        
+        # Create dummy cache
+        features_cache = torch.randn(cache_samples, feature_dim)
+        labels = torch.randint(0, avg_num_classes, (cache_samples,))
+        
+        # Create TIP wrapper
+        tip_model = TIPWrapper(wrapper_model, features_cache, labels).cuda()
+        
+        # Freeze adapter (only beta_alpha should be trainable, as per TIP-Adapter paper)
+        tip_model.adapter.weight.requires_grad = False
+        if tip_model.adapter.bias is not None:
+            tip_model.adapter.bias.requires_grad = False
+        
+        # Count ACTUAL trainable parameters (should be only beta_alpha = 2 scalars)
+        trainable_params = sum(p.numel() for p in tip_model.parameters() if p.requires_grad)
+        
+        mem_after_tip = get_gpu_memory_mb()
+        additional_mem = mem_after_tip - mem_after_encoder
+        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
         cache_info = {
             "k_shot": k,
@@ -382,36 +435,52 @@ def measure_baseline_remote_sensing(args, cfg, all_datasets) -> Dict:
         }
         
         print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
-        print(f"   Beta parameter: ~0.00 MB (1 scalar)")
+        print(f"   Trainable params: {trainable_params:,} (beta_alpha)")
+        print(f"   Total memory: {additional_mem:.2f} MB")
+        
+        del tip_model, wrapper_model, base_model, classification_head
         
     elif args.baseline_method == 'lp++':
-        print(f"\n2️⃣  LP++ Adapter: Feature cache + alpha_vec + adapter (k={args.k_shot} shot)")
-        # Similar to TIP but with additional alpha_vec and adapter weights
+        print(f"\n2️⃣  LP++ Adapter: Creating real LP++ wrapper (k={args.k_shot} shot)...")
+        from atlas_src.utils import LPPWrapper
+        from baselines_train_remote_sensing import ReturnFeaturesClassifier
+        
         k = args.k_shot
         avg_num_classes = 30
         feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
-        
         cache_samples = k * avg_num_classes
-        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
-        # LP++ has alpha_vec (num_classes) and adapter (feature_dim × num_classes)
-        lpp_params = cache_samples * feature_dim * 2 + avg_num_classes + feature_dim * avg_num_classes
-        trainable_params = avg_num_classes + feature_dim * avg_num_classes  # alpha_vec + adapter
-        additional_params = lpp_params
-        additional_mem = cache_size_mb + trainable_params * 4 / (1024 ** 2)
+        # Create dummy classification head
+        classification_head = torch.nn.Linear(feature_dim, avg_num_classes).cuda()
+        base_model = ImageClassifier(image_encoder, classification_head)
+        wrapper_model = ReturnFeaturesClassifier(base_model)
+        
+        # Create dummy cache
+        features_cache = torch.randn(cache_samples, feature_dim)
+        labels = torch.randint(0, avg_num_classes, (cache_samples,))
+        
+        # Create LP++ wrapper
+        lpp_model = LPPWrapper(wrapper_model, features_cache, labels, k).cuda()
+        
+        # Count ACTUAL trainable parameters
+        trainable_params = sum(p.numel() for p in lpp_model.parameters() if p.requires_grad)
+        
+        mem_after_lpp = get_gpu_memory_mb()
+        additional_mem = mem_after_lpp - mem_after_encoder
+        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
         cache_info = {
             "k_shot": k,
             "cache_samples": cache_samples,
             "feature_dim": feature_dim,
             "cache_size_mb": cache_size_mb,
-            "alpha_vec_params": avg_num_classes,
-            "adapter_params": feature_dim * avg_num_classes
         }
         
         print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
-        print(f"   Alpha vec: {avg_num_classes} params")
-        print(f"   Adapter: {feature_dim * avg_num_classes:,} params")
+        print(f"   Trainable params: {trainable_params:,} (adapter + alpha_vec)")
+        print(f"   Total memory: {additional_mem:.2f} MB")
+        
+        del lpp_model, wrapper_model, base_model, classification_head
         
     elif args.baseline_method == 'lora':
         print(f"\n2️⃣  LoRA: Applying LoRA modules (r={args.lora_r}, alpha={args.lora_alpha})...")
@@ -427,14 +496,15 @@ def measure_baseline_remote_sensing(args, cfg, all_datasets) -> Dict:
         mem_after_lora = get_gpu_memory_mb()
         additional_mem = mem_after_lora - mem_after_encoder
         
-        # Count LoRA parameters
+        # Count ACTUAL LoRA parameters
+        trainable_params = 0
         for name, module in image_encoder.named_modules():
             if isinstance(module, LoRALinear):
                 additional_params += module.lora_A.numel() + module.lora_B.numel()
                 trainable_params += module.lora_A.numel() + module.lora_B.numel()
         
         print(f"   LoRA modules: {additional_mem:.2f} MB")
-        print(f"   LoRA A+B params: {trainable_params:,}")
+        print(f"   Trainable params: {trainable_params:,} (A + B matrices)")
         print(f"   Total: {mem_after_lora:.2f} MB")
     
     else:
@@ -742,7 +812,7 @@ def measure_energy_reverse(args, cfg, all_datasets) -> Dict:
 
 def measure_baseline_reverse(args, cfg, all_datasets) -> Dict:
     """Measure GPU memory for baseline methods on general (reverse) datasets"""
-    from src.models import ImageEncoder
+    from src.models import ImageEncoder, ImageClassifier, get_classification_head
     
     print("\n" + "="*80)
     print(f"📊 Baseline: {args.baseline_method} (Reverse) GPU Memory Calculation")
@@ -767,27 +837,52 @@ def measure_baseline_reverse(args, cfg, all_datasets) -> Dict:
     cache_info = None
     
     if args.baseline_method == 'linear_probe':
-        print("\n2️⃣  Linear probe: Only classification head (trainable)")
-        # Classification head size estimation
+        print("\n2️⃣  Linear probe: Creating classification head...")
         avg_num_classes = 50  # Average for general datasets
-        feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
-        head_params = feature_dim * avg_num_classes + avg_num_classes
-        trainable_params = head_params
-        additional_mem = head_params * 4 / (1024 ** 2)
+        classification_head = get_classification_head(args, args.model.replace('/', ''))
+        if classification_head is None:
+            feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
+            classification_head = torch.nn.Linear(feature_dim, avg_num_classes)
+        
+        classification_head = classification_head.cuda()
+        trainable_params = sum(p.numel() for p in classification_head.parameters() if p.requires_grad)
+        additional_mem = trainable_params * 4 / (1024 ** 2)
+        
+        print(f"   Classification head: {trainable_params:,} parameters")
+        print(f"   Memory: {additional_mem:.2f} MB")
+        
+        del classification_head
         
     elif args.baseline_method == 'tip':
-        print(f"\n2️⃣  TIP Adapter: Feature cache + beta parameter (k={args.k_shot} shot)")
+        print(f"\n2️⃣  TIP Adapter: Creating real TIP wrapper (k={args.k_shot} shot)...")
+        from atlas_src.utils import TIPWrapper
+        from baselines_train_remote_sensing import ReturnFeaturesClassifier
+        
         k = args.k_shot
         avg_num_classes = 50  # Average for general datasets
         feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
-        
         cache_samples = k * avg_num_classes
-        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
-        tip_params = cache_samples * feature_dim * 2 + 1
-        trainable_params = 1
-        additional_params = tip_params
-        additional_mem = cache_size_mb
+        classification_head = torch.nn.Linear(feature_dim, avg_num_classes).cuda()
+        base_model = ImageClassifier(image_encoder, classification_head)
+        wrapper_model = ReturnFeaturesClassifier(base_model)
+        
+        features_cache = torch.randn(cache_samples, feature_dim)
+        labels = torch.randint(0, avg_num_classes, (cache_samples,))
+        
+        tip_model = TIPWrapper(wrapper_model, features_cache, labels).cuda()
+        
+        # Freeze adapter (only beta_alpha should be trainable, as per TIP-Adapter paper)
+        tip_model.adapter.weight.requires_grad = False
+        if tip_model.adapter.bias is not None:
+            tip_model.adapter.bias.requires_grad = False
+        
+        # Count ACTUAL trainable parameters (should be only beta_alpha = 2 scalars)
+        trainable_params = sum(p.numel() for p in tip_model.parameters() if p.requires_grad)
+        
+        mem_after_tip = get_gpu_memory_mb()
+        additional_mem = mem_after_tip - mem_after_encoder
+        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
         cache_info = {
             "k_shot": k,
@@ -797,34 +892,47 @@ def measure_baseline_reverse(args, cfg, all_datasets) -> Dict:
         }
         
         print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
-        print(f"   Beta parameter: ~0.00 MB (1 scalar)")
+        print(f"   Trainable params: {trainable_params:,} (beta_alpha)")
+        print(f"   Total memory: {additional_mem:.2f} MB")
+        
+        del tip_model, wrapper_model, base_model, classification_head
         
     elif args.baseline_method == 'lp++':
-        print(f"\n2️⃣  LP++ Adapter: Feature cache + alpha_vec + adapter (k={args.k_shot} shot)")
+        print(f"\n2️⃣  LP++ Adapter: Creating real LP++ wrapper (k={args.k_shot} shot)...")
+        from atlas_src.utils import LPPWrapper
+        from baselines_train_remote_sensing import ReturnFeaturesClassifier
+        
         k = args.k_shot
         avg_num_classes = 50
         feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
-        
         cache_samples = k * avg_num_classes
-        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
-        lpp_params = cache_samples * feature_dim * 2 + avg_num_classes + feature_dim * avg_num_classes
-        trainable_params = avg_num_classes + feature_dim * avg_num_classes
-        additional_params = lpp_params
-        additional_mem = cache_size_mb + trainable_params * 4 / (1024 ** 2)
+        classification_head = torch.nn.Linear(feature_dim, avg_num_classes).cuda()
+        base_model = ImageClassifier(image_encoder, classification_head)
+        wrapper_model = ReturnFeaturesClassifier(base_model)
+        
+        features_cache = torch.randn(cache_samples, feature_dim)
+        labels = torch.randint(0, avg_num_classes, (cache_samples,))
+        
+        lpp_model = LPPWrapper(wrapper_model, features_cache, labels, k).cuda()
+        trainable_params = sum(p.numel() for p in lpp_model.parameters() if p.requires_grad)
+        
+        mem_after_lpp = get_gpu_memory_mb()
+        additional_mem = mem_after_lpp - mem_after_encoder
+        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
         cache_info = {
             "k_shot": k,
             "cache_samples": cache_samples,
             "feature_dim": feature_dim,
             "cache_size_mb": cache_size_mb,
-            "alpha_vec_params": avg_num_classes,
-            "adapter_params": feature_dim * avg_num_classes
         }
         
         print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
-        print(f"   Alpha vec: {avg_num_classes} params")
-        print(f"   Adapter: {feature_dim * avg_num_classes:,} params")
+        print(f"   Trainable params: {trainable_params:,} (adapter + alpha_vec)")
+        print(f"   Total memory: {additional_mem:.2f} MB")
+        
+        del lpp_model, wrapper_model, base_model, classification_head
         
     elif args.baseline_method == 'lora':
         print(f"\n2️⃣  LoRA: Applying LoRA modules (r={args.lora_r}, alpha={args.lora_alpha})...")
@@ -840,14 +948,14 @@ def measure_baseline_reverse(args, cfg, all_datasets) -> Dict:
         mem_after_lora = get_gpu_memory_mb()
         additional_mem = mem_after_lora - mem_after_encoder
         
-        # Count LoRA parameters
+        trainable_params = 0
         for name, module in image_encoder.named_modules():
             if isinstance(module, LoRALinear):
                 additional_params += module.lora_A.numel() + module.lora_B.numel()
                 trainable_params += module.lora_A.numel() + module.lora_B.numel()
         
         print(f"   LoRA modules: {additional_mem:.2f} MB")
-        print(f"   LoRA A+B params: {trainable_params:,}")
+        print(f"   Trainable params: {trainable_params:,} (A + B matrices)")
         print(f"   Total: {mem_after_lora:.2f} MB")
     
     else:
@@ -913,8 +1021,8 @@ def generate_save_path(args, method: str, baseline_method: Optional[str] = None)
 def plot_bubble_chart(results: List[Dict], args) -> str:
     """Create bubble chart: x=GPU memory, y=accuracy, bubble size=trainable params
     
-    Note: Since we don't have accuracy data, this function saves the structure
-    for future use when accuracy data becomes available.
+    Uses the ACCURACIES dictionary at the top of this file.
+    Edit that dictionary to fill in actual accuracy values!
     """
     try:
         import matplotlib.pyplot as plt
@@ -927,6 +1035,7 @@ def plot_bubble_chart(results: List[Dict], args) -> str:
     methods = []
     gpu_memory = []
     trainable_params = []
+    y_positions = []
     
     for result in results:
         method_name = result.get('method', 'unknown')
@@ -936,6 +1045,28 @@ def plot_bubble_chart(results: List[Dict], args) -> str:
         methods.append(method_name.upper())
         gpu_memory.append(result.get('total_gpu_mb', 0) / 1024)  # Convert to GB
         trainable_params.append(result.get('trainable_params', 0))
+        
+        # Get accuracy from ACCURACIES dictionary
+        acc = ACCURACIES.get(method_name.lower())
+        y_positions.append(acc)
+    
+    # If we have any None values, fill with placeholders
+    has_missing = any(y is None for y in y_positions)
+    if has_missing:
+        placeholder_values = [65, 67, 57, 73, 66, 72]
+        for i, y in enumerate(y_positions):
+            if y is None:
+                y_positions[i] = placeholder_values[i % len(placeholder_values)]
+        
+        print("\n⚠️  NOTE: Some accuracy values are missing in ACCURACIES dictionary")
+        print("   Edit the ACCURACIES dict at the top of this file to add real values")
+        print(f"   Example: \"lora\": 66.66")
+    
+    print(f"\n📊 Bubble Chart Data:")
+    print(f"   Methods: {methods}")
+    print(f"   GPU Memory (GB): {[f'{m:.2f}' for m in gpu_memory]}")
+    print(f"   Accuracy (%): {[f'{y:.2f}' if y else 'N/A' for y in y_positions]}")
+    print(f"   Trainable Params: {trainable_params}")
     
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 8))
