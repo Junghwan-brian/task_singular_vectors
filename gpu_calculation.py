@@ -325,7 +325,6 @@ def measure_energy_remote_sensing(args, cfg, all_datasets) -> Dict:
 def measure_baseline_remote_sensing(args, cfg, all_datasets) -> Dict:
     """Measure GPU memory for baseline methods on remote sensing datasets"""
     from src.models import ImageEncoder
-    from baselines_train_remote_sensing import LoRALinear, apply_lora_to_module
     
     print("\n" + "="*80)
     print(f"📊 Baseline: {args.baseline_method} (Remote Sensing) GPU Memory Calculation")
@@ -347,45 +346,72 @@ def measure_baseline_remote_sensing(args, cfg, all_datasets) -> Dict:
     additional_mem = 0
     additional_params = 0
     trainable_params = 0
+    cache_info = None
     
-    if args.baseline_method == 'zeroshot':
-        print("\n2️⃣  Zero-shot: No additional components")
-        additional_mem = 0
-        additional_params = 0
-        trainable_params = 0
+    if args.baseline_method == 'linear_probe':
+        print("\n2️⃣  Linear probe: Only classification head (trainable)")
+        # Classification head is small, typically ~1-5MB depending on num_classes
+        # We'll estimate based on typical remote sensing datasets (10-50 classes)
+        avg_num_classes = 30  # Average for remote sensing
+        feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
+        head_params = feature_dim * avg_num_classes + avg_num_classes  # weight + bias
+        trainable_params = head_params
+        additional_mem = head_params * 4 / (1024 ** 2)  # Convert to MB
         
-    elif args.baseline_method == 'linear_probe':
-        print("\n2️⃣  Linear probe: Only classification head (not loaded without dataset)")
-        additional_mem = 0  # Head is loaded with dataset
-        additional_params = 0
-        trainable_params = 0
+    elif args.baseline_method == 'tip':
+        print(f"\n2️⃣  TIP Adapter: Feature cache + beta parameter (k={args.k_shot} shot)")
+        # Feature cache size: k × num_classes × feature_dim × 4 bytes
+        k = args.k_shot
+        avg_num_classes = 30
+        feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
         
-    elif args.baseline_method in ['tip_adapter', 'lp++']:
-        print(f"\n2️⃣  {args.baseline_method}: Feature cache (loaded during training)")
-        additional_mem = 0  # Cache is created from dataset
-        additional_params = 0
-        trainable_params = 0
+        cache_samples = k * avg_num_classes
+        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
-    elif args.baseline_method == 'lora':
-        print(f"\n2️⃣  LoRA: Applying LoRA modules (r={args.lora_r}, alpha={args.lora_alpha})...")
-        apply_lora_to_module(
-            image_encoder, 
-            r=args.lora_r, 
-            alpha=args.lora_alpha, 
-            dropout=args.lora_dropout
-        )
+        # TIP has beta_alpha (scalar), cache_keys and cache_values
+        tip_params = cache_samples * feature_dim * 2 + 1  # keys + values + beta
+        trainable_params = 1  # Only beta_alpha is trainable
+        additional_params = tip_params
+        additional_mem = cache_size_mb
         
-        mem_after_lora = get_gpu_memory_mb()
-        additional_mem = mem_after_lora - mem_after_encoder
+        cache_info = {
+            "k_shot": k,
+            "cache_samples": cache_samples,
+            "feature_dim": feature_dim,
+            "cache_size_mb": cache_size_mb
+        }
         
-        # Count LoRA parameters
-        for name, module in image_encoder.named_modules():
-            if isinstance(module, LoRALinear):
-                additional_params += module.lora_A.numel() + module.lora_B.numel()
-                trainable_params += module.lora_A.numel() + module.lora_B.numel()
+        print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
+        print(f"   Beta parameter: ~0.00 MB (1 scalar)")
         
-        print(f"   LoRA modules: {additional_mem:.2f} MB")
-        print(f"   Total: {mem_after_lora:.2f} MB")
+    elif args.baseline_method == 'lp++':
+        print(f"\n2️⃣  LP++ Adapter: Feature cache + alpha_vec + adapter (k={args.k_shot} shot)")
+        # Similar to TIP but with additional alpha_vec and adapter weights
+        k = args.k_shot
+        avg_num_classes = 30
+        feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
+        
+        cache_samples = k * avg_num_classes
+        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
+        
+        # LP++ has alpha_vec (num_classes) and adapter (feature_dim × num_classes)
+        lpp_params = cache_samples * feature_dim * 2 + avg_num_classes + feature_dim * avg_num_classes
+        trainable_params = avg_num_classes + feature_dim * avg_num_classes  # alpha_vec + adapter
+        additional_params = lpp_params
+        additional_mem = cache_size_mb + trainable_params * 4 / (1024 ** 2)
+        
+        cache_info = {
+            "k_shot": k,
+            "cache_samples": cache_samples,
+            "feature_dim": feature_dim,
+            "cache_size_mb": cache_size_mb,
+            "alpha_vec_params": avg_num_classes,
+            "adapter_params": feature_dim * avg_num_classes
+        }
+        
+        print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
+        print(f"   Alpha vec: {avg_num_classes} params")
+        print(f"   Adapter: {feature_dim * avg_num_classes:,} params")
     
     else:
         raise ValueError(f"Unknown baseline method: {args.baseline_method}")
@@ -410,17 +436,23 @@ def measure_baseline_remote_sensing(args, cfg, all_datasets) -> Dict:
     del image_encoder
     reset_gpu_memory()
     
-    return {
+    result = {
         "method": "baseline",
         "baseline_method": args.baseline_method,
         "mode": "remote_sensing",
         "model": args.model,
+        "k_shot": args.k_shot,
         "base_encoder_mb": encoder_mem,
         "additional_mb": additional_mem,
         "total_gpu_mb": total_mem,
         "total_params": total_params,
         "trainable_params": trainable_params,
     }
+    
+    if cache_info:
+        result["cache_info"] = cache_info
+    
+    return result
 
 
 def measure_atlas_reverse(args, cfg, all_datasets) -> Dict:
@@ -647,7 +679,7 @@ def measure_energy_reverse(args, cfg, all_datasets) -> Dict:
     # Calculate compression ratio
     original_tv_size = len(task_vectors) * 432  # MB per task vector
     compression_ratio = (original_tv_size / sigma_mem) if sigma_mem > 0 else 0
-    
+    num_tasks = len(task_vectors)
     print("\n" + "="*80)
     print("📈 Final Results:")
     print("="*80)
@@ -671,7 +703,7 @@ def measure_energy_reverse(args, cfg, all_datasets) -> Dict:
         "mode": "reverse",
         "model": args.model,
         "test_dataset": test_ds,
-        "num_task_vectors": len(task_vectors),
+        "num_task_vectors": num_tasks,
         "svd_keep_topk": args.svd_keep_topk,
         "base_encoder_mb": encoder_mem,
         "sigma_modules_mb": sigma_mem,
@@ -708,41 +740,67 @@ def measure_baseline_reverse(args, cfg, all_datasets) -> Dict:
     additional_mem = 0
     additional_params = 0
     trainable_params = 0
+    cache_info = None
     
-    if args.baseline_method == 'zeroshot':
-        print("\n2️⃣  Zero-shot: No additional components")
+    if args.baseline_method == 'linear_probe':
+        print("\n2️⃣  Linear probe: Only classification head (trainable)")
+        # Classification head size estimation
+        avg_num_classes = 50  # Average for general datasets
+        feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
+        head_params = feature_dim * avg_num_classes + avg_num_classes
+        trainable_params = head_params
+        additional_mem = head_params * 4 / (1024 ** 2)
         
-    elif args.baseline_method == 'linear_norm':
-        print("\n2️⃣  Linear Norm: Only layer normalization parameters")
-        # Count only LayerNorm parameters
-        for name, module in image_encoder.named_modules():
-            if isinstance(module, torch.nn.LayerNorm):
-                trainable_params += sum(p.numel() for p in module.parameters() if p.requires_grad)
-        additional_mem = 0  # No additional GPU memory, just parameter selection
+    elif args.baseline_method == 'tip':
+        print(f"\n2️⃣  TIP Adapter: Feature cache + beta parameter (k={args.k_shot} shot)")
+        k = args.k_shot
+        avg_num_classes = 50  # Average for general datasets
+        feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
         
-    elif args.baseline_method == 'lora':
-        print(f"\n2️⃣  LoRA: Applying LoRA modules (r={args.lora_r}, alpha={args.lora_alpha})...")
-        # Import LoRA from baselines script
-        from baselines_train_remote_sensing import LoRALinear, apply_lora_to_module
+        cache_samples = k * avg_num_classes
+        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
         
-        apply_lora_to_module(
-            image_encoder, 
-            r=args.lora_r, 
-            alpha=args.lora_alpha, 
-            dropout=args.lora_dropout
-        )
+        tip_params = cache_samples * feature_dim * 2 + 1
+        trainable_params = 1
+        additional_params = tip_params
+        additional_mem = cache_size_mb
         
-        mem_after_lora = get_gpu_memory_mb()
-        additional_mem = mem_after_lora - mem_after_encoder
+        cache_info = {
+            "k_shot": k,
+            "cache_samples": cache_samples,
+            "feature_dim": feature_dim,
+            "cache_size_mb": cache_size_mb
+        }
         
-        # Count LoRA parameters
-        for name, module in image_encoder.named_modules():
-            if isinstance(module, LoRALinear):
-                additional_params += module.lora_A.numel() + module.lora_B.numel()
-                trainable_params += module.lora_A.numel() + module.lora_B.numel()
+        print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
+        print(f"   Beta parameter: ~0.00 MB (1 scalar)")
         
-        print(f"   LoRA modules: {additional_mem:.2f} MB")
-        print(f"   Total: {mem_after_lora:.2f} MB")
+    elif args.baseline_method == 'lp++':
+        print(f"\n2️⃣  LP++ Adapter: Feature cache + alpha_vec + adapter (k={args.k_shot} shot)")
+        k = args.k_shot
+        avg_num_classes = 50
+        feature_dim = 512 if 'B-32' in args.model else 768 if 'B-16' in args.model else 768
+        
+        cache_samples = k * avg_num_classes
+        cache_size_mb = cache_samples * feature_dim * 4 / (1024 ** 2)
+        
+        lpp_params = cache_samples * feature_dim * 2 + avg_num_classes + feature_dim * avg_num_classes
+        trainable_params = avg_num_classes + feature_dim * avg_num_classes
+        additional_params = lpp_params
+        additional_mem = cache_size_mb + trainable_params * 4 / (1024 ** 2)
+        
+        cache_info = {
+            "k_shot": k,
+            "cache_samples": cache_samples,
+            "feature_dim": feature_dim,
+            "cache_size_mb": cache_size_mb,
+            "alpha_vec_params": avg_num_classes,
+            "adapter_params": feature_dim * avg_num_classes
+        }
+        
+        print(f"   Feature cache: {cache_size_mb:.2f} MB ({cache_samples} samples × {feature_dim} dims)")
+        print(f"   Alpha vec: {avg_num_classes} params")
+        print(f"   Adapter: {feature_dim * avg_num_classes:,} params")
     
     else:
         raise ValueError(f"Unknown baseline method for reverse: {args.baseline_method}")
@@ -767,17 +825,41 @@ def measure_baseline_reverse(args, cfg, all_datasets) -> Dict:
     del image_encoder
     reset_gpu_memory()
     
-    return {
+    result = {
         "method": "baseline",
         "baseline_method": args.baseline_method,
         "mode": "reverse",
         "model": args.model,
+        "k_shot": args.k_shot,
         "base_encoder_mb": encoder_mem,
         "additional_mb": additional_mem,
         "total_gpu_mb": total_mem,
         "total_params": total_params,
         "trainable_params": trainable_params,
     }
+    
+    if cache_info:
+        result["cache_info"] = cache_info
+    
+    return result
+
+
+def generate_save_path(args, method: str, baseline_method: Optional[str] = None) -> str:
+    """Generate adaptive save path for results"""
+    os.makedirs("results/gpu_memory", exist_ok=True)
+    
+    # Format: results/gpu_memory/{mode}_{model}_{method}_{baseline_method}_k{k}.json
+    model_safe = args.model.replace("/", "-").replace(":", "-")
+    
+    if method == "baseline" and baseline_method:
+        filename = f"{args.mode}_{model_safe}_{method}_{baseline_method}_k{args.k_shot}.json"
+    else:
+        filename = f"{args.mode}_{model_safe}_{method}_k{args.k_shot}.json"
+    
+    if args.test_dataset:
+        filename = f"{args.test_dataset}_{filename}"
+    
+    return os.path.join("results/gpu_memory", filename)
 
 
 def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
@@ -785,7 +867,9 @@ def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
     results = []
     
     print("\n" + "="*100)
-    print(f"🚀 Running ALL methods for mode={args.mode}, test_dataset={args.test_dataset}")
+    print(f"🚀 Running ALL methods for mode={args.mode}, model={args.model}, k={args.k_shot}")
+    if args.test_dataset:
+        print(f"   Test dataset: {args.test_dataset}")
     print("="*100)
     
     # 1. Atlas
@@ -798,6 +882,13 @@ def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
         else:
             result = measure_atlas_reverse(args, cfg, all_datasets)
         results.append(result)
+        
+        # Save individual result
+        save_path = generate_save_path(args, "atlas")
+        with open(save_path, 'w') as f:
+            json.dump(result, f, indent=4)
+        print(f"✅ Saved to: {save_path}")
+        
     except Exception as e:
         print(f"❌ Atlas failed: {e}")
         import traceback
@@ -813,18 +904,22 @@ def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
         else:
             result = measure_energy_reverse(args, cfg, all_datasets)
         results.append(result)
+        
+        # Save individual result
+        save_path = generate_save_path(args, "energy")
+        with open(save_path, 'w') as f:
+            json.dump(result, f, indent=4)
+        print(f"✅ Saved to: {save_path}")
+        
     except Exception as e:
         print(f"❌ Energy failed: {e}")
         import traceback
         traceback.print_exc()
     
-    # 3. Baselines
-    baseline_methods = {
-        "remote_sensing": ["zeroshot", "linear_probe", "lora"],
-        "reverse": ["zeroshot", "linear_norm", "lora"]
-    }
+    # 3. Baselines - same for both modes now
+    baseline_methods = ["linear_probe", "tip", "lp++"]
     
-    for baseline_method in baseline_methods[args.mode]:
+    for baseline_method in baseline_methods:
         try:
             print("\n" + "🔹"*50)
             print(f"Running Baseline: {baseline_method}...")
@@ -840,6 +935,12 @@ def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
                 result = measure_baseline_reverse(args, cfg, all_datasets)
             results.append(result)
             
+            # Save individual result
+            save_path = generate_save_path(args, "baseline", baseline_method)
+            with open(save_path, 'w') as f:
+                json.dump(result, f, indent=4)
+            print(f"✅ Saved to: {save_path}")
+            
             # Restore original
             args.baseline_method = original_method
             
@@ -852,7 +953,7 @@ def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
     print("\n" + "="*100)
     print("📊 SUMMARY: GPU Memory Usage Comparison")
     print("="*100)
-    print(f"{'Method':<20} {'GPU Memory (MB)':<20} {'Trainable Params':<20}")
+    print(f"{'Method':<25} {'GPU Memory (MB)':<20} {'Trainable Params':<20}")
     print("-"*100)
     
     for result in results:
@@ -863,7 +964,7 @@ def run_all_methods(args, cfg, all_datasets) -> List[Dict]:
         gpu_mem = result.get('total_gpu_mb', 0)
         trainable = result.get('trainable_params', 0)
         
-        print(f"{method_name:<20} {gpu_mem:<20.2f} {trainable:<20,}")
+        print(f"{method_name:<25} {gpu_mem:<20.2f} {trainable:<20,}")
     
     print("="*100)
     
@@ -917,34 +1018,23 @@ def main():
     parser.add_argument(
         "--baseline_method",
         type=str,
-        help="Baseline method (required when method=baseline)"
+        choices=["linear_probe", "tip", "lp++"],
+        help="Baseline method (optional, will run all if not specified with --all or method=baseline)"
     )
     
-    # LoRA-specific
+    # K-shot
     parser.add_argument(
-        "--lora_r",
+        "--k_shot",
         type=int,
-        default=8,
-        help="LoRA rank"
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=float,
-        default=16.0,
-        help="LoRA alpha"
-    )
-    parser.add_argument(
-        "--lora_dropout",
-        type=float,
-        default=0.0,
-        help="LoRA dropout"
+        default=16,
+        help="K-shot samples per class (default: 16 for TIP/LP++ comparison)"
     )
     
     # Energy-specific
     parser.add_argument(
         "--svd_keep_topk",
         type=int,
-        default=2,
+        default=12,
         help="Number of singular vectors to keep per task (for Energy)"
     )
     
@@ -978,7 +1068,7 @@ def main():
         default=os.path.expanduser("~/openclip-cachedir/open_clip"),
         help="Directory for caching models from OpenCLIP"
     )
-
+    
     parser.add_argument(
         "--cache_dir",
         type=str,
@@ -991,9 +1081,6 @@ def main():
     # Validate arguments
     if not args.all and not args.method:
         parser.error("Either --method or --all must be specified")
-    
-    if args.method == "baseline" and not args.baseline_method and not args.all:
-        parser.error("--baseline_method is required when method=baseline")
     
     # Set device
     if not torch.cuda.is_available():
@@ -1023,46 +1110,118 @@ def main():
     
     # Set defaults from config
     args.model = cfg.model
-    args.model_location = os.path.expanduser(cfg.model_location)
+    
+    # Set model_location based on mode if not provided
+    if not args.model_location:
+        if args.mode == "remote_sensing":
+            args.model_location = "./models/checkpoints_remote_sensing"
+        else:  # reverse
+            args.model_location = "./models/checkpoints"
+    
+    args.model_location = os.path.expanduser(args.model_location)
+    
+    print(f"\n📦 Configuration:")
+    print(f"   Mode: {args.mode}")
+    print(f"   Model: {args.model}")
+    print(f"   Model location: {args.model_location}")
+    print(f"   K-shot: {args.k_shot}")
+    if args.test_dataset:
+        print(f"   Test dataset: {args.test_dataset}")
     
     # Measure memory based on mode and method
     try:
         if args.all:
+            # Run all methods automatically
             results_list = run_all_methods(args, cfg, all_datasets)
             
-            # Save all results if requested
-            if args.save_json:
-                save_path = os.path.expanduser(args.save_json)
-                os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-                with open(save_path, 'w') as f:
-                    json.dump(results_list, f, indent=4)
-                print(f"\n✅ All results saved to: {save_path}")
+            # Summary is already printed in run_all_methods
+            print(f"\n✅ All results saved to: results/gpu_memory/")
+        
+        elif args.method == "baseline" and not args.baseline_method:
+            # Run all baseline methods if baseline_method not specified
+            print("\n" + "="*100)
+            print(f"🚀 Running ALL Baseline methods for mode={args.mode}, model={args.model}, k={args.k_shot}")
+            if args.test_dataset:
+                print(f"   Test dataset: {args.test_dataset}")
+            print("="*100)
+            
+            results_list = []
+            baseline_methods = ["linear_probe", "tip", "lp++"]
+            
+            for baseline_method in baseline_methods:
+                try:
+                    print("\n" + "🔹"*50)
+                    print(f"Running Baseline: {baseline_method}...")
+                    print("🔹"*50)
+                    
+                    args.baseline_method = baseline_method
+                    
+                    if args.mode == "remote_sensing":
+                        result = measure_baseline_remote_sensing(args, cfg, all_datasets)
+                    else:
+                        result = measure_baseline_reverse(args, cfg, all_datasets)
+                    results_list.append(result)
+                    
+                    # Save individual result
+                    save_path = generate_save_path(args, "baseline", baseline_method)
+                    with open(save_path, 'w') as f:
+                        json.dump(result, f, indent=4)
+                    print(f"✅ Saved to: {save_path}")
+                    
+                except Exception as e:
+                    print(f"❌ Baseline {baseline_method} failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Print summary
+            print("\n" + "="*100)
+            print("📊 SUMMARY: Baseline Methods GPU Memory Usage")
+            print("="*100)
+            print(f"{'Method':<25} {'GPU Memory (MB)':<20} {'Trainable Params':<20}")
+            print("-"*100)
+            
+            for result in results_list:
+                method_name = f"baseline_{result.get('baseline_method', 'unknown')}"
+                gpu_mem = result.get('total_gpu_mb', 0)
+                trainable = result.get('trainable_params', 0)
+                print(f"{method_name:<25} {gpu_mem:<20.2f} {trainable:<20,}")
+            
+            print("="*100)
+            print(f"\n✅ All baseline results saved to: results/gpu_memory/")
         
         else:
             # Single method
             if args.mode == "remote_sensing":
                 if args.method == "atlas":
                     results = measure_atlas_remote_sensing(args, cfg, all_datasets)
+                    save_path = generate_save_path(args, "atlas")
                 elif args.method == "energy":
                     results = measure_energy_remote_sensing(args, cfg, all_datasets)
+                    save_path = generate_save_path(args, "energy")
                 elif args.method == "baseline":
                     results = measure_baseline_remote_sensing(args, cfg, all_datasets)
+                    save_path = generate_save_path(args, "baseline", args.baseline_method)
             
             elif args.mode == "reverse":
                 if args.method == "atlas":
                     results = measure_atlas_reverse(args, cfg, all_datasets)
+                    save_path = generate_save_path(args, "atlas")
                 elif args.method == "energy":
                     results = measure_energy_reverse(args, cfg, all_datasets)
+                    save_path = generate_save_path(args, "energy")
                 elif args.method == "baseline":
                     results = measure_baseline_reverse(args, cfg, all_datasets)
+                    save_path = generate_save_path(args, "baseline", args.baseline_method)
             
-            # Save single result if requested
+            # Save single result with adaptive path
             if args.save_json:
+                # Use custom path if provided
                 save_path = os.path.expanduser(args.save_json)
                 os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-                with open(save_path, 'w') as f:
-                    json.dump(results, f, indent=4)
-                print(f"\n✅ Results saved to: {save_path}")
+            
+            with open(save_path, 'w') as f:
+                json.dump(results, f, indent=4)
+            print(f"\n✅ Results saved to: {save_path}")
     
     except Exception as e:
         print(f"\n❌ Error: {e}")
