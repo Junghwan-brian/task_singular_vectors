@@ -22,3 +22,5 @@ models/*
 *.gz
 imagenet/*
 *.jpeg
+results/*
+test_outputs/*
