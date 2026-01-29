@@ -1146,7 +1146,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initialize_sigma",
         type=str,
-        choices=["sum", "tsvm", "average", "alpha"],
+        choices=["sum", "tsvm", "average", "alpha", "ablation_topk", "ablation_alpha"],
         help="Initialization strategy for sigma basis"
     )
     parser.add_argument(

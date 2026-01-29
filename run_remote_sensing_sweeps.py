@@ -196,15 +196,16 @@ REMOTE_SENSING_DATASETS = {
     "WHU-RS19": 150,
 }
 
-GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
-ENERGY_MODELS = ["ViT-L-14", "ViT-B-16", "ViT-B-32"]
-ENERGY_INITIALIZE_SIGMA = ["average"]
+GPU_IDS = [0,1,2,3]  # Default GPU IDs, can be overridden via CLI
+ENERGY_MODELS = ["ViT-B-16", "ViT-B-32"]
+ENERGY_INITIALIZE_SIGMA = ["ablation_alpha"]
 ENERGY_ADAPTERS = ["none"]
 ENERGY_K = [1,2,4,8,16]
-ENERGY_SVD_KEEP_TOPK = [12]
-ENERGY_SIGMA_LR = [1e-2, 1e-3, 5e-3]
+ENERGY_SVD_KEEP_TOPK = [16]
+ENERGY_SIGMA_LR = [1e-3]
 ENERGY_SIGMA_WD = [0.0]
 ENERGY_WARMUP_RATIO = [0.1]
+ENERGY_SIGMA_ALPHA = [1, 3, 5, 7, 10]  # None means grid search, or specify fixed values like [1, 5, 10]
 
 ATLAS_MODELS = ["ViT-L-14", "ViT-B-16", "ViT-B-32"]
 ATLAS_ADAPTERS = ["none", "lp++", "tip"]
@@ -212,7 +213,7 @@ ATLAS_K = [1,2,4,8,16]
 
 # Baseline configurations
 BASELINE_MODELS = ["ViT-L-14", "ViT-B-16", "ViT-B-32"]
-BASELINE_METHODS = ["lp++", "zeroshot"]
+BASELINE_METHODS = ["lora"]
 BASELINE_K = [1,2,4,8,16]
 BASELINE_LP_LR = [1e-3, 1e-4]
 BASELINE_LP_EPOCHS = [20]
@@ -228,7 +229,7 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
     """Build Energy grid search commands."""
     commands: List[List[str]] = []
     
-    for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio in itertools.product(
+    for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio, sigma_alpha in itertools.product(
         ENERGY_MODELS,
         ENERGY_INITIALIZE_SIGMA,
         ENERGY_ADAPTERS,
@@ -238,6 +239,7 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
         ENERGY_SIGMA_LR,
         ENERGY_SIGMA_WD,
         ENERGY_WARMUP_RATIO,
+        ENERGY_SIGMA_ALPHA,
     ):
         _, results_json = _expected_energy_paths(
             model=model,
@@ -278,6 +280,9 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             "--adapter",
             adapter,
         ]
+        # Add sigma_alpha only if specified (not None)
+        if sigma_alpha is not None:
+            cmd.extend(["--sigma_alpha", f"{sigma_alpha:.6g}"])
         commands.append(cmd)
     
     return commands
@@ -661,7 +666,7 @@ def main() -> None:
     parser.add_argument(
         "--per-gpu",
         type=int,
-        default=8,
+        default=4,
         help="Number of commands to run concurrently on each GPU",
     )
     args = parser.parse_args()
