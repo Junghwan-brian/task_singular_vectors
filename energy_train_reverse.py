@@ -1127,7 +1127,7 @@ if __name__ == "__main__":
         "--test_dataset",
         type=str,
         # required=True,
-        default="Country211",
+        default="CIFAR10",
         # choices=allowed_test_datasets,
         help="Held-out dataset to train on (sigma epochs auto-set by dataset size)",
     )
@@ -1141,7 +1141,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        # default="ViT-B-32"
+        default="ViT-B-32",
         type=str,
         help="Vision backbone (e.g., ViT-B-32, ViT-B-16)"
     )

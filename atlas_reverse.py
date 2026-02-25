@@ -21,8 +21,8 @@ from tqdm.auto import tqdm
 
 # Fix for H100 cuDNN compatibility issue
 # Disable problematic attention backends that cause "No execution plans support the graph" error
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
+# torch.backends.cuda.enable_flash_sdp(False)
+# torch.backends.cuda.enable_mem_efficient_sdp(False)
 # torch.backends.cuda.enable_cudnn_sdp(False)
 # # Additional cuDNN settings for H100 compatibility
 # torch.backends.cudnn.allow_tf32 = False
