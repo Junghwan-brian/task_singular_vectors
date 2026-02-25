@@ -12,7 +12,7 @@ import time
 import json
 import logging
 import argparse
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 import torch
 import torchvision
 from typing import Optional
@@ -246,6 +246,11 @@ def run_ufm_zeroshot(cfg) -> dict:
     
     test_ds = cfg.test_dataset
     
+    # Setup save_dir if not present (required by get_classification_head)
+    with open_dict(cfg):
+        if not hasattr(cfg, 'save_dir') or cfg.save_dir is None:
+            cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
+    
     # Load encoder and head
     image_encoder = ImageEncoder(cfg.model).cuda()
     classification_head = get_classification_head(cfg, test_ds).cuda()
@@ -338,6 +343,11 @@ def run_ufm_ln(cfg) -> dict:
     elif cfg.ln_epochs is None:
         cfg.ln_epochs = 1
         logger.info(f"Using default ln_epochs={cfg.ln_epochs}")
+    
+    # Setup save_dir if not present (required by get_classification_head)
+    with open_dict(cfg):
+        if not hasattr(cfg, 'save_dir') or cfg.save_dir is None:
+            cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
     
     # Load encoder and head
     image_encoder = ImageEncoder(cfg.model).cuda()
@@ -671,6 +681,14 @@ if __name__ == "__main__":
     
     # Set device
     cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Expand paths and setup save_dir
+    cfg.data_location = os.path.expanduser(cfg.data_location)
+    cfg.model_location = os.path.expanduser(cfg.model_location)
+    
+    # Setup save_dir (required by get_classification_head)
+    if not hasattr(cfg, 'save_dir') or cfg.save_dir is None:
+        cfg.save_dir = os.path.join(cfg.model_location, cfg.model)
     
     OmegaConf.set_struct(cfg, True)
     

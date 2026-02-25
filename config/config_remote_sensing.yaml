@@ -28,6 +28,7 @@ num_tasks: 15
 sigma_epochs: null
 sigma_lr: 1.0e-03
 sigma_wd: 0.0
+sigma_alpha: null
 sigma_lr_step_size: 1
 sigma_lr_gamma: 1.0
 train_k: 0
@@ -38,8 +39,13 @@ adapter_wd: null
 config_tag: null
 epochs_per_task: 10
 port: 12355
-svd_keep_topk: 5
+svd_keep_topk: 12
 world_size: 1
 blockwise_coef: true
 seed: 1
 warmup_ratio: 0.1
+
+
+# Number of trainable sigma parameters: 36,792 --> 60
+# Number of trainable sigma parameters: 36,792 --> 54
+# Number of trainable sigma parameters: 16,464 --> 24

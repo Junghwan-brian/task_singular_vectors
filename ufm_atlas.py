@@ -28,7 +28,7 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from atlas_src.modeling import ImageEncoder, ImageClassifier
 from atlas_src.composition import WeightedImageEncoder
 from atlas_src.utils import TIPWrapper, LPPWrapper
@@ -478,7 +478,7 @@ def run_ufm_atlas(args):
     num_batches = len(train_loader)
     scheduler = cosine_lr(optimizer, args.lr, 0, args.epochs * num_batches)
     
-    scaler = GradScaler('cuda')
+    scaler = GradScaler()
     loss_fn = ssl_loss_trusted
     
     # Training loop

@@ -764,27 +764,38 @@ def run_energy(cfg: DictConfig) -> None:
             for name, tensor in model.image_encoder.state_dict().items()
         }
 
-        # Grid search로 sigma 초기 스케일 최적화 (train 데이터 기준)
-        try:
-            alpha_candidates = getattr(cfg, "sigma_alpha_candidates", [1, 3, 5, 7, 10])
-            max_eval_batches = int(getattr(cfg, "sigma_alpha_eval_batches", 0)) or None
-            logger.info(f"Running alpha grid search over {alpha_candidates} (max_batches={max_eval_batches})")
-            best_alpha, best_acc = grid_search_sigma_alpha(
-                sigma_modules=sigma_modules,
-                sigma_key_map=sigma_key_map,
-                base_params=base_params,
-                base_buffers=base_buffers,
-                model=model,
-                train_loader=train_loader,
-                device=cfg.device,
-                alphas=alpha_candidates,
-                max_batches=max_eval_batches,
-                apply_best=True,
-                logger=logger,
-            )
-            logger.info(f"Selected alpha={best_alpha} (train acc={best_acc*100:.2f}%) for sigma initialization.")
-        except Exception as e:
-            logger.warning(f"Alpha grid search failed: {e}. Proceeding without scaling.")
+        # Sigma 초기 스케일 설정: 고정 alpha 또는 grid search
+        fixed_alpha = getattr(cfg, "sigma_alpha", None)
+        if fixed_alpha is not None:
+            # 사용자가 지정한 고정 alpha 사용
+            logger.info(f"Using fixed sigma_alpha={fixed_alpha}")
+            with torch.no_grad():
+                for _, module in sigma_modules.items():
+                    if module.sigma.numel() > 0:
+                        module.sigma.data.mul_(float(fixed_alpha))
+            best_alpha = fixed_alpha
+        else:
+            # Grid search로 sigma 초기 스케일 최적화 (train 데이터 기준)
+            try:
+                alpha_candidates = getattr(cfg, "sigma_alpha_candidates", [1, 3, 5, 7, 10])
+                max_eval_batches = int(getattr(cfg, "sigma_alpha_eval_batches", 0)) or None
+                logger.info(f"Running alpha grid search over {alpha_candidates} (max_batches={max_eval_batches})")
+                best_alpha, best_acc = grid_search_sigma_alpha(
+                    sigma_modules=sigma_modules,
+                    sigma_key_map=sigma_key_map,
+                    base_params=base_params,
+                    base_buffers=base_buffers,
+                    model=model,
+                    train_loader=train_loader,
+                    device=cfg.device,
+                    alphas=alpha_candidates,
+                    max_batches=max_eval_batches,
+                    apply_best=True,
+                    logger=logger,
+                )
+                logger.info(f"Selected alpha={best_alpha} (train acc={best_acc*100:.2f}%) for sigma initialization.")
+            except Exception as e:
+                logger.warning(f"Alpha grid search failed: {e}. Proceeding without scaling.")
 
         # Load validation dataset for per-epoch evaluation with progress feedback
         logger.info(f"Loading validation dataset: {val_dataset_name}")
@@ -1135,8 +1146,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initialize_sigma",
         type=str,
-        choices=["sum", "tsvm", "average", "alpha"],
+        choices=["sum", "tsvm", "average", "alpha", "ablation_topk", "ablation_alpha"],
         help="Initialization strategy for sigma basis"
+    )
+    parser.add_argument(
+        "--sigma_alpha",
+        type=float,
+        default=None,
+        help="Fixed alpha scale for sigma initialization. If None, use grid search to find optimal alpha."
     )
     
     # Adapter options
