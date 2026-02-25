@@ -186,7 +186,7 @@ def _sanitize_value(val):
 def build_energy_config_tag(cfg) -> str:
     num_tasks_minus_one = _sanitize_value(len(cfg.DATASETS_ALL) - 1)
     lr_part = _sanitize_value(cfg.sigma_lr)
-    svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 2))
+    svd_part = _sanitize_value(getattr(cfg, "svd_keep_topk", 12))
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
     warmup_ratio_part = _sanitize_value(getattr(cfg, "warmup_ratio", 0.1))
     wd_part = _sanitize_value(getattr(cfg, "sigma_wd", 0.0))
@@ -282,7 +282,7 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config, sigma_reduce: str = 
     device = config.device
     datasets = list(config.DATASETS)
     num_tasks = int(len(datasets))
-    desired_k = max(1, int(getattr(config, "svd_keep_topk", 3)))
+    desired_k = max(1, int(getattr(config, "svd_keep_topk", 12)))
     sigma_reduce = str(sigma_reduce).lower()
     with torch.no_grad():
         new_vector = {}
@@ -414,7 +414,7 @@ def grid_search_sigma_alpha(
         (best_alpha, best_acc)
     """
     if alphas is None:
-        alphas = [1, 5, 10, 15, 20]
+        alphas = [1, 3, 5, 7, 10]
     if logger is None:
         logger = logging.getLogger(__name__)
     model.eval()
@@ -492,7 +492,7 @@ def run_energy(cfg: DictConfig) -> None:
             logger.info(f"✓ Auto-set sigma_epochs={cfg.sigma_epochs} for {test_ds}")
         
         if cfg.sigma_epochs is None:
-            cfg.sigma_epochs = 10
+            cfg.sigma_epochs = 20
         
         # Normalize adapter choice
         cfg.adapter = normalize_adapter_choice(cfg.adapter)
@@ -1088,7 +1088,7 @@ def run_energy(cfg: DictConfig) -> None:
             "sigma_epochs": cfg.sigma_epochs,
             "sigma_lr": cfg.sigma_lr,
             "sigma_wd": cfg.sigma_wd,
-            "svd_keep_topk": getattr(cfg, "svd_keep_topk", 2),
+            "svd_keep_topk": getattr(cfg, "svd_keep_topk", 12),
             "initialize_sigma": getattr(cfg, "initialize_sigma", None),
             "adapter_choice": cfg.adapter,
             "training_time": min_epoch_time,
