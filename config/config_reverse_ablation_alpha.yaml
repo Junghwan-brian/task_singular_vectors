@@ -37,7 +37,7 @@ num_grad_accumulation: 1
 adapter: none
 adapter_lr: null
 adapter_wd: null
-config_tag: null
+config_tag: ablation_alpha
 epochs_per_task: 10
 port: 12355
 svd_keep_topk: 12
@@ -45,5 +45,5 @@ world_size: 1
 blockwise_coef: true
 seed: 1
 warmup_ratio: 0.1
-
-
+sigma_alpha_candidates: [1, 5, 10, 15]
+sigma_alpha_eval_batches: 0

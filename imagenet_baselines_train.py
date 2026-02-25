@@ -166,6 +166,20 @@ class ReturnFeaturesClassifier(torch.nn.Module):
         return self.forward(inputs, **kwargs)
 
 
+def get_ood_dataloader(dataset_name: str, preprocess, cfg):
+    """Create OOD dataloader for evaluation"""
+    from src.datasets.registry import get_dataset
+    from src.datasets.common import get_dataloader
+    
+    dataset = get_dataset(
+        dataset_name,
+        preprocess,
+        location=cfg.data_location,
+        batch_size=cfg.batch_size,
+    )
+    return get_dataloader(dataset, is_train=False, args=cfg, image_encoder=None)
+
+
 def evaluate_adapter_model(adapter_model: torch.nn.Module, dataloader, device) -> dict:
     """Evaluate adapter model on a dataloader"""
     adapter_model.eval()
@@ -254,7 +268,7 @@ def train_linear_probe(model, train_loader, val_loader, cfg, logger):
     
     logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
     
-    # OOD evaluations
+    # OOD evaluations - use fine-tuned classification head
     ood_results = {}
     ood_list = ["ImageNetA", "ImageNetR", "ImageNetSketch", "ImageNetV2MFVal"]
     logger.info("\n" + "=" * 100)
@@ -264,8 +278,14 @@ def train_linear_probe(model, train_loader, val_loader, cfg, logger):
     model.eval()
     with torch.no_grad():
         for ood_name in ood_list:
-            m = eval_single_dataset(model.image_encoder, ood_name, cfg)
-            ood_results[ood_name] = float(m.get("top1", 0.0))
+            ood_loader = get_ood_dataloader(ood_name, model.image_encoder.val_preprocess, cfg)
+            
+            # Use evaluate_encoder_with_dataloader to ensure trained head is used
+            ood_metrics = evaluate_encoder_with_dataloader(
+                model.image_encoder, model.classification_head, ood_loader, cfg.device
+            )
+            ood_acc = ood_metrics['top1']
+            ood_results[ood_name] = float(ood_acc)
             logger.info(f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
     
     # Compose unified evaluation results
@@ -322,13 +342,16 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, logger, adapter: str)
         shots = int(cfg.train_k) if int(cfg.train_k) > 0 else 0
         logger.info(f"[adapter:lp++] Initializing LP++ with shots={shots}")
         adapter_model = LPPWrapper(adapter_model, features_cache, labels, shots)
-        epochs = 300
+        # Reduce epochs to prevent overfitting on few-shot data
+        epochs = 50 if shots <= 4 else 100 if shots <= 8 else 200
         adapter_model = adapter_model.to(cfg.device)
         
-        lr_temp = float(getattr(adapter_model, 'lr_temp', 1e-1))
-        lr_alpha = float(getattr(adapter_model, 'lr_alpha', 1e-3))
+        # Use much smaller learning rates to prevent instability
+        lr_temp = float(getattr(adapter_model, 'lr_temp', 1e-1)) * 0.01  # 100x smaller
+        lr_alpha = float(getattr(adapter_model, 'lr_alpha', 1e-3)) * 0.1  # 10x smaller
         
-        logger.info(f"[adapter:lp++] Using data-driven learning rates: lr_temp={lr_temp:.6f}, lr_alpha={lr_alpha:.6f}")
+        logger.info(f"[adapter:lp++] Using stabilized learning rates: lr_temp={lr_temp:.6f}, lr_alpha={lr_alpha:.6f}, epochs={epochs}")
+        logger.warning(f"[adapter:lp++] Original LP++ may not work well on ImageNet few-shot. Consider using TIP or Linear Probe instead.")
         
         param_groups = [
             {'params': adapter_model.adapter.parameters(), 'lr': lr_temp},
@@ -416,7 +439,7 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, logger, adapter: str)
     
     logger.info(f"Adapter '{adapter}' Acc: {final_acc*100:.2f}%")
     
-    # OOD evaluations - need to wrap for compatibility
+    # OOD evaluations - use the adapted model (encoder + adapter)
     ood_results = {}
     ood_list = ["ImageNetA", "ImageNetR", "ImageNetSketch", "ImageNetV2MFVal"]
     logger.info("\n" + "=" * 100)
@@ -425,10 +448,13 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, logger, adapter: str)
     
     adapter_model.eval()
     with torch.no_grad():
-        # For OOD evaluation, use the base encoder (adapter doesn't help on different distributions)
         for ood_name in ood_list:
-            m = eval_single_dataset(model.image_encoder, ood_name, cfg)
-            ood_results[ood_name] = float(m.get("top1", 0.0))
+            ood_loader = get_ood_dataloader(ood_name, model.image_encoder.val_preprocess, cfg)
+            
+            # Evaluate using the trained adapter model
+            ood_metrics = evaluate_adapter_model(adapter_model, ood_loader, cfg.device)
+            ood_acc = ood_metrics['top1']
+            ood_results[ood_name] = float(ood_acc)
             logger.info(f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
     
     # Compose unified evaluation results
@@ -557,7 +583,7 @@ def train_lora(model, train_loader, val_loader, cfg, logger):
     
     logger.info(f"LoRA validation accuracy: {final_acc*100:.2f}%")
     
-    # OOD evaluations
+    # OOD evaluations - use LoRA-adapted encoder
     ood_results = {}
     ood_list = ["ImageNetA", "ImageNetR", "ImageNetSketch", "ImageNetV2MFVal"]
     logger.info("\n" + "=" * 100)
@@ -567,8 +593,11 @@ def train_lora(model, train_loader, val_loader, cfg, logger):
     model.eval()
     with torch.no_grad():
         for ood_name in ood_list:
-            m = eval_single_dataset(model.image_encoder, ood_name, cfg)
-            ood_results[ood_name] = float(m.get("top1", 0.0))
+            ood_loader = get_ood_dataloader(ood_name, model.image_encoder.val_preprocess, cfg)
+            ood_metrics = evaluate_encoder_with_dataloader(
+                model.image_encoder, model.classification_head, ood_loader, cfg.device
+            )
+            ood_results[ood_name] = float(ood_metrics['top1'])
             logger.info(f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
     
     # Compose unified evaluation results
@@ -762,6 +791,22 @@ def run_imagenet_baseline(cfg) -> None:
     os.makedirs(config_dir, exist_ok=True)
     save_dir = os.path.join(config_dir, shot_folder)
     os.makedirs(save_dir, exist_ok=True)
+    
+    results_path = os.path.join(save_dir, f"baseline_results_imagenet.json")
+    
+    # Check if eval_only mode
+    if getattr(cfg, 'eval_only', False):
+        logger.info("=" * 80)
+        logger.info("EVAL ONLY MODE")
+        logger.info("=" * 80)
+        logger.warning("Baseline methods don't save model checkpoints.")
+        logger.warning("Skipping re-evaluation. Results JSON already exists or needs retraining.")
+        logger.info(f"Results path: {results_path}")
+        if os.path.exists(results_path):
+            logger.info("✓ Results file exists. No action needed.")
+        else:
+            logger.warning("✗ Results file not found. Please retrain without --eval_only flag.")
+        return
 
     # Train baseline
     logger.info(f"\nTraining baseline '{cfg.baseline_method}' on ImageNet")
@@ -777,7 +822,6 @@ def run_imagenet_baseline(cfg) -> None:
         raise NotImplementedError(f"Unknown baseline method: {cfg.baseline_method}")
 
     # Save results JSON
-    results_path = os.path.join(save_dir, f"baseline_results_imagenet.json")
     results.update({
         "target_dataset": test_ds,
         "k_shot": k,
@@ -845,6 +889,8 @@ def main():
                         default="./models/checkpoints", help="Where checkpoints/heads are stored")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--gpu", type=int, help="GPU id (overrides --device as cuda:{id})")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Only evaluate existing results without training")
 
     args = parser.parse_args()
 

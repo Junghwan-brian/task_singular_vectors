@@ -176,39 +176,34 @@ def _expected_atlas_paths(
     return atlas_pt, results_json
 
 DATASETS_ALL = {
-    # "Cars": 20,
     "DTD": 20,
-    # "EuroSAT": 20,
     "GTSRB": 20,
     "MNIST": 20,
-    # "RESISC45": 20,
-    # "SUN397": 20,
     "SVHN": 20,
     "CIFAR10": 20,
     "CIFAR100": 20,
     "STL10": 20,
     "Food101":20,
     "Flowers102": 20,
-    # "FER2013": 20,
     "PCAM":20,
     "OxfordIIITPet": 20,
     "RenderedSST2": 20,
     "EMNIST":20,
     "FashionMNIST":20,
-    # "KMNIST":20,
     "FGVCAircraft": 20,
     "CUB200": 20,
     "Country211": 20,
 }
 
 
-GPU_IDS = [0,1]  # Default GPU IDs, can be overridden via CLI
-ENERGY_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
+GPU_IDS = [0,1,2,3]  # Default GPU IDs, can be overridden via CLI
+# ENERGY_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
+ENERGY_MODELS = ["ViT-B-32"]
 ENERGY_INITIALIZE_SIGMA = ["average"]
 ENERGY_ADAPTERS = ["none"]
-ENERGY_K = [1,2,4,8,16]
-ENERGY_SVD_KEEP_TOPK = [14, 16]
-ENERGY_SIGMA_LR = [1e-3, 5e-3]
+ENERGY_K = [4] #K-shot samples per class (0=fullshot)
+ENERGY_SVD_KEEP_TOPK = [12, 15, 17, 19, 21, 23, 25, 27] #Number of singular vectors to keep per task
+ENERGY_SIGMA_LR = [1e-3]
 ENERGY_SIGMA_WD = [0.0]
 ENERGY_WARMUP_RATIO = [0.1]
 
@@ -219,11 +214,11 @@ ATLAS_K = [16]
 # Baseline configurations
 BASELINE_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
 BASELINE_METHODS = ["lp++"]
-BASELINE_K = [1,2,4,8,16]
+BASELINE_K = [1,2]
 BASELINE_LP_LR = [1e-3]
 BASELINE_LP_EPOCHS = [20]
 BASELINE_LP_WD = [0.0]
-BASELINE_ADAPTER_WD = [0.0, 0.1, 0.01]
+BASELINE_ADAPTER_WD = [0.0]
 BASELINE_LORA_R = [8]
 BASELINE_LORA_ALPHA = [16.0]
 BASELINE_LORA_LR = [1e-4]
@@ -642,7 +637,7 @@ def main() -> None:
     parser.add_argument(
         "--per-gpu",
         type=int,
-        default=8,
+        default=4,
         help="Number of commands to run concurrently on each GPU",
     )
     args = parser.parse_args()
@@ -653,15 +648,15 @@ def main() -> None:
     commands: List[List[str]] = []
     if not args.skip_energy:
         commands.extend(build_energy_commands(datasets))
-    if not args.skip_atlas:
-        commands.extend(build_atlas_commands(datasets))
-    if not args.skip_baselines:
-        commands.extend(build_baseline_commands(datasets))
-    if not args.skip_energy_adapters:
-        energy_adapter_cmds = build_energy_adapter_commands(datasets, args.best_config_file)
-        if energy_adapter_cmds:
-            commands.extend(energy_adapter_cmds)
-            print(f"Added {len(energy_adapter_cmds)} Energy+Adapter commands")
+    # if not args.skip_atlas:
+    #     commands.extend(build_atlas_commands(datasets))
+    # if not args.skip_baselines:
+    #     commands.extend(build_baseline_commands(datasets))
+    # if not args.skip_energy_adapters:
+    #     energy_adapter_cmds = build_energy_adapter_commands(datasets, args.best_config_file)
+    #     if energy_adapter_cmds:
+    #         commands.extend(energy_adapter_cmds)
+    #         print(f"Added {len(energy_adapter_cmds)} Energy+Adapter commands")
 
     if not commands:
         print("Nothing to run (all sweeps skipped).", file=sys.stderr)

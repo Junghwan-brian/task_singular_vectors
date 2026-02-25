@@ -1,5 +1,6 @@
 import os
 import torch
+import torchvision
 import torchvision.datasets as datasets
 
 
@@ -11,6 +12,13 @@ class MNIST:
         batch_size=128,
         num_workers=6,
     ):
+        # CLIP/OpenCLIP preprocess expects 3-channel images; MNIST is grayscale.
+        preprocess = torchvision.transforms.Compose(
+            [
+                torchvision.transforms.Lambda(lambda img: img.convert("RGB")),
+                preprocess,
+            ]
+        )
         self.train_dataset = datasets.MNIST(
             root=location, download=True, train=True, transform=preprocess
         )

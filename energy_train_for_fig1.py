@@ -238,20 +238,26 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for sigma training (general datasets)
 SIGMA_EPOCHS_PER_DATASET = {
+    # "Cars": 20,
     "DTD": 20,
+    # "EuroSAT": 20,
     "GTSRB": 20,
     "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
     "SVHN": 20,
     "CIFAR10": 20,
     "CIFAR100": 20,
     "STL10": 20,
     "Food101":20,
     "Flowers102": 20,
+    # "FER2013": 20,
     "PCAM":20,
     "OxfordIIITPet": 20,
     "RenderedSST2": 20,
     "EMNIST":20,
     "FashionMNIST":20,
+    # "KMNIST":20,
     "FGVCAircraft": 20,
     "CUB200": 20,
     "Country211": 20,
@@ -373,13 +379,6 @@ def compute_and_sum_svd_mem_reduction(task_vectors, config, sigma_reduce: str = 
             # 이후 단계에서 SigmaParametrization(U, V, sigma)로 사용
             new_vector[key] = [U_orth, Sigma, V_orth]
     return new_vector
-
-# 하위 호환(기존 호출이 있을 수 있으므로), 내부적으로 통합 함수 호출
-def compute_and_sum_svd_mem_reduction_average(task_vectors, config):
-    return compute_and_sum_svd_mem_reduction(task_vectors, config, sigma_reduce="mean")
-
-def compute_and_sum_svd_mem_reduction_sum(task_vectors, config):
-    return compute_and_sum_svd_mem_reduction(task_vectors, config, sigma_reduce="sum")
 
 def grid_search_sigma_alpha(
     sigma_modules: torch.nn.ModuleDict,
@@ -832,6 +831,7 @@ def run_energy(cfg: DictConfig) -> None:
         loss_history = []
         val_history = []
         eval_counter = 0
+        val_acc_history = []
 
         def record_validation(stage: str, epoch_value, accuracy_value):
             """Record evaluation metadata for result serialization."""
@@ -853,37 +853,38 @@ def run_energy(cfg: DictConfig) -> None:
         )
         os.makedirs(visualization_dir, exist_ok=True)
 
-        # # Log zeroshot accuracy before any sigma updates
-        # model.eval()
-        # with torch.no_grad():
-        #     pretrained_metrics = evaluate_encoder_with_dataloader(
-        #         pretrained_encoder, classification_head, val_loader, cfg.device
-        #     )
-        #     pretrained_acc = pretrained_metrics['top1']
-        #     logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
-        #     record_validation("pretrained", -2, pretrained_acc)
-
-        #     eval_params = {}
-        #     for name, p in base_params.items():
-        #         eval_params[name] = p.clone()
-        #     for safe_key, module in sigma_modules.items():
-        #         orig_key = sigma_key_map.get(safe_key, safe_key)
-        #         if orig_key in eval_params and module.sigma.numel() > 0:
-        #             delta = module().to(eval_params[orig_key].device)
-        #             if eval_params[orig_key].shape == delta.shape:
-        #                 eval_params[orig_key] = eval_params[orig_key] + delta
-
-        #     model.image_encoder.load_state_dict(eval_params, strict=False)
-        #     zeroshot_metrics = evaluate_encoder_with_dataloader(
-        #         model.image_encoder, classification_head, val_loader, cfg.device
-        #     )
-        #     zeroshot_acc = zeroshot_metrics['top1']
-        #     logger.info(f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
-        #     record_validation("zeroshot", -1, zeroshot_acc)
-        #     model.image_encoder.load_state_dict(base_state_dict, strict=False)
+        # Log zeroshot accuracy before any sigma updates
+        logger.info("\n" + "=" * 100)
+        logger.info("Evaluating zero-shot CLIP performance before training...")
+        logger.info("=" * 100 + "\n")
         
-        pretrained_acc = 0.0  # Placeholder when evaluation is disabled
-        zeroshot_acc = 0.0  # Placeholder when evaluation is disabled
+        model.eval()
+        with torch.no_grad():
+            pretrained_metrics = evaluate_encoder_with_dataloader(
+                pretrained_encoder, classification_head, val_loader, cfg.device
+            )
+            pretrained_acc = pretrained_metrics['top1']
+            logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
+            record_validation("pretrained", -2, pretrained_acc)
+
+            eval_params = {}
+            for name, p in base_params.items():
+                eval_params[name] = p.clone()
+            for safe_key, module in sigma_modules.items():
+                orig_key = sigma_key_map.get(safe_key, safe_key)
+                if orig_key in eval_params and module.sigma.numel() > 0:
+                    delta = module().to(eval_params[orig_key].device)
+                    if eval_params[orig_key].shape == delta.shape:
+                        eval_params[orig_key] = eval_params[orig_key] + delta
+
+            model.image_encoder.load_state_dict(eval_params, strict=False)
+            zeroshot_metrics = evaluate_encoder_with_dataloader(
+                model.image_encoder, classification_head, val_loader, cfg.device
+            )
+            zeroshot_acc = zeroshot_metrics['top1']
+            logger.info(f"Zero-shot (with merged task vectors) validation accuracy: {zeroshot_acc * 100:.2f}%")
+            record_validation("zeroshot", -1, zeroshot_acc)
+            model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
         sigma_records = []
         records = visualize_sigma_matrices(
@@ -970,43 +971,54 @@ def run_energy(cfg: DictConfig) -> None:
             epoch_train_time = time.time() - epoch_start
             epoch_times.append(epoch_train_time)
 
-            # if epoch in eval_epochs:
-            #     model.eval()
-            #     with torch.no_grad():
-            #         eval_params = {}
-            #         for name, p in base_params.items():
-            #             eval_params[name] = p.clone()
-            #         for safe_key, module in sigma_modules.items():
-            #             orig_key = sigma_key_map.get(safe_key, safe_key)
-            #             if orig_key in eval_params and module.sigma.numel() > 0:
-            #                 delta = module().to(eval_params[orig_key].device)
-            #                 if eval_params[orig_key].shape == delta.shape:
-            #                     eval_params[orig_key] = eval_params[orig_key] + delta
+            # 매 epoch 종료 시 검증 수행 및 저장
+            model.eval()
+            with torch.no_grad():
+                eval_params = {}
+                for name, p in base_params.items():
+                    eval_params[name] = p.clone()
+                for safe_key, module in sigma_modules.items():
+                    orig_key = sigma_key_map.get(safe_key, safe_key)
+                    if orig_key in eval_params and module.sigma.numel() > 0:
+                        delta = module().to(eval_params[orig_key].device)
+                        if eval_params[orig_key].shape == delta.shape:
+                            eval_params[orig_key] = eval_params[orig_key] + delta
 
-            #         model.image_encoder.load_state_dict(eval_params, strict=False)
+                model.image_encoder.load_state_dict(eval_params, strict=False)
 
-            #         val_metrics = evaluate_encoder_with_dataloader(
-            #             model.image_encoder, classification_head, val_loader, cfg.device
-            #         )
-            #         val_acc = val_metrics['top1']
+                val_metrics = evaluate_encoder_with_dataloader(
+                    model.image_encoder, classification_head, val_loader, cfg.device
+                )
+                val_acc = float(val_metrics['top1'])
 
-            #         logger.info(f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
-            #         record_validation("epoch", epoch, val_acc)
+                logger.info(f"[sigma] epoch {epoch + 1}/{int(cfg.sigma_epochs)} validation accuracy: {val_acc * 100:.2f}%")
+                record_validation("epoch", epoch, val_acc)
+                val_acc_history.append(val_acc)
 
-            #         model.image_encoder.load_state_dict(base_state_dict, strict=False)
+                # 검증 후 encoder를 원상 복구
+                model.image_encoder.load_state_dict(base_state_dict, strict=False)
 
-            #     records = visualize_sigma_matrices(
-            #         sigma_modules,
-            #         sigma_key_map,
-            #         epoch=epoch,
-            #         save_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.png"),
-            #         title=f"{test_ds} ({shot_folder})",
-            #         json_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.json"),
-            #     )
-            #     if records:
-            #         sigma_records.extend(records)
-            #     model.train()
-            pass  # Evaluation disabled during training
+            # 에폭별 acc 히스토리를 즉시 저장(중간 중단 대비)
+            try:
+                acc_history_path = os.path.join(energy_save_dir, "val_acc_history.json")
+                with open(acc_history_path, "w") as f:
+                    json.dump(
+                        {
+                            "target_dataset": test_ds,
+                            "model": cfg.model,
+                            "k_shot": k,
+                            "sigma_epochs": int(cfg.sigma_epochs),
+                            "config_tag": cfg.config_tag,
+                            "adapter_choice": cfg.adapter,
+                            "val_acc_history": val_acc_history,
+                        },
+                        f,
+                        indent=2,
+                    )
+                logger.info(f"✓ Saved epoch-{epoch} val_acc_history to {acc_history_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save val_acc_history: {e}")
+            model.train()
 
         # Finalize weights and save: materialize the final deltas onto base params
         with torch.no_grad():
@@ -1078,8 +1090,11 @@ def run_energy(cfg: DictConfig) -> None:
             if adapter_summary:
                 adapter_result_tag = adapter_path_tag(adapter_summary["adapter_type"])
 
-        # Save results to JSON
-        results_path = os.path.join(energy_save_dir, f"energy_results_{adapter_result_tag}.json")
+        # Save results to JSON (in centralized location for easy comparison)
+        save_result_dir = getattr(cfg, "save_result_dir", "energy/results")
+        os.makedirs(save_result_dir, exist_ok=True)
+        results_path = os.path.join(save_result_dir, f"{test_ds}.json")
+        
         results = {
             "target_dataset": test_ds,
             "final_accuracy": float(final_acc),
@@ -1099,9 +1114,10 @@ def run_energy(cfg: DictConfig) -> None:
             "gpu_peak_mem_mb": gpu_peak_mem_mb,
             "loss_history": loss_history,
             "validation_history": val_history,
+            "val_acc_history": val_acc_history,
             "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
-            # "pretrained_accuracy": float(pretrained_acc),  # Disabled
-            # "zeroshot_accuracy": float(zeroshot_acc),  # Disabled
+            "pretrained_accuracy": float(pretrained_acc),
+            "zeroshot_accuracy": float(zeroshot_acc),
             "config_tag": cfg.config_tag,
             "adapter_results": adapter_summary,
         }
@@ -1141,7 +1157,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        # default="ViT-B-32"
         type=str,
         help="Vision backbone (e.g., ViT-B-32, ViT-B-16)"
     )
@@ -1155,7 +1170,6 @@ if __name__ == "__main__":
         "--k",
         type=int,
         dest="train_k",
-        default=4,
         help="K-shot samples per class (0=fullshot)"
     )
     parser.add_argument("--warmup_ratio", type=float, help="Warmup ratio for sigma learning rate")
@@ -1163,7 +1177,6 @@ if __name__ == "__main__":
     # SVD and initialization
     parser.add_argument(
         "--svd_keep_topk",
-        default=12,
         type=int,
         help="Number of singular vectors to keep per task"
     )
@@ -1193,6 +1206,12 @@ if __name__ == "__main__":
     # Other
     parser.add_argument("--config_tag", type=str, help="Custom tag for output directory")
     parser.add_argument("--seed", type=int, default=1, help="Random seed for k-shot sampling")
+    parser.add_argument(
+        "--save_result_dir",
+        type=str,
+        default="energy/results",
+        help="Directory to save result JSONs for comparison with MAML",
+    )
     
     args = parser.parse_args()
     

@@ -1,22 +1,14 @@
 DATASETS: ''
 DATASETS_ALL:
-- DTD
-- GTSRB
-- MNIST
-- SVHN
-- STL10
-- OxfordIIITPet
-- Flowers102
-- CIFAR100
-- PCAM
-- CIFAR10
-- Food101
-- FashionMNIST
-- RenderedSST2
-- EMNIST
-- FGVCAircraft
-- CUB200
-- Country211
+  - MNIST
+  - EMNIST
+  - FashionMNIST
+  - SVHN
+  - DTD
+  - PCAM
+  - GTSRB
+  - RenderedSST2
+  - FGVCAircraft
 DATASETS_VAL: ''
 batch_size: 32
 cache_dir: null
@@ -26,7 +18,7 @@ initialize_sigma: average
 model: ViT-B-32
 model_location: ./models/checkpoints
 n_eval_points: 31
-num_tasks: 17
+num_tasks: 8
 sigma_epochs: null
 sigma_lr: 1.0e-03
 sigma_wd: 0.0
@@ -37,7 +29,7 @@ num_grad_accumulation: 1
 adapter: none
 adapter_lr: null
 adapter_wd: null
-config_tag: null
+config_tag: src_dissimilar_to_aircraft
 epochs_per_task: 10
 port: 12355
 svd_keep_topk: 12
@@ -45,5 +37,4 @@ world_size: 1
 blockwise_coef: true
 seed: 1
 warmup_ratio: 0.1
-
 

@@ -356,7 +356,7 @@ def train_tip_or_lpp(model, train_loader, val_loader, cfg, train_dataset_name, l
         logger.info(f"[adapter:lp++] Initializing LP++ with shots={shots}")
         adapter_model = LPPWrapper(
             adapter_model, features_cache, labels, shots)
-        epochs = 20
+        epochs = 300
         adapter_model = adapter_model.to(cfg.device)
         
         # LP++ requires training both adapter (classifier) and alpha_vec with different learning rates

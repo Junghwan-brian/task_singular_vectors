@@ -24,6 +24,9 @@ from src.utils.variables_and_paths import (
 )
 from src.datasets.remote_sensing import sample_k_shot_indices
 from src.datasets.imagenet_ood import ImageNetILSVRCVal
+from src.datasets.registry import get_dataset
+from src.datasets.common import get_dataloader
+from src.eval.eval_remote_sensing_comparison import evaluate_encoder_with_dataloader
 from src.utils.utils import cosine_lr
 
 
@@ -118,6 +121,17 @@ def setup_logger(name: str = __name__) -> logging.Logger:
     logger.addHandler(h)
     logger.propagate = False
     return logger
+
+
+def get_ood_dataloader(dataset_name: str, preprocess, cfg):
+    """Create OOD dataloader for evaluation"""
+    dataset = get_dataset(
+        dataset_name,
+        preprocess,
+        location=cfg.data_location,
+        batch_size=cfg.batch_size,
+    )
+    return get_dataloader(dataset, is_train=False, args=cfg, image_encoder=None)
 
 
 def _sanitize_value(val):
@@ -457,6 +471,91 @@ def run_imagenet_energy(cfg) -> None:
     os.makedirs(config_dir, exist_ok=True)
     energy_save_dir = os.path.join(config_dir, shot_folder)
     os.makedirs(energy_save_dir, exist_ok=True)
+    
+    energy_path = os.path.join(energy_save_dir, "energy.pt")
+    
+    # Define evaluation helper function
+    def _eval_on_loader(image_encoder_mod, loader) -> float:
+        image_encoder_mod.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch in loader:
+                batch = maybe_dictionarize(batch)
+                x = batch["images"].to(device, non_blocking=True)
+                y = batch["labels"].to(device, non_blocking=True)
+                feats = image_encoder_mod(x)
+                logits = model.classification_head(feats)
+                pred = logits.argmax(dim=1)
+                correct += int((pred == y).sum().item())
+                total += int(y.size(0))
+        if total == 0:
+            raise RuntimeError("Validation loader is empty.")
+        return float(correct / total)
+    
+    # Check if eval_only mode
+    if getattr(cfg, 'eval_only', False):
+        logger.info("=" * 80)
+        logger.info("EVAL ONLY MODE: Loading existing model for evaluation")
+        logger.info("=" * 80)
+        
+        if not os.path.exists(energy_path):
+            logger.error(f"Energy model not found: {energy_path}")
+            logger.error("Cannot run eval_only mode without trained model!")
+            return
+        
+        logger.info(f"Loading energy model from: {energy_path}")
+        model.image_encoder = ImageEncoder.load(cfg.model, energy_path).to(device)
+        logger.info("✓ Model loaded successfully")
+        
+        # Skip to evaluation
+        model.eval()
+        with torch.no_grad():
+            final_acc = _eval_on_loader(model.image_encoder, val_full_loader)
+        logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
+        
+        # OOD evaluations
+        ood_results = {}
+        ood_list = ["ImageNetA", "ImageNetR", "ImageNetSketch", "ImageNetV2MFVal"]
+        logger.info("\n" + "=" * 100)
+        logger.info("Evaluating on OOD datasets...")
+        logger.info("=" * 100 + "\n")
+        model.eval()
+        with torch.no_grad():
+            for ood_name in ood_list:
+                ood_loader = get_ood_dataloader(ood_name, model.image_encoder.val_preprocess, cfg)
+                ood_metrics = evaluate_encoder_with_dataloader(
+                    model.image_encoder, model.classification_head, ood_loader, cfg.device
+                )
+                ood_results[ood_name] = float(ood_metrics['top1'])
+                logger.info(f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
+        
+        # Compose unified evaluation results
+        all_eval_accuracies = {val_dataset_name: float(final_acc)}
+        for k_name, v_acc in ood_results.items():
+            all_eval_accuracies[k_name] = float(v_acc)
+        
+        # Save updated results
+        results_path = os.path.join(energy_save_dir, f"energy_results_imagenet.json")
+        if os.path.exists(results_path):
+            with open(results_path, 'r') as f:
+                results = json.load(f)
+        else:
+            results = {}
+        
+        results.update({
+            "final_accuracy": float(final_acc),
+            "ood_accuracies": ood_results,
+            "all_eval_accuracies": all_eval_accuracies,
+        })
+        
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=4)
+        logger.info(f"✓ Updated results saved to {results_path}")
+        logger.info("\n" + "=" * 100)
+        logger.info("EVAL ONLY MODE COMPLETE")
+        logger.info("=" * 100)
+        return
 
     # Optimizer
     params = [p for p in sigma_modules.parameters() if p.requires_grad]
@@ -491,24 +590,6 @@ def run_imagenet_energy(cfg) -> None:
         val_history.append(record)
         eval_counter += 1
         return record
-
-    def _eval_on_loader(image_encoder_mod, loader) -> float:
-        image_encoder_mod.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for batch in loader:
-                batch = maybe_dictionarize(batch)
-                x = batch["images"].to(device, non_blocking=True)
-                y = batch["labels"].to(device, non_blocking=True)
-                feats = image_encoder_mod(x)
-                logits = model.classification_head(feats)
-                pred = logits.argmax(dim=1)
-                correct += int((pred == y).sum().item())
-                total += int(y.size(0))
-        if total == 0:
-            raise RuntimeError("Validation loader is empty.")
-        return float(correct / total)
 
     # Pretrained/zeroshot evals
     model.eval()
@@ -667,7 +748,6 @@ def run_imagenet_energy(cfg) -> None:
         model.image_encoder.load_state_dict(materialized, strict=False)
 
     os.makedirs(energy_save_dir, exist_ok=True)
-    energy_path = os.path.join(energy_save_dir, "energy.pt")
     model.image_encoder.save(energy_path)
     logger.info(f"Saved energy-trained encoder to {energy_path}")
 
@@ -678,7 +758,7 @@ def run_imagenet_energy(cfg) -> None:
     logger.info(f"Final validation accuracy: {final_acc * 100:.2f}%")
     record_validation("final", int(cfg.sigma_epochs), final_acc)
 
-    # OOD evals + include ImageNet val in a single combined dict
+    # OOD evals + include ImageNet val in a single combined dict - use fine-tuned head
     ood_results = {}
     ood_list = ["ImageNetA", "ImageNetR", "ImageNetSketch", "ImageNetV2MFVal"]
     logger.info("\n" + "=" * 100)
@@ -687,8 +767,11 @@ def run_imagenet_energy(cfg) -> None:
     model.eval()
     with torch.no_grad():
         for ood_name in ood_list:
-            m = eval_single_dataset(model.image_encoder, ood_name, cfg)
-            ood_results[ood_name] = float(m.get("top1", 0.0))
+            ood_loader = get_ood_dataloader(ood_name, model.image_encoder.val_preprocess, cfg)
+            ood_metrics = evaluate_encoder_with_dataloader(
+                model.image_encoder, model.classification_head, ood_loader, cfg.device
+            )
+            ood_results[ood_name] = float(ood_metrics['top1'])
             logger.info(
                 f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
             record_validation(f"ood:{ood_name}", int(
@@ -792,6 +875,8 @@ def main():
                         help="How many basis tasks to use from ALL_DATASETS")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--gpu", type=int, help="GPU id (overrides --device as cuda:{id})")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Only evaluate existing model without training")
 
     args = parser.parse_args()
 

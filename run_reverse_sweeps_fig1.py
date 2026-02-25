@@ -69,19 +69,18 @@ def _datasets_all_from_config() -> Sequence[str]:
     return list(DATASETS_ALL.keys())
 
 
-def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int, sigma_wd: float, warmup_ratio: float, num_basis_tasks: int) -> str:
+def _energy_config_tag(init_mode: str, sigma_lr: float, topk: int, sigma_wd: float, warmup_ratio: float) -> str:
     datasets_all = _datasets_all_from_config()
     candidate_int = len(datasets_all)
     num_tasks_minus_one = max(candidate_int - 1, 0)
     init_value = (init_mode or "average").strip().lower()
-    return "energy_{}_{}_{}_{}_{}_{}_{}".format(
+    return "energy_{}_{}_{}_{}_{}_{}".format(
         _sanitize_value(num_tasks_minus_one),
         _sanitize_value(sigma_lr),
         _sanitize_value(topk),
         _sanitize_value(init_value),
         _sanitize_value(warmup_ratio),
         _sanitize_value(sigma_wd),
-        _sanitize_value(num_basis_tasks),
     )
 
 
@@ -100,17 +99,18 @@ def _expected_energy_paths(
     sigma_wd: float,
     k: int,
     warmup_ratio: float,
-    num_basis_tasks: int,
 ) -> tuple[str, str]:
-    # Use flat naming scheme in workspace-level ablation folder
+    sigma_lr = float(sigma_lr)
     topk = int(topk)
+    sigma_wd = float(sigma_wd)
     k = int(k)
-    num_basis_tasks = int(num_basis_tasks)
-    exp_id = f"{dataset}_{model}_k{k}_topk{topk}_basis{num_basis_tasks}"
-    ablation_dir = os.path.join(os.getcwd(), "ablation", "results")
-    results_json = os.path.join(ablation_dir, f"{exp_id}.json")
-    # energy.pt is not used in ablation study, but return a dummy path
-    energy_pt = results_json.replace(".json", ".pt")
+    warmup_ratio = float(warmup_ratio)
+    config_tag = _energy_config_tag(init_mode, sigma_lr, topk, sigma_wd, warmup_ratio)
+    adapter_tag = _adapter_tag(adapter)
+    dataset_dir = f"{dataset}Val"
+    base_dir = os.path.join(MODEL_ROOT, model, dataset_dir, config_tag, _shot_folder(k))
+    energy_pt = os.path.join(base_dir, "energy.pt")
+    results_json = os.path.join(base_dir, f"energy_results_{adapter_tag}.json")
     return energy_pt, results_json
 
 DATASETS_ALL = {
@@ -140,26 +140,21 @@ DATASETS_ALL = {
 }
 
 
-GPU_IDS = [0,1,2,3]  # Default GPU IDs, can be overridden via CLI
-ENERGY_MODELS = ["ViT-B-32"]
+GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs, can be overridden via CLI
+ENERGY_MODELS = ["ViT-B-16"]
 ENERGY_INITIALIZE_SIGMA = ["average"]
 ENERGY_ADAPTERS = ["none"]
-ENERGY_K = [4]
-# ENERGY_SVD_KEEP_TOPK = [3, 5, 7, 9, 12, 15]
-# ENERGY_SVD_KEEP_TOPK = [10, 12, 15, 17, 19, 21, 23, 25, 27] #Number of singular vectors to keep per task
-# ENERGY_SVD_KEEP_TOPK = [30, 32, 34, 36, 38, 40] #Number of singular vectors to keep per task
-ENERGY_SVD_KEEP_TOPK = [45, 50, 55, 60, 65, 70] #Number of singular vectors to keep per task
+ENERGY_K = [16]
+ENERGY_SVD_KEEP_TOPK = [12]
 ENERGY_SIGMA_LR = [1e-3]
 ENERGY_SIGMA_WD = [0.0]
 ENERGY_WARMUP_RATIO = [0.1]
-ENERGY_NUM_BASIS_TASKS = [17]  # 0 = use all tasks, >0 = random selection
-# ENERGY_NUM_BASIS_TASKS = [0]  # 0 = use all tasks, >0 = random selection
 
 def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
     """Build Energy grid search commands."""
     commands: List[List[str]] = []
     
-    for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio, num_basis_tasks in itertools.product(
+    for model, init_mode, adapter, dataset, k, topk, sigma_lr, sigma_wd, warmup_ratio in itertools.product(
         ENERGY_MODELS,
         ENERGY_INITIALIZE_SIGMA,
         ENERGY_ADAPTERS,
@@ -169,7 +164,6 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
         ENERGY_SIGMA_LR,
         ENERGY_SIGMA_WD,
         ENERGY_WARMUP_RATIO,
-        ENERGY_NUM_BASIS_TASKS,
     ):
         _, results_json = _expected_energy_paths(
             model=model,
@@ -181,17 +175,16 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             sigma_wd=sigma_wd,
             k=int(k),
             warmup_ratio=warmup_ratio,
-            num_basis_tasks=int(num_basis_tasks),
         )
-        if _path_exists(results_json):
-            print(
-                f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}, warmup={warmup_ratio}, num_basis={num_basis_tasks}) -> {results_json}",
-                flush=True,
-            )
-            continue
+        # if _path_exists(results_json):
+        #     print(
+        #         f"[skip] energy {model} {dataset} (init={init_mode}, adapter={adapter}, k={k}, wd={sigma_wd}, warmup={warmup_ratio}) -> {results_json}",
+        #         flush=True,
+        #     )
+        #     continue
         cmd = [
             sys.executable,
-            "energy_train_ablation.py",
+            "energy_train_for_fig1.py",
             "--model",
             model,
             "--initialize_sigma",
@@ -210,8 +203,6 @@ def build_energy_commands(datasets: Sequence[str]) -> List[List[str]]:
             f"{warmup_ratio:.6g}",
             "--adapter",
             adapter,
-            "--num_basis_tasks",
-            str(num_basis_tasks),
         ]
         commands.append(cmd)
     
@@ -287,8 +278,8 @@ def main() -> None:
     parser.add_argument(
         "--best_config_file",
         type=str,
-        default="./config/config_reverse.yaml",
-        help="Path to config file",
+        default="./results/best_energy_configs_per_dataset.json",
+        help="Path to best Energy configs JSON file for adapter training",
     )
     parser.add_argument(
         "--dry-run",
@@ -315,7 +306,7 @@ def main() -> None:
     parser.add_argument(
         "--per-gpu",
         type=int,
-        default=4,
+        default=1,
         help="Number of commands to run concurrently on each GPU",
     )
     args = parser.parse_args()

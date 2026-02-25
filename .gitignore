@@ -22,3 +22,5 @@ models/*
 *.gz
 imagenet/*
 *.jpeg
+/.venv/*
+*.sh

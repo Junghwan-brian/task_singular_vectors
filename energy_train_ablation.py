@@ -190,7 +190,8 @@ def build_energy_config_tag(cfg) -> str:
     init_mode_part = _sanitize_value(getattr(cfg, "initialize_sigma", "average"))
     warmup_ratio_part = _sanitize_value(getattr(cfg, "warmup_ratio", 0.1))
     wd_part = _sanitize_value(getattr(cfg, "sigma_wd", 0.0))
-    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}_{warmup_ratio_part}_{wd_part}"
+    num_basis_part = _sanitize_value(getattr(cfg, "num_basis_tasks", 0))
+    return f"energy_{num_tasks_minus_one}_{lr_part}_{svd_part}_{init_mode_part}_{warmup_ratio_part}_{wd_part}_{num_basis_part}"
 
 
 def normalize_adapter_choice(value: str) -> str:
@@ -238,20 +239,26 @@ def setup_simple_logger(name: str = __name__) -> logging.Logger:
 
 # Dataset-specific epochs for sigma training (general datasets)
 SIGMA_EPOCHS_PER_DATASET = {
+    # "Cars": 20,
     "DTD": 20,
+    # "EuroSAT": 20,
     "GTSRB": 20,
     "MNIST": 20,
+    # "RESISC45": 20,
+    # "SUN397": 20,
     "SVHN": 20,
     "CIFAR10": 20,
     "CIFAR100": 20,
     "STL10": 20,
     "Food101":20,
     "Flowers102": 20,
+    # "FER2013": 20,
     "PCAM":20,
     "OxfordIIITPet": 20,
     "RenderedSST2": 20,
     "EMNIST":20,
     "FashionMNIST":20,
+    # "KMNIST":20,
     "FGVCAircraft": 20,
     "CUB200": 20,
     "Country211": 20,
@@ -566,6 +573,20 @@ def run_energy(cfg: DictConfig) -> None:
     task_vectors = [
         NonLinearTaskVector(cfg.model, ptm_check, check) for check in ft_checks
     ]
+    
+    # Random sampling of task vectors for ablation study
+    num_basis_tasks = int(getattr(cfg, "num_basis_tasks", 0))
+    if num_basis_tasks > 0 and num_basis_tasks < len(task_vectors):
+        import random
+        seed = int(getattr(cfg, "seed", 1))
+        random.seed(seed)
+        selected_indices = random.sample(range(len(task_vectors)), num_basis_tasks)
+        task_vectors = [task_vectors[i] for i in sorted(selected_indices)]
+        selected_datasets = [cfg.DATASETS_VAL[i] for i in sorted(selected_indices)]
+        logger.info(f"[Ablation] Using {num_basis_tasks} randomly selected task vectors (seed={seed}):")
+        logger.info(f"  Selected datasets: {selected_datasets}")
+    elif num_basis_tasks > 0:
+        logger.info(f"[Ablation] num_basis_tasks={num_basis_tasks} >= total tasks ({len(task_vectors)}), using all tasks")
 
     # create final task vector with timing
     svd_start = time.time()
@@ -772,14 +793,9 @@ def run_energy(cfg: DictConfig) -> None:
         )
         logger.info(f"✓ Validation dataset loaded ({len(val_loader.dataset)} samples)")
 
-        config_dir = os.path.join(
-            cfg.model_location,
-            cfg.model,
-            val_dataset_name,
-            cfg.config_tag,
-        )
-        os.makedirs(config_dir, exist_ok=True)
-        energy_save_dir = os.path.join(config_dir, shot_folder)
+        # Use workspace-level 'ablation' folder for results (similar to maml_train.py)
+        ablation_root = os.path.join(os.getcwd(), "ablation")
+        energy_save_dir = os.path.join(ablation_root, "results")
         os.makedirs(energy_save_dir, exist_ok=True)
 
         params = [p for p in sigma_modules.parameters() if p.requires_grad]
@@ -847,52 +863,23 @@ def run_energy(cfg: DictConfig) -> None:
             eval_counter += 1
             return record
 
-        # Prepare visualization directory
-        visualization_dir = os.path.join(
-            energy_save_dir, f"sigma_visualization_{adapter_tag}"
-        )
+        # Prepare visualization directory (optional, for debugging)
+        visualization_dir = os.path.join(ablation_root, "visualizations")
         os.makedirs(visualization_dir, exist_ok=True)
 
-        # # Log zeroshot accuracy before any sigma updates
-        # model.eval()
-        # with torch.no_grad():
-        #     pretrained_metrics = evaluate_encoder_with_dataloader(
-        #         pretrained_encoder, classification_head, val_loader, cfg.device
-        #     )
-        #     pretrained_acc = pretrained_metrics['top1']
-        #     logger.info(f"Pretrained encoder validation accuracy: {pretrained_acc * 100:.2f}%")
-        #     record_validation("pretrained", -2, pretrained_acc)
-
-        #     eval_params = {}
-        #     for name, p in base_params.items():
-        #         eval_params[name] = p.clone()
-        #     for safe_key, module in sigma_modules.items():
-        #         orig_key = sigma_key_map.get(safe_key, safe_key)
-        #         if orig_key in eval_params and module.sigma.numel() > 0:
-        #             delta = module().to(eval_params[orig_key].device)
-        #             if eval_params[orig_key].shape == delta.shape:
-        #                 eval_params[orig_key] = eval_params[orig_key] + delta
-
-        #     model.image_encoder.load_state_dict(eval_params, strict=False)
-        #     zeroshot_metrics = evaluate_encoder_with_dataloader(
-        #         model.image_encoder, classification_head, val_loader, cfg.device
-        #     )
-        #     zeroshot_acc = zeroshot_metrics['top1']
-        #     logger.info(f"Zeroshot encoder validation accuracy: {zeroshot_acc * 100:.2f}%")
-        #     record_validation("zeroshot", -1, zeroshot_acc)
-        #     model.image_encoder.load_state_dict(base_state_dict, strict=False)
+        # Create unique identifier for this experiment
+        svd_topk = getattr(cfg, "svd_keep_topk", 2)
+        num_basis = getattr(cfg, "num_basis_tasks", 0)
+        exp_id = f"{test_ds}_{cfg.model}_k{k}_topk{svd_topk}_basis{num_basis}"
         
-        pretrained_acc = 0.0  # Placeholder when evaluation is disabled
-        zeroshot_acc = 0.0  # Placeholder when evaluation is disabled
-
         sigma_records = []
         records = visualize_sigma_matrices(
             sigma_modules,
             sigma_key_map,
             epoch=-1,
-            save_path=os.path.join(visualization_dir, "sigma_epoch_-1.png"),
-            title=f"{test_ds} ({shot_folder})",
-            json_path=os.path.join(visualization_dir, "sigma_epoch_-1.json"),
+            save_path=os.path.join(visualization_dir, f"{exp_id}_epoch_-1.png"),
+            title=f"{test_ds} (k={k}, topk={svd_topk}, basis={num_basis})",
+            json_path=os.path.join(visualization_dir, f"{exp_id}_epoch_-1.json"),
         )
         if records:
             sigma_records.extend(records)
@@ -970,43 +957,6 @@ def run_energy(cfg: DictConfig) -> None:
             epoch_train_time = time.time() - epoch_start
             epoch_times.append(epoch_train_time)
 
-            # if epoch in eval_epochs:
-            #     model.eval()
-            #     with torch.no_grad():
-            #         eval_params = {}
-            #         for name, p in base_params.items():
-            #             eval_params[name] = p.clone()
-            #         for safe_key, module in sigma_modules.items():
-            #             orig_key = sigma_key_map.get(safe_key, safe_key)
-            #             if orig_key in eval_params and module.sigma.numel() > 0:
-            #                 delta = module().to(eval_params[orig_key].device)
-            #                 if eval_params[orig_key].shape == delta.shape:
-            #                     eval_params[orig_key] = eval_params[orig_key] + delta
-
-            #         model.image_encoder.load_state_dict(eval_params, strict=False)
-
-            #         val_metrics = evaluate_encoder_with_dataloader(
-            #             model.image_encoder, classification_head, val_loader, cfg.device
-            #         )
-            #         val_acc = val_metrics['top1']
-
-            #         logger.info(f"[sigma] epoch {epoch} validation accuracy: {val_acc * 100:.2f}%")
-            #         record_validation("epoch", epoch, val_acc)
-
-            #         model.image_encoder.load_state_dict(base_state_dict, strict=False)
-
-            #     records = visualize_sigma_matrices(
-            #         sigma_modules,
-            #         sigma_key_map,
-            #         epoch=epoch,
-            #         save_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.png"),
-            #         title=f"{test_ds} ({shot_folder})",
-            #         json_path=os.path.join(visualization_dir, f"sigma_epoch_{epoch:03d}.json"),
-            #     )
-            #     if records:
-            #         sigma_records.extend(records)
-            #     model.train()
-            pass  # Evaluation disabled during training
 
         # Finalize weights and save: materialize the final deltas onto base params
         with torch.no_grad():
@@ -1051,9 +1001,9 @@ def run_energy(cfg: DictConfig) -> None:
             sigma_modules,
             sigma_key_map,
             epoch="final",
-            save_path=os.path.join(visualization_dir, "sigma_epoch_final.png"),
-            title=f"{test_ds} ({shot_folder})",
-            json_path=os.path.join(visualization_dir, "sigma_epoch_final.json"),
+            save_path=os.path.join(visualization_dir, f"{exp_id}_epoch_final.png"),
+            title=f"{test_ds} (k={k}, topk={svd_topk}, basis={num_basis})",
+            json_path=os.path.join(visualization_dir, f"{exp_id}_epoch_final.json"),
         )
         if records:
             sigma_records.extend(records)
@@ -1078,32 +1028,32 @@ def run_energy(cfg: DictConfig) -> None:
             if adapter_summary:
                 adapter_result_tag = adapter_path_tag(adapter_summary["adapter_type"])
 
-        # Save results to JSON
-        results_path = os.path.join(energy_save_dir, f"energy_results_{adapter_result_tag}.json")
+        # Save results to JSON with flat naming scheme for easy plotting
+        results_path = os.path.join(energy_save_dir, f"{exp_id}.json")
         results = {
-            "target_dataset": test_ds,
-            "final_accuracy": float(final_acc),
-            "k_shot": k,
+            "test_dataset": test_ds,
             "model": cfg.model,
+            "k_shot": k,
+            "svd_keep_topk": svd_topk,
+            "num_basis_tasks": num_basis,
+            "final_accuracy": float(final_acc),
             "sigma_epochs": cfg.sigma_epochs,
             "sigma_lr": cfg.sigma_lr,
             "sigma_wd": cfg.sigma_wd,
-            "svd_keep_topk": getattr(cfg, "svd_keep_topk", 2),
-            "initialize_sigma": getattr(cfg, "initialize_sigma", None),
-            "adapter_choice": cfg.adapter,
-            "training_time": min_epoch_time,
-            "avg_epoch_time": avg_epoch_time,
-            "all_epoch_times": epoch_times,
+            "warmup_ratio": getattr(cfg, "warmup_ratio", 0.1),
+            "initialize_sigma": getattr(cfg, "initialize_sigma", "average"),
+            "seed": getattr(cfg, "seed", 1),
+            "training_time_min_epoch": min_epoch_time,
+            "training_time_avg_epoch": avg_epoch_time,
             "trainable_params": sigma_trainable_params,
             "batch_size": cfg.batch_size,
             "gpu_peak_mem_mb": gpu_peak_mem_mb,
+            "adapter_choice": cfg.adapter,
+            "adapter_results": adapter_summary,
+            # Optional detailed history (can be large)
             "loss_history": loss_history,
             "validation_history": val_history,
-            "evaluation_schedule": [int(ep) for ep in sorted(eval_epochs)],
-            # "pretrained_accuracy": float(pretrained_acc),  # Disabled
-            # "zeroshot_accuracy": float(zeroshot_acc),  # Disabled
-            "config_tag": cfg.config_tag,
-            "adapter_results": adapter_summary,
+            "all_epoch_times": epoch_times,
         }
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=4)
@@ -1141,7 +1091,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        # default="ViT-B-32"
         type=str,
         help="Vision backbone (e.g., ViT-B-32, ViT-B-16)"
     )
@@ -1155,7 +1104,6 @@ if __name__ == "__main__":
         "--k",
         type=int,
         dest="train_k",
-        default=4,
         help="K-shot samples per class (0=fullshot)"
     )
     parser.add_argument("--warmup_ratio", type=float, help="Warmup ratio for sigma learning rate")
@@ -1163,7 +1111,6 @@ if __name__ == "__main__":
     # SVD and initialization
     parser.add_argument(
         "--svd_keep_topk",
-        default=12,
         type=int,
         help="Number of singular vectors to keep per task"
     )
@@ -1193,6 +1140,14 @@ if __name__ == "__main__":
     # Other
     parser.add_argument("--config_tag", type=str, help="Custom tag for output directory")
     parser.add_argument("--seed", type=int, default=1, help="Random seed for k-shot sampling")
+    
+    # Ablation study
+    parser.add_argument(
+        "--num_basis_tasks",
+        type=int,
+        default=0,
+        help="Number of task vectors to use for orthogonal basis (0=use all, >0=random selection)"
+    )
     
     args = parser.parse_args()
     

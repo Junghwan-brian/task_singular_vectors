@@ -32,10 +32,13 @@ class EMNIST:
         num_workers=8,
     ):
         preprocess1 = emnist_preprocess()
+        # EMNIST images are grayscale and also rotated/flipped by default.
+        # Apply rotate/flip on PIL, convert to RGB, then apply CLIP/OpenCLIP preprocess.
         preprocess = torchvision.transforms.Compose(
             [
-                preprocess,
                 preprocess1,
+                torchvision.transforms.Lambda(lambda img: img.convert("RGB")),
+                preprocess,
             ]
         )
         # location = os.path.join(location, "EMNIST")
@@ -56,7 +59,7 @@ class EMNIST:
 
         self.test_dataset = datasets.EMNIST(
             root=location,
-            download=False,
+            download=True,
             split="digits",
             transform=preprocess,
             train=False,

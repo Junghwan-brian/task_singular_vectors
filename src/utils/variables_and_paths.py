@@ -8,26 +8,23 @@ OPENCLIP_CACHEDIR = Path(
 CACHEDIR = None
 
 ALL_DATASETS = [
-    # "Cars",
     "DTD",
-    # "EuroSAT",
     "GTSRB",
     "MNIST",
-    # "RESISC45",
     "SVHN",
-    # "SUN397",
     "STL10",
     "OxfordIIITPet",
     "Flowers102",
     "CIFAR100",
     "PCAM",
-    # "FER2013",
     "CIFAR10",
     "Food101",
     "FashionMNIST",
     "RenderedSST2",
     "EMNIST",
-    "KMNIST",
+    "CUB200",
+    "FGVCAircraft",
+    "Country211"
 ]
 
 DATASETS_8 = ALL_DATASETS[:8]

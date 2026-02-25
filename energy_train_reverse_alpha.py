@@ -414,7 +414,7 @@ def grid_search_sigma_alpha(
         (best_alpha, best_acc)
     """
     if alphas is None:
-        alphas = [1, 5, 10, 15, 20]
+        alphas = [1, 5, 10, 15]
     if logger is None:
         logger = logging.getLogger(__name__)
     model.eval()
@@ -805,27 +805,38 @@ def run_energy(cfg: DictConfig) -> None:
             for name, tensor in model.image_encoder.state_dict().items()
         }
 
-        # Grid search로 sigma 초기 스케일 최적화 (train 데이터 기준)
-        try:
-            alpha_candidates = getattr(cfg, "sigma_alpha_candidates", [1, 3, 5, 7, 10])
-            max_eval_batches = int(getattr(cfg, "sigma_alpha_eval_batches", 0)) or None
-            logger.info(f"Running alpha grid search over {alpha_candidates} (max_batches={max_eval_batches})")
-            best_alpha, best_acc = grid_search_sigma_alpha(
-                sigma_modules=sigma_modules,
-                sigma_key_map=sigma_key_map,
-                base_params=base_params,
-                base_buffers=base_buffers,
-                model=model,
-                train_loader=train_loader,
-                device=cfg.device,
-                alphas=alpha_candidates,
-                max_batches=max_eval_batches,
-                apply_best=True,
-                logger=logger,
-            )
-            logger.info(f"Selected alpha={best_alpha} (train acc={best_acc*100:.2f}%) for sigma initialization.")
-        except Exception as e:
-            logger.warning(f"Alpha grid search failed: {e}. Proceeding without scaling.")
+        # Apply fixed alpha or grid search
+        fixed_alpha = getattr(cfg, "fixed_alpha", None)
+        if fixed_alpha is not None:
+            # Use fixed alpha value without grid search
+            logger.info(f"Using fixed alpha={fixed_alpha} for sigma initialization")
+            with torch.no_grad():
+                for _, module in sigma_modules.items():
+                    if module.sigma.numel() > 0:
+                        module.sigma.data.mul_(float(fixed_alpha))
+            logger.info(f"Applied alpha={fixed_alpha} to all sigma parameters")
+        else:
+            # Grid search로 sigma 초기 스케일 최적화 (train 데이터 기준)
+            try:
+                alpha_candidates = getattr(cfg, "sigma_alpha_candidates", [1, 3, 5, 7, 10])
+                max_eval_batches = int(getattr(cfg, "sigma_alpha_eval_batches", 0)) or None
+                logger.info(f"Running alpha grid search over {alpha_candidates} (max_batches={max_eval_batches})")
+                best_alpha, best_acc = grid_search_sigma_alpha(
+                    sigma_modules=sigma_modules,
+                    sigma_key_map=sigma_key_map,
+                    base_params=base_params,
+                    base_buffers=base_buffers,
+                    model=model,
+                    train_loader=train_loader,
+                    device=cfg.device,
+                    alphas=alpha_candidates,
+                    max_batches=max_eval_batches,
+                    apply_best=True,
+                    logger=logger,
+                )
+                logger.info(f"Selected alpha={best_alpha} (train acc={best_acc*100:.2f}%) for sigma initialization.")
+            except Exception as e:
+                logger.warning(f"Alpha grid search failed: {e}. Proceeding without scaling.")
 
         # Prepare evaluation schedule and history tracking
         eval_epochs = compute_eval_epochs(int(cfg.sigma_epochs))
@@ -1083,6 +1094,7 @@ def run_energy(cfg: DictConfig) -> None:
         results = {
             "target_dataset": test_ds,
             "final_accuracy": float(final_acc),
+            "fixed_alpha": getattr(cfg, "fixed_alpha", None),
             "k_shot": k,
             "model": cfg.model,
             "sigma_epochs": cfg.sigma_epochs,
@@ -1193,6 +1205,7 @@ if __name__ == "__main__":
     # Other
     parser.add_argument("--config_tag", type=str, help="Custom tag for output directory")
     parser.add_argument("--seed", type=int, default=1, help="Random seed for k-shot sampling")
+    parser.add_argument("--fixed_alpha", type=float, help="Fixed alpha value (skips grid search)")
     
     args = parser.parse_args()
     

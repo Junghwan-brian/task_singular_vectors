@@ -1,6 +1,7 @@
 import os
 
 import torch
+import torchvision
 import torchvision.datasets as datasets
 
 
@@ -12,6 +13,13 @@ class FashionMNIST:
         batch_size=128,
         num_workers=6,
     ):
+        # CLIP/OpenCLIP preprocess expects 3-channel images; FashionMNIST is grayscale.
+        preprocess = torchvision.transforms.Compose(
+            [
+                torchvision.transforms.Lambda(lambda img: img.convert("RGB")),
+                preprocess,
+            ]
+        )
 
         location = os.path.join(location, "FashionMNIST")
         self.train_dataset = datasets.FashionMNIST(

@@ -31,6 +31,7 @@ from src.datasets.common import get_dataloader, maybe_dictionarize
 from src.models import get_classification_head
 from src.datasets.remote_sensing import sample_k_shot_indices
 from src.datasets.imagenet_ood import ImageNetILSVRCVal
+from src.datasets.registry import get_dataset
 from src.eval.eval import eval_single_dataset
 from src.eval.eval_remote_sensing_comparison import evaluate_encoder_with_dataloader
 
@@ -44,6 +45,17 @@ def setup_logger(name: str = __name__) -> logging.Logger:
     logger.addHandler(h)
     logger.propagate = False
     return logger
+
+
+def get_ood_dataloader(dataset_name: str, preprocess, args):
+    """Create OOD dataloader for evaluation"""
+    dataset = get_dataset(
+        dataset_name,
+        preprocess,
+        location=args.data_location,
+        batch_size=args.batch_size,
+    )
+    return get_dataloader(dataset, is_train=False, args=args, image_encoder=None)
 
 
 def _sanitize_value(val):
@@ -507,6 +519,92 @@ def run_imagenet_atlas(args):
     logger.info(f"Trainable parameters (atlas): {trainable_params:,}")
     logger.info(f"Number of task vectors: {len(available_task_vectors)}")
     logger.info("=" * 80)
+    
+    # Determine save paths
+    config_tag = build_atlas_config_tag(len(available_task_vectors), args)
+    val_dataset_name = "ImageNetILSVRCVal"
+    shot_folder = f"{k}shots" if k > 0 else "fullshots"
+    save_dir = os.path.join(
+        args.model_location,
+        args.model,
+        val_dataset_name,
+        config_tag,
+        shot_folder,
+    )
+    os.makedirs(save_dir, exist_ok=True)
+    atlas_path = os.path.join(save_dir, "atlas.pt")
+    results_path = os.path.join(save_dir, "atlas_results_imagenet.json")
+    
+    # Check if eval_only mode
+    if getattr(args, 'eval_only', False):
+        logger.info("=" * 80)
+        logger.info("EVAL ONLY MODE: Loading existing atlas coefficients")
+        logger.info("=" * 80)
+        
+        if not os.path.exists(atlas_path):
+            logger.error(f"Atlas coefficients not found: {atlas_path}")
+            logger.error("Cannot run eval_only mode without trained coefficients!")
+            return
+        
+        logger.info(f"Loading atlas coefficients from: {atlas_path}")
+        loaded_coef = torch.load(atlas_path, map_location=args.device, weights_only=True)
+        model.image_encoder.coef.data.copy_(loaded_coef)
+        logger.info("✓ Coefficients loaded successfully")
+        
+        # Evaluation
+        image_encoder = model.image_encoder
+        classification_head = model.classification_head
+        
+        image_encoder.eval()
+        classification_head.eval()
+        
+        final_metrics = evaluate_encoder_with_dataloader(
+            image_encoder, classification_head, val_loader, args.device
+        )
+        final_acc = final_metrics['top1']
+        logger.info(f"Final validation accuracy: {100*final_acc:.2f}%")
+        
+        # OOD evaluations
+        ood_results = {}
+        ood_list = ["ImageNetA", "ImageNetR", "ImageNetSketch", "ImageNetV2MFVal"]
+        logger.info("\n" + "=" * 100)
+        logger.info("Evaluating on OOD datasets...")
+        logger.info("=" * 100 + "\n")
+        
+        with torch.no_grad():
+            for ood_name in ood_list:
+                ood_loader = get_ood_dataloader(ood_name, image_encoder.val_preprocess, args)
+                ood_metrics = evaluate_encoder_with_dataloader(
+                    image_encoder, classification_head, ood_loader, args.device
+                )
+                ood_results[ood_name] = float(ood_metrics['top1'])
+                logger.info(f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
+        
+        # Compose unified evaluation results
+        all_eval_accuracies = {"ImageNetILSVRC": float(final_acc)}
+        for k_name, v_acc in ood_results.items():
+            all_eval_accuracies[k_name] = float(v_acc)
+        
+        # Load and update existing results
+        if os.path.exists(results_path):
+            with open(results_path, 'r') as f:
+                results = json.load(f)
+        else:
+            results = {}
+        
+        results.update({
+            "final_accuracy": float(final_acc),
+            "ood_accuracies": ood_results,
+            "all_eval_accuracies": all_eval_accuracies,
+        })
+        
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=4)
+        logger.info(f"✓ Updated results saved to {results_path}")
+        logger.info("\n" + "=" * 100)
+        logger.info("EVAL ONLY MODE COMPLETE")
+        logger.info("=" * 100)
+        return
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -599,7 +697,7 @@ def run_imagenet_atlas(args):
     logger.info(f"Final validation accuracy: {100*final_acc:.2f}%")
     record_validation("final", args.epochs, final_acc)
 
-    # OOD evaluations
+    # OOD evaluations - use fine-tuned classification head
     ood_results = {}
     ood_list = ["ImageNetA", "ImageNetR", "ImageNetSketch", "ImageNetV2MFVal"]
     logger.info("\n" + "=" * 100)
@@ -607,10 +705,14 @@ def run_imagenet_atlas(args):
     logger.info("=" * 100 + "\n")
     
     image_encoder.eval()
+    classification_head.eval()
     with torch.no_grad():
         for ood_name in ood_list:
-            m = eval_single_dataset(image_encoder, ood_name, args)
-            ood_results[ood_name] = float(m.get("top1", 0.0))
+            ood_loader = get_ood_dataloader(ood_name, image_encoder.val_preprocess, args)
+            ood_metrics = evaluate_encoder_with_dataloader(
+                image_encoder, classification_head, ood_loader, args.device
+            )
+            ood_results[ood_name] = float(ood_metrics['top1'])
             logger.info(f"OOD {ood_name}: {100.0 * ood_results[ood_name]:.2f}%")
             record_validation(f"ood:{ood_name}", int(args.epochs), ood_results[ood_name])
 
@@ -623,17 +725,7 @@ def run_imagenet_atlas(args):
     avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
     logger.info(f"Training time per epoch - Min: {min_epoch_time:.2f}s, Avg: {avg_epoch_time:.2f}s")
 
-    # Save coefficients
-    save_dir = os.path.join(
-        args.model_location,
-        args.model,
-        val_dataset_name,
-        config_tag,
-        shot_folder
-    )
-    os.makedirs(save_dir, exist_ok=True)
-
-    atlas_path = os.path.join(save_dir, "atlas.pt")
+    # Save coefficients (paths already defined earlier)
     final_coef = model.image_encoder.coef.data.clone()
     torch.save(final_coef, atlas_path)
     logger.info(f"✓ Saved learned atlas coefficients to {atlas_path}")
@@ -647,7 +739,6 @@ def run_imagenet_atlas(args):
     else:
         adapter_summary = None
 
-    log_path = os.path.join(save_dir, f"atlas_results_imagenet.json")
     gpu_peak_mem_mb = None
     if torch.cuda.is_available():
         gpu_peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
@@ -673,9 +764,9 @@ def run_imagenet_atlas(args):
         "adapter_choice": adapter_choice_value,
         "adapter_results": adapter_summary,
     }
-    with open(log_path, 'w') as f:
+    with open(results_path, 'w') as f:
         json.dump(result_log, f, indent=4)
-    logger.info(f"✓ Saved results to {log_path}")
+    logger.info(f"✓ Saved results to {results_path}")
 
 
 def main():
@@ -721,16 +812,31 @@ def main():
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--gpu", type=int, help="GPU id (overrides --device as cuda:{id})")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Only evaluate existing model without training")
 
     args = parser.parse_args()
 
+    # Store original args before config loading
+    original_args = vars(args).copy()
+    
     # Load config if exists
     if os.path.exists(args.config_file):
         config = OmegaConf.load(args.config_file)
         # Merge CLI args with config (CLI takes precedence)
-        cli_dict = {k: v for k, v in vars(args).items() if v is not None}
+        # Only include non-None values that were explicitly set
+        cli_dict = {k: v for k, v in original_args.items() 
+                   if v is not None or k in ['partition', 'config_tag']}  # Keep None for these
         config.update(cli_dict)
         args = argparse.Namespace(**OmegaConf.to_container(config))
+    
+    # Ensure all required attributes exist with defaults
+    if not hasattr(args, 'partition'):
+        args.partition = original_args.get('partition', None)
+    if not hasattr(args, 'blockwise_coef'):
+        args.blockwise_coef = original_args.get('blockwise_coef', True)
+    if not hasattr(args, 'adapter'):
+        args.adapter = original_args.get('adapter', 'none')
 
     # Set device
     if getattr(args, "gpu", None) is not None:
@@ -767,6 +873,10 @@ def main():
     logger = setup_logger(__name__)
     logger.info(f"ImageNet Atlas training with {args.model}")
     logger.info(f"Using {args.num_tasks} basis task vectors")
+    
+    # Add missing attribute for compatibility with atlas_src
+    if not hasattr(args, 'openclip_cachedir'):
+        args.openclip_cachedir = None
 
     run_imagenet_atlas(args)
 

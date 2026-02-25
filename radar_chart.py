@@ -318,14 +318,15 @@ if __name__ == "__main__":
     # _ = list_methods("ViT-B-16", 4)
 
     # 2) 플롯 실행 (메서드 선택 + 색 팔레트)
-    methods_to_use = ["Energy (best)", "LinearProbe (best config)", "TIP (best config)", "Atlas"]
+    # ['Atlas', 'Atlas+LP++', 'Atlas+TIP', 'Energy (best)', 'LinearProbe (best)', 'LoRA (best)', 'LP++ (best)', 'TIP (best)']
+    methods_to_use = ["Energy (best)", "LinearProbe (best)", "TIP (best)", "Atlas"]
     custom_colors   = plt.cm.tab20(np.linspace(0, 1, 28))[::3]
     used_methods, used_colors = plot_radar_for_selection(
-        "ViT-B-32", 4,
+        "ViT-B-32", 16,
         methods_to_show=methods_to_use,
         color_list=custom_colors
     )
-    used_methods = [method.replace(" (best config)","").replace(" (best)", "").replace("Energy", "BOLT").replace("LinearProbe", "LP") for method in used_methods]
+    used_methods = [method.replace(" (best config)","").replace(" (best)", "").replace("Energy", "BOLT").replace("Atlas", "aTLAS") for method in used_methods]
 
     # 3) 플롯에서 실제 사용된 순서/색으로 legend만 별도 저장
     save_legend_only(used_methods, used_colors, save_path="figures/legend_only.png", fontsize=10)

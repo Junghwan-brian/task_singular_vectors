@@ -182,7 +182,7 @@ GPU_IDS = [0,1,2,3,4,5,6,7]  # Default GPU IDs
 # Energy configurations for ImageNet
 ENERGY_MODELS = ["ViT-B-16", "ViT-L-14", "ViT-B-32"]
 ENERGY_INITIALIZE_SIGMA = ["average"]
-ENERGY_K = [4, 16]
+ENERGY_K = [4]
 ENERGY_SVD_KEEP_TOPK = [12]
 ENERGY_SIGMA_LR = [1e-3]
 ENERGY_SIGMA_WD = [0.0]
@@ -274,12 +274,12 @@ def build_atlas_commands() -> List[List[str]]:
             k=int(k),
             num_basis=int(num_basis),
         )
-        if _path_exists(results_json):
-            print(
-                f"[skip] atlas {model} ImageNet (k={k}, lr={lr}, num_basis={num_basis}) -> {results_json}",
-                flush=True,
-            )
-            continue
+        # if _path_exists(results_json):
+        #     print(
+        #         f"[skip] atlas {model} ImageNet (k={k}, lr={lr}, num_basis={num_basis}) -> {results_json}",
+        #         flush=True,
+        #     )
+        #     continue
         
         cmd = [
             sys.executable,
@@ -288,6 +288,7 @@ def build_atlas_commands() -> List[List[str]]:
             "--k", str(k),
             "--lr", f"{lr:.6g}",
             "--num_tasks", str(num_basis),
+            "--config_file", "config/config_reverse.yaml",
         ]
         commands.append(cmd)
     
@@ -314,12 +315,12 @@ def build_baseline_commands() -> List[List[str]]:
                 results_json = _expected_baseline_paths(
                     model=model, method=method, k=k, **hparams
                 )
-                if _path_exists(results_json):
-                    print(
-                        f"[skip] baseline {model} ImageNet (method={method}, k={k}) -> {results_json}",
-                        flush=True,
-                    )
-                    continue
+                # if _path_exists(results_json):
+                #     print(
+                #         f"[skip] baseline {model} ImageNet (method={method}, k={k}) -> {results_json}",
+                #         flush=True,
+                #     )
+                #     continue
                 
                 cmd = [
                     sys.executable,
@@ -339,12 +340,12 @@ def build_baseline_commands() -> List[List[str]]:
                 results_json = _expected_baseline_paths(
                     model=model, method=method, k=k, **hparams
                 )
-                if _path_exists(results_json):
-                    print(
-                        f"[skip] baseline {model} ImageNet (method={method}, k={k}, wd={adapter_wd}) -> {results_json}",
-                        flush=True,
-                    )
-                    continue
+                # if _path_exists(results_json):
+                #     print(
+                #         f"[skip] baseline {model} ImageNet (method={method}, k={k}, wd={adapter_wd}) -> {results_json}",
+                #         flush=True,
+                #     )
+                #     continue
                 
                 cmd = [
                     sys.executable,
@@ -371,12 +372,12 @@ def build_baseline_commands() -> List[List[str]]:
                 results_json = _expected_baseline_paths(
                     model=model, method=method, k=k, **hparams
                 )
-                if _path_exists(results_json):
-                    print(
-                        f"[skip] baseline {model} ImageNet (method={method}, k={k}) -> {results_json}",
-                        flush=True,
-                    )
-                    continue
+                # if _path_exists(results_json):
+                #     print(
+                #         f"[skip] baseline {model} ImageNet (method={method}, k={k}) -> {results_json}",
+                #         flush=True,
+                #     )
+                #     continue
                 
                 cmd = [
                     sys.executable,
@@ -489,7 +490,7 @@ def main() -> None:
     parser.add_argument(
         "--per-gpu",
         type=int,
-        default=1,
+        default=4,
         help="Number of commands to run concurrently on each GPU",
     )
     args = parser.parse_args()
